@@ -1,0 +1,6 @@
+{{ define "main" }}
+<div class="shell docs-layout docs-single">
+    <aside>{{ partial "docs-nav.html" . }}</aside>
+    <article class="doc-content"><p class="eyebrow"><span></span> Documentation</p><h1>{{ .Title }}</h1>{{ .Content }}{{ with .Site.Params.github }}<div class="doc-footer"><a href="{{ . }}/issues">Found a problem? Open an issue ↗</a></div>{{ end }}</article>
+</div>
+{{ end }}

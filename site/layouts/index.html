@@ -1,0 +1,75 @@
+{{ define "main" }}
+<section class="hero">
+    <div class="shell hero-grid">
+        <div class="hero-copy">
+            <p class="eyebrow"><span></span> Release directly from your machine</p>
+            <h1>Go ship yourself.</h1>
+            <p class="lede">Delivery Boy runs on your laptop or in your CI and talks straight to your targets. Keep the release in <code>.deliver.yml</code>, use your own tools and credentials, and add a hosted service only when you want one.</p>
+            <div class="actions"><a class="button button-primary" href="/docs/getting-started/">Read the quick start</a>{{ with .Site.Params.github }}<a class="button button-quiet" href="{{ . }}">View the CLI source <span>↗</span></a>{{ end }}</div>
+            <p class="hero-note">Free CLI · MIT licensed · no account, daemon, or hosted runner</p>
+        </div>
+        <div class="terminal" aria-label="Delivery Boy terminal example">
+            <div class="terminal-top"><span></span><span></span><span></span><b>.deliver.yml</b></div>
+            <pre><code><em>$</em> deliver plan
+
+<small>production · web</small>
+  01  build Hugo site
+  02  package release
+  03  check server access
+  04  upload and verify
+  05  activate release
+  06  check live URL
+
+<em>$</em> deliver deploy
+  <i>✓</i> preflight
+  <i>✓</i> build
+  <i>✓</i> stage
+  <i>✓</i> activate
+  <i>✓</i> verify
+
+<strong>release succeeded</strong></code></pre>
+        </div>
+    </div>
+</section>
+
+<section class="proof-bar">
+    <div class="shell proof-grid"><div><strong>Run it yourself</strong><span>Release from your laptop, workstation, or CI</span></div><div><strong>Connect directly</strong><span>Use your own tools, targets, and secret stores</span></div><div><strong>Add Teams if needed</strong><span>The hosted service stays optional</span></div></div>
+</section>
+
+<section class="section">
+    <div class="shell section-heading"><p class="eyebrow"><span></span> A release you can inspect</p><h2>Your deploy is code.<br>Keep it with the code.</h2><p>Put the release contract in <code>.deliver.yml</code>. Review changes with the rest of the project, then ask Delivery Boy to compile it into a plan.</p></div>
+    <div class="shell steps">
+        <article><b>01</b><h3>Describe</h3><p>Name the targets, services, secrets, checks, and release order in one file.</p></article>
+        <article><b>02</b><h3>Preview</h3><p>Print every local command, upload, remote step, live switch, and check without running them.</p></article>
+        <article><b>03</b><h3>Preflight</h3><p>Find missing tools, inputs, secrets, and server access before the release changes anything.</p></article>
+        <article><b>04</b><h3>Release</h3><p>Build and stage complete artifacts, switch them live, verify production, and roll back on failure.</p></article>
+    </div>
+</section>
+
+<section class="section section-dark">
+    <div class="shell section-heading"><p class="eyebrow eyebrow-light"><span></span> Use the stack you have</p><h2>One release can contain more than one shape.</h2><p>A site, a Compose stack, an nginx change, and a signed Mac app can belong to one ordered plan. Delivery Boy calls the tools that already do each job well.</p></div>
+    <div class="shell deployer-grid">
+        <article><span>H</span><h3>Hugo</h3><p>Build, package, stage, and switch a static site without a partial-copy window.</p></article>
+        <article><span>F</span><h3>Files</h3><p>Ship prepared directories and artifacts as versioned releases.</p></article>
+        <article><span>D</span><h3>Docker Compose</h3><p>Keep Compose files intact while Delivery Boy builds, ships, starts, and checks them.</p></article>
+        <article><span>N</span><h3>nginx</h3><p>Issue TLS, stage changes, validate the full config, and restore it if reload fails.</p></article>
+        <article><span>M</span><h3>macOS</h3><p>Build, sign, notarize, and publish an app and its Sparkle feed.</p></article>
+        <article><span>›_</span><h3>Commands</h3><p>Add the project-specific local and SSH steps that make your release yours.</p></article>
+    </div>
+</section>
+
+<section class="section cli-section">
+    <div class="shell cli-grid">
+        <div><p class="eyebrow"><span></span> Free CLI</p><h2>Your release does not pass through us.</h2><p>The CLI runs where you run it and connects straight to your targets. Keep targets and steps with your code, and resolve secrets from tools you already trust. Delivery Boy Teams will remain optional.</p><a class="text-link" href="/docs/getting-started/">Read the CLI quick start →</a></div>
+        <div class="command-list"><code>deliver init</code><span>Detect the project and prepare a config</span><code>deliver plan</code><span>Print the release without running it</span><code>deliver preflight</code><span>Check requirements and access</span><code>deliver deploy</code><span>Build, stage, activate, and verify</span><code>deliver rollback</code><span>Restore the prior release</span></div>
+    </div>
+</section>
+
+<section class="section hosted-section">
+    <div class="shell hosted-card"><div><p class="eyebrow eyebrow-light"><span></span> Paid Teams · private preview</p><h2>Add shared control without giving up the local CLI.</h2><p>Delivery Boy Teams is a planned hosted service for groups that want shared history, approvals, schedules, notifications, and isolated runners. It adds teamwork around the CLI; it does not become a requirement for releasing. Public signup and billing are not open yet.</p><div class="actions"><a class="button button-quiet" href="/docs/teams/">What Teams will add →</a></div></div><div class="hosted-list"><span>Shared run history</span><span>Role-based approvals</span><span>Schedules</span><span>Isolated runners</span><span>Slack</span><span>Notifications</span></div></div>
+</section>
+
+<section class="final-cta">
+    <div class="shell"><div class="delivery-mark" aria-hidden="true">🛵</div><h2>Keep the release in your hands.</h2><p>Print the plan, review every step, then run it from your own machine.</p><div class="actions actions-center"><a class="button button-primary" href="/docs/getting-started/">Read the quick start</a>{{ with .Site.Params.github }}<a class="button button-quiet" href="{{ . }}">Browse the CLI source <span>↗</span></a>{{ end }}</div></div>
+</section>
+{{ end }}

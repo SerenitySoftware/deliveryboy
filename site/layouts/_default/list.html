@@ -1,0 +1,7 @@
+{{ define "main" }}
+<section class="docs-hero"><div class="shell"><p class="eyebrow"><span></span> Delivery Boy docs</p><h1>{{ .Title }}</h1><p>{{ .Params.description }}</p></div></section>
+<div class="shell docs-layout">
+    <aside>{{ partial "docs-nav.html" . }}</aside>
+    <article class="doc-content">{{ .Content }}</article>
+</div>
+{{ end }}

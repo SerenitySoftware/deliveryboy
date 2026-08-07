@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    name: CLI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Hugo on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq hugo
+      - name: Install Hugo on macOS
+        if: runner.os == 'macOS'
+        run: brew install hugo
+      - name: Install Hugo on Windows
+        if: runner.os == 'Windows'
+        run: choco install hugo-extended -y
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  site:
+    name: Site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: "0.152.2"
+          extended: true
+      - run: hugo --source site --minify

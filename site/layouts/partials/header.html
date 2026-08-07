@@ -1,0 +1,10 @@
+<header class="site-header">
+    <div class="shell header-inner">
+        <a class="brand" href="/" aria-label="Delivery Boy home"><span aria-hidden="true">🛵</span> Delivery Boy</a>
+        <nav aria-label="Main navigation">
+            <a href="/docs/">Docs</a>
+            {{ with .Site.Params.github }}<a href="{{ . }}">GitHub</a>{{ end }}
+            <a class="nav-cta" href="/docs/getting-started/">Get started</a>
+        </nav>
+    </div>
+</header>

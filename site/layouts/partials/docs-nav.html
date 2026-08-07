@@ -1,0 +1,1 @@
+<nav class="docs-nav" aria-label="Documentation"><p>Documentation</p><a href="/docs/">Overview</a>{{ range where .Site.RegularPages "Section" "docs" }}<a href="{{ .RelPermalink }}"{{ if eq $.RelPermalink .RelPermalink }} aria-current="page"{{ end }}>{{ .Title }}</a>{{ end }}</nav>

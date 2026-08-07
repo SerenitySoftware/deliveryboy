@@ -1,0 +1,15 @@
+baseURL = "https://deliveryboy.app/"
+languageCode = "en-us"
+title = "Delivery Boy"
+enableRobotsTXT = true
+
+[params]
+description = "Release from your own machine with no third-party release service required. Preview each step, deploy directly, verify, and roll back with the Delivery Boy CLI."
+github = "https://github.com/SerenitySoftware/deliveryboy"
+
+[markup]
+  [markup.highlight]
+    noClasses = false
+  [markup.goldmark]
+    [markup.goldmark.renderer]
+      unsafe = true

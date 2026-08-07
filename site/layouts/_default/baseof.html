@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {{ $title := .Site.Title }}
+    {{ if not .IsHome }}{{ $title = printf "%s · %s" .Title .Site.Title }}{{ end }}
+    {{ $description := .Site.Params.description }}
+    {{ with .Params.description }}{{ $description = . }}{{ end }}
+    <title>{{ $title }}</title>
+    <meta name="description" content="{{ $description }}">
+    <link rel="canonical" href="{{ .Permalink }}">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Delivery Boy">
+    <meta property="og:title" content="{{ $title }}">
+    <meta property="og:description" content="{{ $description }}">
+    <meta property="og:url" content="{{ .Permalink }}">
+    <meta property="og:image" content="https://deliveryboy.app/og.png">
+    <meta name="twitter:card" content="summary_large_image">
+    {{ $css := resources.Get "css/site.css" | minify | fingerprint }}
+    <link rel="stylesheet" href="{{ $css.RelPermalink }}">
+</head>
+<body>
+    {{ partial "header.html" . }}
+    <main>{{ block "main" . }}{{ end }}</main>
+    {{ partial "footer.html" . }}
+</body>
+</html>

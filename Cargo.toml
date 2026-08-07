@@ -1,0 +1,37 @@
+[package]
+name = "deliver"
+version = "0.1.0"
+edition = "2021"
+description = "Delivery Boy CLI — config-driven deploys, no server required."
+license = "MIT"
+homepage = "https://deliveryboy.app/"
+repository = "https://github.com/SerenitySoftware/deliveryboy"
+documentation = "https://deliveryboy.app/docs/"
+readme = "README.md"
+keywords = ["deployment", "release", "cli", "devops", "ssh"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+]
+
+# `deliver` is the command. Aliased from the project name deliveryboy.
+[[bin]]
+name = "deliver"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+serde_json = "1"
