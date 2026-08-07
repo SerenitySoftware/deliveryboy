@@ -22,7 +22,8 @@ deliver --version
 ```
 
 Versioned macOS, Linux, and Windows binaries, Homebrew, WinGet, and
-`cargo install deliver` are planned for the public beta.
+`cargo install deliveryboy` are planned for the public beta. Every install
+method provides the `deliver` command.
 
 ## Start a release
 

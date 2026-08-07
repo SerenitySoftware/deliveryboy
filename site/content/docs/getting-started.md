@@ -19,6 +19,9 @@ deliver --version
 
 Cargo installs the command into its binary directory, normally `~/.cargo/bin`. Make sure that directory is on your `PATH`.
 
+Once the public beta ships, `cargo install deliveryboy` will install the same
+`deliver` command without cloning the repository.
+
 Do not copy a binary from an untrusted source. Public releases will include checksums.
 
 ## Detect your project

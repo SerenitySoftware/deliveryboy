@@ -1,5 +1,5 @@
 [package]
-name = "deliver"
+name = "deliveryboy"
 version = "0.1.0"
 edition = "2021"
 description = "Delivery Boy CLI — config-driven deploys, no server required."
@@ -21,7 +21,7 @@ include = [
     "/SECURITY.md",
 ]
 
-# `deliver` is the command. Aliased from the project name deliveryboy.
+# `deliveryboy` is the package; `deliver` is the command it installs.
 [[bin]]
 name = "deliver"
 path = "src/main.rs"
