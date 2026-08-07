@@ -1845,8 +1845,14 @@ fn cleanup_runs_after_the_real_steps_and_is_skipped_on_failure() {
 #[test]
 fn clean_command_removes_the_work_dir() {
     let dir = hugo_site_repo("clean-cmd");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("app: demo", "app: clean-test");
+    std::fs::write(&cfg, body).unwrap();
     // `deliver clean` sweeps the app's scratch dir under the system temp dir.
-    let scratch = std::env::temp_dir().join("deliver").join("demo");
+    // Keep this test's app distinct because the suite runs in parallel.
+    let scratch = std::env::temp_dir().join("deliver").join("clean-test");
     std::fs::create_dir_all(scratch.join("run-1")).unwrap();
     std::fs::write(scratch.join("run-1/leftover.tar.gz"), "x").unwrap();
 

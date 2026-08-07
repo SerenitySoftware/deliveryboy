@@ -98,7 +98,7 @@ fn run_step(step: &PlannedStep, target: &Target, host: &str, dry_run: bool) -> R
 
 /// Write a file with an exact mode, creating parents. The mode is set *before*
 /// the contents land, so a secret is never briefly world-readable.
-fn write_file(path: &str, mode: u32, content: &str) -> Result<bool> {
+fn write_file(path: &str, _mode: u32, content: &str) -> Result<bool> {
     use std::io::Write;
     let p = std::path::Path::new(path);
     if let Some(parent) = p.parent() {
@@ -109,14 +109,14 @@ fn write_file(path: &str, mode: u32, content: &str) -> Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(mode);
+        opts.mode(_mode);
     }
     let mut file = opts.open(p)?;
     file.write_all(content.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))?;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(_mode))?;
     }
     Ok(true)
 }
