@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Delivery Boy has not published its first public beta. Until then, only the
-current `main` branch receives security fixes.
+The current `0.1.x` beta line and the `main` branch receive security fixes.
+Older beta versions may be asked to upgrade before a fix is backported.
 
 ## Report a vulnerability
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-08-07
 
 First public beta of the standalone `deliver` CLI.
 
@@ -15,3 +15,6 @@ First public beta of the standalone `deliver` CLI.
 - Clean-tree, branch, upstream, version, tag, and post-release notification
   controls.
 - Environment, dotenv, SOPS, macOS Keychain, and 1Password secret sources.
+- Self-hosted CLI releases through `.deliver.yml`, crates.io, and tagged GitHub
+  release builds.
+- Release-specific previews through `deliver plan --version`.

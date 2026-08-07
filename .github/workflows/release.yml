@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            format: tar
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            format: tar
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            format: tar
+          - os: macos-15
+            target: aarch64-apple-darwin
+            format: tar
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            format: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check tag and package version
+        shell: bash
+        run: |
+          cargo_version=$(cargo pkgid | sed 's/.*#//' | sed 's/.*@//')
+          test "$GITHUB_REF_NAME" = "v$cargo_version"
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke test
+        if: runner.os != 'Windows'
+        run: target/${{ matrix.target }}/release/deliver --version
+      - name: Smoke test on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: target/${{ matrix.target }}/release/deliver.exe --version
+      - name: Package tar archive
+        if: matrix.format == 'tar'
+        shell: bash
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          name="deliveryboy-${version}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/deliver" "$name/"
+          cp README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - name: Package zip archive
+        if: matrix.format == 'zip'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $name = "deliveryboy-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name
+          Copy-Item "target/${{ matrix.target }}/release/deliver.exe" $name
+          Copy-Item README.md, LICENSE $name
+          Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: deliveryboy-*-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        run: cd dist && sha256sum deliveryboy-* > SHA256SUMS
+      - name: Attest release files
+        uses: actions/attest@v4
+        with:
+          subject-path: "dist/*"
+      - name: Extract release notes
+        shell: bash
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          awk -v version="$version" '
+            $0 ~ "^## " version " — " { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Delivery Boy ${GITHUB_REF_NAME#v}" \
+            --notes-file release-notes.md

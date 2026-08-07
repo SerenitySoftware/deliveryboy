@@ -8,11 +8,19 @@ machine. No Delivery Boy account, daemon, or hosted runner is required.
 
 ## Status
 
-The CLI is preparing for its first public beta. macOS and Linux are the current
-development hosts. Native Windows support is a release gate, not a completed
-claim.
+The CLI is in public beta. macOS and Linux are the current release hosts.
+Windows binaries are experimental while native command execution is completed.
 
-## Install from source
+## Install
+
+Install the `deliveryboy` package to get the `deliver` command:
+
+```bash
+cargo install deliveryboy
+deliver --version
+```
+
+You can also install from a source checkout:
 
 ```bash
 git clone https://github.com/SerenitySoftware/deliveryboy.git
@@ -21,9 +29,9 @@ cargo install --path .
 deliver --version
 ```
 
-Versioned macOS, Linux, and Windows binaries, Homebrew, WinGet, and
-`cargo install deliveryboy` are planned for the public beta. Every install
-method provides the `deliver` command.
+Versioned macOS, Linux, and experimental Windows archives are attached to
+GitHub releases. Homebrew and WinGet packages will follow. Every install method
+provides the `deliver` command.
 
 ## Start a release
 

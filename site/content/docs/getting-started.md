@@ -8,21 +8,22 @@ Delivery Boy is a single `deliver` binary that runs on your machine and connects
 
 ## Availability
 
-Delivery Boy is preparing its first public beta. Packaged binaries are not available yet. Until they ship, build the CLI from source:
+Install the public beta from crates.io. The `deliveryboy` package provides the
+`deliver` command:
 
 ```bash
-git clone https://github.com/SerenitySoftware/deliveryboy.git
-cd deliveryboy
-cargo install --path .
+cargo install deliveryboy
 deliver --version
 ```
 
 Cargo installs the command into its binary directory, normally `~/.cargo/bin`. Make sure that directory is on your `PATH`.
 
-Once the public beta ships, `cargo install deliveryboy` will install the same
-`deliver` command without cloning the repository.
+Versioned macOS, Linux, and experimental Windows archives are also available
+from the GitHub release. Each release includes SHA-256 checksums and build
+attestations. Homebrew and WinGet packages will follow.
 
-Do not copy a binary from an untrusted source. Public releases will include checksums.
+Do not copy a binary from an untrusted source. Check its release checksum and
+attestation before running it.
 
 ## Detect your project
 

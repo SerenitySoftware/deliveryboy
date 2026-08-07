@@ -71,6 +71,9 @@ enum Commands {
     Plan {
         #[arg(long)]
         service: Vec<String>,
+        /// Preview this release version without prompting (e.g. 0.4.1)
+        #[arg(long)]
+        version: Option<String>,
         /// Emit JSON instead of text
         #[arg(long)]
         json: bool,
@@ -136,7 +139,11 @@ fn run(cli: &Cli) -> Result<i32> {
             write,
             force,
         } => cmd_init(path, host.as_deref(), dir.as_deref(), *write, *force),
-        Commands::Plan { service, json } => cmd_plan(cli.config.as_deref(), service, *json),
+        Commands::Plan {
+            service,
+            version,
+            json,
+        } => cmd_plan(cli.config.as_deref(), service, version.as_deref(), *json),
         Commands::Deploy {
             service,
             dry_run,
@@ -677,11 +684,29 @@ fn preflight_announced(
     report.ok()
 }
 
-fn cmd_plan(explicit: Option<&Path>, only: &[String], json: bool) -> Result<i32> {
+fn cmd_plan(
+    explicit: Option<&Path>,
+    only: &[String],
+    version_arg: Option<&str>,
+    json: bool,
+) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
-    let v = version_announced(&config, &repo_root(&path));
-    let compiled = compile_announced(&config, only, &repo_root(&path), &v)?;
+    let root = repo_root(&path);
+    let mut v = version_announced(&config, &root);
+    if let Some(wanted) = version_arg {
+        let prefix = version::previous_tag(&root)
+            .as_deref()
+            .and_then(version::SemVer::parse)
+            .map(|parsed| parsed.prefix)
+            .unwrap_or_else(|| "v".to_string());
+        v = v.with_release(
+            format!("{prefix}{}", wanted.trim_start_matches('v')),
+            "argument",
+        );
+        ui::detail(format!("planned release: {}", v.release_display()));
+    }
+    let compiled = compile_announced(&config, only, &root, &v)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&compiled)?);
     } else {

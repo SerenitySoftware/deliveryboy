@@ -109,6 +109,41 @@ fn plan_json_is_machine_readable() {
 }
 
 #[test]
+fn plan_version_expands_release_placeholders_without_running() {
+    let dir = tmpdir("plan-version");
+    let cfg = write_config(
+        &dir,
+        r#"
+version: 1
+app: self-release
+defaults: {target: local}
+targets:
+  local: {method: local, dir: .}
+services:
+  publish:
+    deployer: commands
+    config:
+      steps:
+        - command: echo release-{release}-version-{version}
+"#,
+    );
+    let out = deliver()
+        .arg("--config")
+        .arg(&cfg)
+        .args(["plan", "--version", "1.2.3"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("planned release: v1.2.3"), "{text}");
+    assert!(text.contains("echo release-v1.2.3-version-1.2.3"), "{text}");
+}
+
+#[test]
 fn unsupported_version_is_a_config_error() {
     let dir = tmpdir("version");
     let cfg = write_config(&dir, &SAMPLE.replace("version: 1", "version: 9"));

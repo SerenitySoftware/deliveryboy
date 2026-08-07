@@ -29,7 +29,11 @@ Check the config schema, service references, deployer names, and target names.
 
 ## `deliver plan`
 
-Compile and print every step without running it. Add `--json` for machine-readable output or `--service NAME` to select services.
+Compile and print every step without running it. Add `--json` for machine-readable output, `--service NAME` to select services, or `--version VERSION` to preview the exact release placeholders that a later deploy will use.
+
+```bash
+deliver plan --version 1.2.3
+```
 
 ## `deliver preflight`
 
