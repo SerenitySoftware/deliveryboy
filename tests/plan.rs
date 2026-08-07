@@ -278,7 +278,7 @@ targets: {{local: {{host: localhost, dir: /tmp/nope}}}}
 services:
   a:
     deployer: files
-    before: [{{command: "touch {}"}}]
+    before: [{{command: 'touch {}'}}]
     config: {{src: x.txt}}
 "#,
         marker.display()
@@ -364,7 +364,8 @@ fn discovers_deliveryboy_config_dir() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains(".deliveryboy/config.yml"));
+    let text = String::from_utf8_lossy(&out.stdout).replace('\\', "/");
+    assert!(text.contains(".deliveryboy/config.yml"), "{text}");
 }
 
 #[test]
@@ -1315,8 +1316,11 @@ fn tilde_in_key_path_is_expanded() {
         "    host: box.example.md\n    user: root\n    dir: /srv/demo\n    ssh:\n      key: ~/.ssh/demo.pem\n",
     );
     let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
-    let home = std::env::var("HOME").unwrap();
-    assert!(text.contains(&format!("-i {home}/.ssh/demo.pem")), "{text}");
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap();
+    let key = std::path::Path::new(&home).join(".ssh/demo.pem");
+    assert!(text.contains(&format!("-i {}", key.display())), "{text}");
 }
 
 // --- deploy version vs app release -----------------------------------------
@@ -2790,25 +2794,31 @@ fn backups_run_before_services_are_replaced() {
 #[test]
 fn a_failed_start_can_roll_back_to_the_previous_image() {
     let dir = compose_repo("compose-rollback", "");
-    let text = String::from_utf8_lossy(&run_in(&dir, &["deploy", "--dry-run"]).stdout).to_string();
+    let out = run_in(&dir, &["plan", "--json"]);
     assert!(
-        text.contains("mark the current image as rollback"),
-        "{text}"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let mark = text
-        .find("mark the current image as rollback")
-        .expect("no rollback tag step");
-    let load = text
-        .find("load image on the target")
-        .expect("no image load step");
-    let start = text.find("start services").expect("no start step");
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let steps = plan[0]["steps"].as_array().unwrap();
+    let step_index = |label| {
+        steps
+            .iter()
+            .position(|step| step["label"] == label)
+            .unwrap_or_else(|| panic!("no {label} step"))
+    };
+    let mark = step_index("mark the current image as rollback");
+    let load = step_index("load image on the target");
+    let start = step_index("start services");
     assert!(
         mark < load && load < start,
-        "outgoing image must be tagged before the new image replaces it: {text}"
+        "outgoing image must be tagged before the new image replaces it"
     );
-    // The start step advertises an undo.
-    let after = &text[start..];
-    assert!(after.contains("undo available"), "{after}");
+    let rollback = steps[start]["rollback"]
+        .as_str()
+        .expect("start step has no rollback");
+    assert!(rollback.contains("demo:rollback"), "{rollback}");
 }
 
 // --- secrets.define ---------------------------------------------------------

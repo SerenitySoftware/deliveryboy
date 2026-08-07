@@ -48,10 +48,12 @@ pub struct Status {
 }
 
 fn expand_tilde(path: &str) -> String {
-    match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
-        _ => path.to_string(),
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            return Path::new(&home).join(rest).to_string_lossy().to_string();
+        }
     }
+    path.to_string()
 }
 
 /// Scan a shell fragment for `security find-generic-password -s <service>`, which

@@ -145,8 +145,11 @@ fn default_port() -> u16 {
 /// `~` in a config path refers to the operator's home, not a literal directory.
 fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            return std::path::Path::new(&home)
+                .join(rest)
+                .to_string_lossy()
+                .to_string();
         }
     }
     path.to_string()
