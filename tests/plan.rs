@@ -2146,6 +2146,150 @@ fn tag_name_is_templated() {
 }
 
 #[test]
+fn after_tag_steps_are_planned_but_not_run_by_a_dry_run() {
+    let dir = local_deploy_repo("after-tag-dry-run");
+    git_init_tagged(&dir, "tmp");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["tag", "-d", "tmp"])
+        .output()
+        .unwrap();
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "  tag: {enabled: true}",
+        "  tag: {enabled: true}\n  after_tag:\n    - command: touch after-tag-marker",
+    );
+    std::fs::write(&cfg, body).unwrap();
+
+    let out = run_in(&dir, &["deploy", "--dry-run", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("after tag"), "{text}");
+    assert!(text.contains("touch after-tag-marker"), "{text}");
+    assert!(!dir.join("after-tag-marker").exists());
+    assert!(!tag_exists(&dir, "v2.0.0"));
+}
+
+#[test]
+fn after_tag_steps_run_only_after_the_tag_exists() {
+    let dir = local_deploy_repo("after-tag-order");
+    git_init_tagged(&dir, "tmp");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["tag", "-d", "tmp"])
+        .output()
+        .unwrap();
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "  tag: {enabled: true}",
+        "  tag: {enabled: true}\n  after_tag:\n    - command: git rev-parse -q --verify refs/tags/v2.0.0 >/dev/null && touch after-tag-marker",
+    );
+    std::fs::write(&cfg, body).unwrap();
+    for args in [vec!["add", "-A"], vec!["commit", "-qm", "add finalizer"]] {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(&args)
+            .output()
+            .unwrap();
+    }
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(tag_exists(&dir, "v2.0.0"));
+    assert!(dir.join("after-tag-marker").exists(), "{text}");
+}
+
+#[test]
+fn after_tag_requires_tagging() {
+    let dir = hugo_site_repo("after-tag-needs-tag");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "app: demo",
+        "app: demo\nversioning:\n  after_tag: [{command: true}]",
+    );
+    std::fs::write(&cfg, body).unwrap();
+
+    let out = run_in(&dir, &["validate"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("after_tag requires"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn after_tag_failure_leaves_the_tag_for_a_safe_retry() {
+    let dir = local_deploy_repo("after-tag-failure");
+    git_init_tagged(&dir, "tmp");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["tag", "-d", "tmp"])
+        .output()
+        .unwrap();
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "  tag: {enabled: true}",
+        "  tag: {enabled: true}\n  after_tag:\n    - command: exit 1",
+    );
+    std::fs::write(&cfg, body).unwrap();
+    for args in [
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "add failing finalizer"],
+    ] {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(&args)
+            .output()
+            .unwrap();
+    }
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(tag_exists(&dir, "v2.0.0"));
+    assert!(text.contains("safe retry"), "{text}");
+}
+
+#[test]
+fn partial_deploy_does_not_include_after_tag_steps() {
+    let dir = local_deploy_repo("after-tag-partial");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "  tag: {enabled: true}",
+        "  tag: {enabled: true}\n  after_tag:\n    - command: echo publish-whole-release",
+    );
+    std::fs::write(&cfg, body).unwrap();
+
+    let out = run_in(&dir, &["plan", "--service", "ship", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("publish-whole-release"), "{text}");
+}
+
+#[test]
 fn versioning_block_is_canonical_and_release_is_still_accepted() {
     for (key, name) in [("versioning", "vers-canonical"), ("release", "vers-legacy")] {
         let dir = hugo_site_repo(name);

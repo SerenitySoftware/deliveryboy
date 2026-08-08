@@ -15,6 +15,7 @@ First public beta of the standalone `deliver` CLI.
 - Clean-tree, branch, upstream, version, tag, and post-release notification
   controls.
 - Environment, dotenv, SOPS, macOS Keychain, and 1Password secret sources.
-- Self-hosted CLI releases through `.deliver.yml`, crates.io, and tagged GitHub
-  release builds.
+- Self-hosted CLI releases through `.deliver.yml`, crates.io, and local macOS
+  and Linux release builds uploaded to GitHub after tagging.
 - Release-specific previews through `deliver plan --version`.
+- Retriable `versioning.after_tag` commands for work that needs the final tag.

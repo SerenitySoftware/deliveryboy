@@ -26,14 +26,19 @@ grep -Fq 'cargo install deliveryboy' README.md || {
   exit 1
 }
 
-test -f .github/workflows/release.yml || {
-  echo ".github/workflows/release.yml is missing" >&2
-  exit 1
-}
+test -x scripts/release/build-local.sh
+test -x scripts/release/publish-github.sh
+test -f scripts/release/Dockerfile
 
 command -v cargo >/dev/null
 command -v git >/dev/null
 command -v hugo >/dev/null
 command -v curl >/dev/null
+command -v docker >/dev/null
+command -v gh >/dev/null
+command -v rustup >/dev/null
+
+docker info >/dev/null
+gh auth status >/dev/null
 
 echo "release metadata agrees on $version"

@@ -131,8 +131,14 @@ versioning:
     enabled: true
     name: "v{version}"
     push: true
+  after_tag:
+    - command: ./scripts/publish-release.sh {version} {work}
 ```
 
 Tags are created only after the release and its checks succeed.
+`after_tag` commands run only after the tag exists and a configured tag push
+succeeds. They can publish artifacts that earlier steps placed in `{work}`.
+They run only for a full deploy, not one selected with `--service`. Make these
+commands safe to retry: the tag and any earlier public step may already exist.
 
 Use `versioning.require_clean` and `versioning.require_pushed` for production releases. They keep a local edit or an unpushed commit from becoming a release no one else can reproduce.

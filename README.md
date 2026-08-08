@@ -8,8 +8,9 @@ machine. No Delivery Boy account, daemon, or hosted runner is required.
 
 ## Status
 
-The CLI is in public beta. macOS and Linux are the current release hosts.
-Windows binaries are experimental while native command execution is completed.
+The CLI is in public beta. Releases include macOS and Linux binaries built and
+tested on the release operator's machine. Windows support still needs native
+command execution and a local Windows test host.
 
 ## Install
 
@@ -29,8 +30,8 @@ cargo install --path .
 deliver --version
 ```
 
-Versioned macOS, Linux, and experimental Windows archives are attached to
-GitHub releases. Homebrew and WinGet packages will follow. Every install method
+Versioned macOS and Linux archives with SHA-256 checksums are attached to GitHub
+releases. Homebrew and WinGet packages will follow. Every install method
 provides the `deliver` command.
 
 ## Start a release

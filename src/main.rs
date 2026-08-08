@@ -785,25 +785,14 @@ fn cmd_deploy(
     if !verify_only && !dry_run {
         notifications::send(&config, &root, &v, "started", None);
     }
-    let outcome = exec::execute(&plan, &config.targets, dry_run)?;
+    let (release_plan, after_tag_plan): (Vec<_>, Vec<_>) =
+        plan.into_iter().partition(|service| !service.after_tag);
+    let outcome = exec::execute(&release_plan, &config.targets, dry_run)?;
 
     if outcome.ok {
-        ui::phase("Done");
-        ui::ok(format!(
-            "{} in {}",
-            if dry_run {
-                "dry run complete"
-            } else {
-                "deploy complete"
-            },
-            timer.elapsed()
-        ));
-        // The two outputs, side by side: our deploy id and the app's release.
-        ui::detail(format!("deploy version: {}", v.id));
-        ui::detail(format!("release:        {}", v.release_display()));
-
         // Tag what shipped, if configured. Only after success, and never on a
         // dry run — a tag should mean "this is live".
+        let mut tag_ready = dry_run;
         if let Some(tag_cfg) = config.versioning.as_ref().and_then(|r| r.tag.as_ref()) {
             if tag_cfg.enabled && !dry_run {
                 match version::tag_release(&root, &v, tag_cfg) {
@@ -817,12 +806,60 @@ fn cmd_deploy(
                         if let Some(note) = tag.note {
                             ui::note(note);
                         }
+                        tag_ready = !tag_cfg.push || tag.pushed;
                     }
                     // The deploy is done; failing to tag must not undo that.
                     Err(e) => ui::note(format!("not tagged: {e}")),
                 }
             }
         }
+
+        if !after_tag_plan.is_empty() {
+            if !tag_ready {
+                ui::phase("Failed");
+                ui::note("after-tag steps did not run because the release tag was not pushed.");
+                ui::note("fix the tag push, then run the same release again.");
+                if !dry_run {
+                    notifications::send(&config, &root, &v, "failed", Some("release tag"));
+                }
+                return Ok(1);
+            }
+            ui::phase(if dry_run {
+                "After tag (dry run)"
+            } else {
+                "After tag"
+            });
+            let finalized = exec::execute(&after_tag_plan, &config.targets, dry_run)?;
+            if !finalized.ok {
+                ui::phase("Failed");
+                ui::note("the release tag exists, but an after-tag step failed.");
+                ui::note("after-tag commands should support a safe retry of the same release.");
+                if !dry_run {
+                    notifications::send(
+                        &config,
+                        &root,
+                        &v,
+                        "failed",
+                        finalized.failed_step.as_deref(),
+                    );
+                }
+                return Ok(1);
+            }
+        }
+
+        ui::phase("Done");
+        ui::ok(format!(
+            "{} in {}",
+            if dry_run {
+                "dry run complete"
+            } else {
+                "deploy complete"
+            },
+            timer.elapsed()
+        ));
+        // The two outputs, side by side: our deploy id and the app's release.
+        ui::detail(format!("deploy version: {}", v.id));
+        ui::detail(format!("release:        {}", v.release_display()));
         if !verify_only && !dry_run {
             notifications::send(&config, &root, &v, "succeeded", None);
         }

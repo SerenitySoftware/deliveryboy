@@ -18,12 +18,13 @@ deliver --version
 
 Cargo installs the command into its binary directory, normally `~/.cargo/bin`. Make sure that directory is on your `PATH`.
 
-Versioned macOS, Linux, and experimental Windows archives are also available
-from the GitHub release. Each release includes SHA-256 checksums and build
-attestations. Homebrew and WinGet packages will follow.
+Versioned macOS and Linux archives are also available from the GitHub release.
+Delivery Boy builds and tests them on the release operator's machine, then
+uploads them after pushing the release tag. Each release includes SHA-256
+checksums. Homebrew and WinGet packages will follow.
 
-Do not copy a binary from an untrusted source. Check its release checksum and
-attestation before running it.
+Do not copy a binary from an untrusted source. Check its release checksum before
+running it.
 
 ## Detect your project
 

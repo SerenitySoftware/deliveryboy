@@ -18,6 +18,8 @@ versioning:
     name: "v{version}"
     annotate: true
     push: true
+  after_tag:
+    - command: ./scripts/release/publish-github.sh {version} {work}
 
 services:
   cli:
@@ -29,6 +31,7 @@ services:
         - command: cargo clippy --all-targets --locked -- -D warnings
         - command: cargo test --locked
         - command: hugo --source site --minify --destination {work}/site
+        - command: ./scripts/release/build-local.sh {version} {work}
         - command: cargo publish --dry-run --locked
         - command: ./scripts/release/publish-crate.sh {version}
 

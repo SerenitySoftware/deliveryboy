@@ -13,6 +13,9 @@ pub struct ServicePlan {
     /// Which host of that target these steps run against.
     pub host: String,
     pub steps: Vec<PlannedStep>,
+    /// These steps run after Delivery Boy creates and pushes the release tag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_tag: bool,
 }
 
 /// Kahn's algorithm over `needs`; errors on cycles.
@@ -85,7 +88,54 @@ pub fn build(
                 target: target_name.clone(),
                 host,
                 steps,
+                after_tag: false,
             });
+        }
+    }
+
+    // A partial service deploy must not publish a whole-app release. Full
+    // deploys append these steps to the plan so they remain visible in `plan`
+    // and preflight, but the command runner holds them until the tag exists.
+    if only.is_empty() {
+        if let Some(versioning) = &config.versioning {
+            if !versioning.after_tag.is_empty() {
+                let target_name = config
+                    .defaults
+                    .target
+                    .clone()
+                    .or_else(|| config.targets.keys().next().cloned())
+                    .ok_or_else(|| anyhow::anyhow!("versioning.after_tag needs a target"))?;
+                let target = config
+                    .targets
+                    .get(&target_name)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("unknown target '{target_name}'"))?;
+                let host = target.hosts()[0].clone();
+                let ctx = PlanContext {
+                    secrets: resolver,
+                    work_dir: crate::version::run_scratch(&config.app, &version.id)
+                        .to_string_lossy()
+                        .to_string(),
+                    app: config.app.clone(),
+                    target,
+                    host: host.clone(),
+                    sudo: false,
+                    repo_root: repo_root.to_path_buf(),
+                    version: version.clone(),
+                };
+                let steps = versioning
+                    .after_tag
+                    .iter()
+                    .map(|raw| crate::deployers::compile_raw_step(raw, &ctx))
+                    .collect::<Result<Vec<_>>>()?;
+                plan.push(ServicePlan {
+                    service: "after tag".to_string(),
+                    target: target_name,
+                    host,
+                    steps,
+                    after_tag: true,
+                });
+            }
         }
     }
     Ok(plan)

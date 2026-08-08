@@ -350,6 +350,11 @@ pub struct VersioningConfig {
     pub branch: Option<String>,
     #[serde(default)]
     pub tag: Option<TagConfig>,
+    /// Local steps that run only after the release tag exists and, when
+    /// configured, has been pushed. Use this for work that needs the final tag,
+    /// such as creating a GitHub release from artifacts built earlier.
+    #[serde(default)]
+    pub after_tag: Vec<serde_yaml::Value>,
 }
 
 fn default_notification_events() -> Vec<String> {
@@ -446,6 +451,17 @@ pub fn load(path: &Path) -> Result<Config> {
             if !config.services.contains_key(dep) {
                 bail!("service '{name}': needs unknown service '{dep}'");
             }
+        }
+    }
+    if let Some(versioning) = &config.versioning {
+        if !versioning.after_tag.is_empty()
+            && !versioning
+                .tag
+                .as_ref()
+                .map(|tag| tag.enabled)
+                .unwrap_or(false)
+        {
+            bail!("versioning.after_tag requires versioning.tag.enabled: true");
         }
     }
     for notice in &config.notifications {
