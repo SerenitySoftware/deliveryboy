@@ -3472,6 +3472,15 @@ services:
         text.contains("VITE_API_URL='https://api.example.md'"),
         "{text}"
     );
+    // Present is not the same as applied. `VAR=v cmd` binds to one command,
+    // so with `npm ci && npm run build` the variable reached `npm ci` and
+    // never the build — and a Vite app with a missing VITE_* does not fail,
+    // it silently ships its localhost fallback. Assert the form that
+    // survives the chain, not merely that the value appears somewhere.
+    assert!(
+        text.contains("export VITE_API_URL='https://api.example.md';"),
+        "build env must be exported so it reaches every command in the chain: {text}"
+    );
     assert!(text.contains("VITE_RELEASE='1.2.3'"), "{text}");
     // A directory src implies packaging and an atomic release — a bare scp of a
     // directory would leave the site half-written while it copied.
@@ -3697,4 +3706,69 @@ services:
         !text.contains("wc -l <"),
         "a missing first-run history file must not cause a shell redirection error: {text}"
     );
+}
+
+/// The shell behaviour the `export` above exists for.
+///
+/// Executable rather than asserted in prose, because the failure it
+/// prevents is invisible: the variable is right there in the command, the
+/// build exits 0, and the bundle ships pointing at localhost.
+#[test]
+fn an_env_prefix_does_not_survive_a_command_chain_but_an_export_does() {
+    fn sh(script: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("sh");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    // How Delivery Boy used to render it.
+    assert_eq!(
+        sh("OUT='yes' true && printf '%s' \"$OUT\""),
+        "",
+        "a VAR=value prefix reaches only the first command — this is the bug"
+    );
+
+    // How it renders now.
+    assert_eq!(
+        sh("export OUT='yes'; true && printf '%s' \"$OUT\""),
+        "yes",
+        "an export reaches every command in the chain"
+    );
+}
+
+#[test]
+fn a_quoted_env_value_is_still_escaped_after_the_export_change() {
+    // The escaping matters more with `export`: a value that broke out of
+    // its quotes would now run as a statement rather than as one command's
+    // environment.
+    let dir = tmpdir("files-build-quoting");
+    std::fs::create_dir_all(dir.join("apps/panel/dist")).unwrap();
+    std::fs::write(dir.join("apps/panel/dist/index.html"), "<html>").unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: demo
+defaults: {target: production}
+targets:
+  production: {host: box.example.md, dir: /srv/demo}
+services:
+  panel:
+    deployer: files
+    config:
+      build: npm run build
+      build_dir: apps/panel
+      src: apps/panel/dist
+      remote_subdir: panel
+      env: {AWKWARD: "it's \"quoted\""}
+"#,
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.2.3");
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+
+    assert!(text.contains("export AWKWARD='it'\\''s"), "{text}");
 }

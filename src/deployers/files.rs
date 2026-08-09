@@ -43,13 +43,21 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                 .replace("{sha}", &ctx.version.git.short_sha)
                 .replace("{work}", &ctx.work_dir())
         };
+        // `export`, not a `VAR=value cmd` prefix. A prefix binds to exactly
+        // one command, so with the near-universal
+        // `npm ci && npm run build` it reached `npm ci` and never the build
+        // that needs it — and a Vite app whose `VITE_*` variable is missing
+        // does not fail, it silently falls back to its localhost default
+        // and ships a bundle pointing at a developer's machine. That is
+        // how Meridian's panel went to production broken while
+        // `.deliver.yml` plainly declared the right value.
         let env: String = cfg
             .get("env")
             .and_then(|v| v.as_mapping())
             .map(|m| {
                 m.iter()
                     .filter_map(|(k, v)| Some((k.as_str()?, v.as_str()?)))
-                    .map(|(k, v)| format!("{k}='{}' ", expand(v).replace('\'', "'\\''")))
+                    .map(|(k, v)| format!("export {k}='{}'; ", expand(v).replace('\'', "'\\''")))
                     .collect()
             })
             .unwrap_or_default();
