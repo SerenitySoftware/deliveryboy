@@ -62,7 +62,7 @@ pub fn scrub(text: &str) -> String {
         return text.to_string();
     }
     let mut ordered: Vec<&(String, String)> = reg.iter().collect();
-    ordered.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    ordered.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
 
     let mut out = text.to_string();
     for (value, name) in ordered {
