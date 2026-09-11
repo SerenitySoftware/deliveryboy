@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Secret values resolved from the provider chain are now redacted from every
+  console path — `plan`, `plan --json`, step labels, rollback messages and
+  error chains — as `[redacted:NAME]`.
+
 ## 0.1.0 — 2026-08-07
 
 First public beta of the standalone `deliver` CLI.

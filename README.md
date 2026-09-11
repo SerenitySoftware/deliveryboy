@@ -50,6 +50,22 @@ deliver deploy
 `--write`. Treat `.deliver.yml` as release code: it can run local commands,
 upload files, and run commands on remote hosts.
 
+## Secrets in output
+
+Values resolved from your provider chain (environment, dotenv, SOPS, Keychain,
+1Password) are recorded for the length of the run and elided from everything
+`deliver` prints — the human plan, `deliver plan --json`, step labels during a
+deploy, and error messages — as `[redacted:NAME]`. The name is kept so the line
+still tells you what was there.
+
+Values shorter than six characters are not scrubbed: replacing them would
+corrupt unrelated output while protecting a value with no entropy to protect.
+
+```
+$ deliver plan
+   1. [command] build (.)  — export VITE_ANALYTICS_KEY='[redacted:BUILD_TOKEN]'; npm run build
+```
+
 ## Built-in deployers
 
 - Hugo sites and prepared files

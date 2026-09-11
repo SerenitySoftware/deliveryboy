@@ -54,6 +54,8 @@ pub fn build(
     version: &crate::version::DeployVersion,
 ) -> Result<Vec<ServicePlan>> {
     let resolver = std::rc::Rc::new(crate::secrets::resolver(config, repo_root)?);
+    // Learn this run's secret values before any of them can reach stdout.
+    crate::secrets::prime_redaction(&resolver);
     let mut plan = Vec::new();
     for name in topo_order(&config.services)? {
         let service = &config.services[&name];
@@ -166,5 +168,5 @@ pub fn render(plan: &[ServicePlan]) -> String {
         }
         out.push('\n');
     }
-    out.trim_end().to_string()
+    crate::secrets::redact::scrub(out.trim_end())
 }

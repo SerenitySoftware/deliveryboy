@@ -3772,3 +3772,179 @@ services:
 
     assert!(text.contains("export AWKWARD='it'\\''s"), "{text}");
 }
+
+// --- secret redaction ------------------------------------------------------
+// A resolved secret must not reach stdout or stderr by *any* route. The
+// individual sites that handle values (the rendered `.env`, the rendered vhost)
+// already keep their contents out of plan output; these tests lock the
+// whole-run guarantee, including the routes no single site owns.
+
+/// A config whose declared secret value also appears where the plan *does*
+/// print: a `files` build env literal. Without the scrubber the value goes
+/// straight to the terminal.
+const REDACTION_SAMPLE: &str = r#"
+version: 1
+app: redacted
+defaults: {target: production}
+secrets:
+  providers:
+    - file: .env.deploy
+  define: [BUILD_TOKEN]
+targets:
+  production: {host: redacted.example, user: root, dir: /var/universal/redacted}
+services:
+  web:
+    deployer: files
+    config:
+      src: dist
+      unpack: true
+      build: "npm run build"
+      env: {VITE_ANALYTICS_KEY: "zzz-shared-build-token-42"}
+"#;
+
+const REDACTION_SECRET: &str = "zzz-shared-build-token-42";
+
+fn redaction_fixture(name: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::create_dir_all(dir.join("dist")).unwrap();
+    std::fs::write(dir.join("dist/index.html"), "<html></html>").unwrap();
+    std::fs::write(
+        dir.join(".env.deploy"),
+        format!("BUILD_TOKEN={REDACTION_SECRET}\n"),
+    )
+    .unwrap();
+    write_config(&dir, REDACTION_SAMPLE);
+    dir
+}
+
+#[test]
+fn plan_redacts_a_resolved_secret_value() {
+    let dir = redaction_fixture("redact-plan");
+    let out = deliver()
+        .arg("--config")
+        .arg(dir.join("cfg.yml"))
+        .arg("plan")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The build step is planned — so the value really did reach the output path.
+    assert!(stdout.contains("VITE_ANALYTICS_KEY"), "{stdout}");
+    // …and it is elided, named so the line stays debuggable.
+    assert!(
+        !stdout.contains(REDACTION_SECRET) && !stderr.contains(REDACTION_SECRET),
+        "secret value reached the terminal\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("[redacted:BUILD_TOKEN]"), "{stdout}");
+}
+
+#[test]
+fn plan_json_redacts_a_resolved_secret_value() {
+    let dir = redaction_fixture("redact-json");
+    let out = deliver()
+        .arg("--config")
+        .arg(dir.join("cfg.yml"))
+        .arg("plan")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Still valid JSON after scrubbing, and still the plan it was.
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("plan --json is JSON");
+    assert!(parsed.as_array().is_some_and(|a| !a.is_empty()), "{stdout}");
+    assert!(
+        !stdout.contains(REDACTION_SECRET),
+        "secret value reached --json output:\n{stdout}"
+    );
+    assert!(stdout.contains("[redacted:BUILD_TOKEN]"), "{stdout}");
+}
+
+#[test]
+fn dry_run_redacts_a_resolved_secret_value() {
+    let dir = redaction_fixture("redact-dry-run");
+    let out = deliver()
+        .arg("--config")
+        .arg(dir.join("cfg.yml"))
+        .arg("deploy")
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Prove the run really walked the executor rather than bailing early —
+    // otherwise the assertion below passes for the wrong reason.
+    assert!(stderr.contains("dry run complete"), "{stderr}");
+    assert!(
+        !stdout.contains(REDACTION_SECRET) && !stderr.contains(REDACTION_SECRET),
+        "secret value reached a dry run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// The rendered-vhost path keeps contents out of the plan on its own; this
+/// pins that behaviour so a future change to the step kinds can't quietly
+/// start printing them.
+#[test]
+fn rendered_vhost_contents_never_reach_plan_output() {
+    let dir = tmpdir("redact-vhost");
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/site.conf"),
+        "server {\n  listen 80;\n  server_name redacted.example;\n  proxy_set_header X-Token __API_TOKEN__;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join(".env.deploy"), "API_TOKEN=zzz-vhost-token-99\n").unwrap();
+    write_config(
+        &dir,
+        r#"
+version: 1
+app: redacted
+defaults: {target: production}
+secrets:
+  providers:
+    - file: .env.deploy
+  define: [API_TOKEN]
+targets:
+  production: {host: redacted.example, user: root, dir: /var/universal/redacted}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config:
+      strategy: managed
+      conf: nginx/site.conf
+      render:
+        __API_TOKEN__: "{secret:API_TOKEN}"
+"#,
+    );
+    for args in [vec!["plan"], vec!["plan", "--json"]] {
+        let out = deliver()
+            .arg("--config")
+            .arg(dir.join("cfg.yml"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stdout.contains("zzz-vhost-token-99") && !stderr.contains("zzz-vhost-token-99"),
+            "{args:?} printed the rendered secret\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}

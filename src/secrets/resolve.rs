@@ -303,22 +303,26 @@ impl Resolver {
     pub fn get(&self, name: &str) -> Option<Found> {
         if let Some(source) = self.definition(name).and_then(|d| d.source.as_ref()) {
             let value = self.get_from(source, name)?;
-            return (!value.is_empty()).then(|| Found {
-                value,
-                provider: source.label(),
-            });
+            return (!value.is_empty()).then(|| self.found(name, value, source.label()));
         }
         for provider in &self.providers {
             if let Some(value) = self.get_from(provider, name) {
                 if !value.is_empty() {
-                    return Some(Found {
-                        value,
-                        provider: provider.label(),
-                    });
+                    return Some(self.found(name, value, provider.label()));
                 }
             }
         }
         None
+    }
+
+    /// The one place a resolved value leaves this type — so it is also the one
+    /// place that has to register it for redaction. Anything printed later
+    /// (plan, `--json`, step labels, an error chain, a subprocess's stderr) is
+    /// scrubbed against that registry, which is what keeps the guarantee from
+    /// depending on every future deployer remembering it.
+    fn found(&self, name: &str, value: String, provider: String) -> Found {
+        super::redact::record(name, &value);
+        Found { value, provider }
     }
 
     fn get_from(&self, provider: &Provider, name: &str) -> Option<String> {

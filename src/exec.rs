@@ -8,6 +8,7 @@
 use crate::config::Target;
 use crate::deployers::{PlannedStep, StepKind};
 use crate::plan::ServicePlan;
+use crate::secrets::redact::scrub;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -130,11 +131,12 @@ fn unwind(pending: Vec<(String, String, Target, String)>) -> usize {
     println!("\n↩ rolling back {} step(s)…", pending.len());
     let mut done = 0;
     for (label, undo, target, host) in pending.into_iter().rev() {
+        let label = scrub(&label);
         println!("  undo: {label}");
         match run_ssh(&target, &host, &undo) {
             Ok(true) => done += 1,
             Ok(false) => eprintln!("  ✗ rollback failed for: {label} — resolve by hand"),
-            Err(e) => eprintln!("  ✗ rollback error for {label}: {e}"),
+            Err(e) => eprintln!("  ✗ rollback error for {label}: {}", scrub(&e.to_string())),
         }
     }
     done
@@ -165,7 +167,7 @@ pub fn execute(
                 "    {:>2}/{}. {} [{}]",
                 i + 1,
                 work.len(),
-                step.label,
+                scrub(&step.label),
                 step.type_name()
             );
             let ok = run_step(step, target, &sp.host, dry_run)?;
@@ -176,13 +178,19 @@ pub fn execute(
                         "     (keeping build artifacts for debugging — `deliver clean` removes them)"
                     );
                 }
-                eprintln!("\n✗ failed: {} ({})", step.label, step.detail());
+                eprintln!(
+                    "\n✗ failed: {} ({})",
+                    scrub(&step.label),
+                    scrub(&step.detail())
+                );
                 eprintln!("  stopping — later steps and services will not run.");
                 let rolled_back = if dry_run { 0 } else { unwind(undoable) };
                 return Ok(Outcome {
                     ok: false,
                     rolled_back,
-                    failed_step: Some(step.label.clone()),
+                    // Travels on into the notification payload, so it leaves
+                    // here already scrubbed.
+                    failed_step: Some(scrub(&step.label)),
                 });
             }
             if let Some(undo) = &step.rollback {
@@ -196,11 +204,11 @@ pub fn execute(
         }
 
         for step in &cleanup {
-            println!("    cleanup: {}", step.label);
+            println!("    cleanup: {}", scrub(&step.label));
             // Never fail a good deploy over cleanup; just say so.
             match run_step(step, target, &sp.host, dry_run) {
                 Ok(true) => {}
-                _ => eprintln!("    (cleanup did not complete: {})", step.label),
+                _ => eprintln!("    (cleanup did not complete: {})", scrub(&step.label)),
             }
         }
         println!();
@@ -236,7 +244,10 @@ pub fn rollback(plan: &[ServicePlan], targets: &BTreeMap<String, Target>) -> Res
         let undo = step.rollback.as_ref().unwrap();
         println!(
             "  • {} → {} [{}]: {}",
-            sp.service, sp.target, sp.host, step.label
+            sp.service,
+            sp.target,
+            sp.host,
+            scrub(&step.label)
         );
         match run_ssh(target, &sp.host, undo) {
             Ok(true) => {}

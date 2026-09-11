@@ -7,6 +7,7 @@
 //! This runs in preflight too, so a missing signing key fails in a second rather
 //! than ten minutes into a notarized build.
 
+pub mod redact;
 pub mod resolve;
 
 pub use resolve::{parse_definitions, parse_providers, Resolver};
@@ -312,6 +313,22 @@ pub fn resolver(config: &Config, repo_root: &std::path::Path) -> anyhow::Result<
         definitions,
         repo_root,
     ))
+}
+
+/// Resolve every declared secret once so the redaction registry knows this
+/// run's values, then drop them.
+///
+/// Without this, only the names a deployer happened to ask for could be
+/// scrubbed — a value that reached the output by some other route (a config
+/// that also hardcodes it into a build env, a subprocess echoing it back)
+/// would print in full. Resolution is the same pass preflight already makes
+/// via [`declared_status`], and whole-file providers are cached, so this costs
+/// one lookup per declared name.
+pub fn prime_redaction(resolver: &Resolver) {
+    for name in resolver.declared_names() {
+        // Recording happens inside `get`; the value is dropped here.
+        let _ = resolver.get(&name);
+    }
 }
 
 /// Report on every declared secret: does it resolve, and from where. Values are

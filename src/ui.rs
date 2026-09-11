@@ -5,7 +5,12 @@
 //!
 //! Everything here writes to **stderr** except step/plan content, so `--json`
 //! output on stdout stays machine-readable.
+//!
+//! Every message goes through [`crate::secrets::redact::scrub`] on the way out:
+//! this is the console boundary, so a resolved secret that reached a message by
+//! any route stops here rather than at each caller's discretion.
 
+use crate::secrets::redact::scrub;
 use std::time::Instant;
 
 pub fn banner() {
@@ -14,24 +19,24 @@ pub fn banner() {
 
 /// Announce what happens next.
 pub fn phase(name: &str) {
-    eprintln!("\n▸ {name}");
+    eprintln!("\n▸ {}", scrub(name));
 }
 
 /// A fact under the current phase.
 pub fn detail(msg: impl AsRef<str>) {
-    eprintln!("    {}", msg.as_ref());
+    eprintln!("    {}", scrub(msg.as_ref()));
 }
 
 pub fn ok(msg: impl AsRef<str>) {
-    eprintln!("    ✓ {}", msg.as_ref());
+    eprintln!("    ✓ {}", scrub(msg.as_ref()));
 }
 
 pub fn fail(msg: impl AsRef<str>) {
-    eprintln!("    ✗ {}", msg.as_ref());
+    eprintln!("    ✗ {}", scrub(msg.as_ref()));
 }
 
 pub fn note(msg: impl AsRef<str>) {
-    eprintln!("  {}", msg.as_ref());
+    eprintln!("  {}", scrub(msg.as_ref()));
 }
 
 /// Wall-clock for the whole run, reported at the end.

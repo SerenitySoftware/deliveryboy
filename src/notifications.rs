@@ -125,7 +125,11 @@ fn post(webhook: &str, payload: &str) -> Result<(), String> {
         if output.status.success() {
             Ok(())
         } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+            // curl's own diagnostics can quote the URL it was given, which for
+            // a Slack webhook *is* the credential.
+            Err(crate::secrets::redact::scrub(
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ))
         }
     })();
     let _ = std::fs::remove_file(&config_path);
@@ -182,7 +186,10 @@ pub fn send(
         };
         match post(&webhook.value, &payload) {
             Ok(()) => println!("  ✓ Slack notice: {event}"),
-            Err(e) => eprintln!("  ! Slack notice failed: {e}"),
+            Err(e) => eprintln!(
+                "  ! Slack notice failed: {}",
+                crate::secrets::redact::scrub(&e)
+            ),
         }
     }
 }

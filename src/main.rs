@@ -123,7 +123,9 @@ fn main() {
     let code = match run(&cli) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("error: {err:#}");
+            // The last boundary: an error chain can carry a value picked up
+            // from a subprocess or a context string.
+            eprintln!("error: {}", secrets::redact::scrub_error(&err));
             2
         }
     };
@@ -708,7 +710,10 @@ fn cmd_plan(
     }
     let compiled = compile_announced(&config, only, &root, &v)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&compiled)?);
+        println!(
+            "{}",
+            secrets::redact::scrub(&serde_json::to_string_pretty(&compiled)?)
+        );
     } else {
         ui::phase("Plan (nothing is executed)");
         println!("{}", plan::render(&compiled));
