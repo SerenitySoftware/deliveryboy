@@ -50,6 +50,22 @@ deliver deploy
 `--write`. Treat `.deliver.yml` as release code: it can run local commands,
 upload files, and run commands on remote hosts.
 
+## What a release changes on the target
+
+Before `deliver deploy` executes anything, it reads the nginx vhost and Docker
+Compose file that are live on the target and prints a unified diff against what
+is about to replace them, then asks before applying it. Files that already match
+say `no changes to live config`. The read is read-only and never fails a
+release, and resolved secrets are elided from both sides of the diff.
+
+```
+▸ Live config on the target
+    stack → box.example.com:/var/universal/demo/docker-compose.yml
+       4       environment:
+       5 -       - LOG=info
+         +       - LOG=debug
+```
+
 ## Secrets in output
 
 Values resolved from your provider chain (environment, dotenv, SOPS, Keychain,

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `deliver deploy` diffs the nginx vhost and Docker Compose file it is about to
+  install against the ones running on the target, and asks before applying a
+  change. The read is read-only and never fails a release; secrets are elided
+  from both sides.
+
 ### Changed
 
 - Secret values resolved from the provider chain are now redacted from every

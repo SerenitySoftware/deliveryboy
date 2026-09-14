@@ -3948,3 +3948,281 @@ services:
         );
     }
 }
+
+// --- live config diff -------------------------------------------------------
+// The pre-deploy diff reads the target read-only, so these run a `--dry-run`
+// deploy against a `method: local` target: the "remote" is this machine, which
+// makes the whole path — compile, read, render — exercisable anywhere.
+
+#[test]
+fn a_vhost_that_is_not_on_the_target_yet_is_announced_as_a_new_file() {
+    let dir = tmpdir("livediff-new-vhost");
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/livediff-absent.conf"),
+        "server {\n  listen 80;\n  server_name livediff.example;\n}\n",
+    )
+    .unwrap();
+    write_config(
+        &dir,
+        r#"
+version: 1
+app: livediff
+defaults: {target: box}
+targets:
+  box: {host: localhost, method: local, sudo: false, dir: /var/universal/livediff}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config:
+      conf: nginx/livediff-absent.conf
+      provider: none
+"#,
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(dir.join("cfg.yml"))
+        .args(["deploy", "--dry-run"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("Live config on the target"), "{text}");
+    // /etc/nginx/sites-available/livediff-absent does not exist on a test box.
+    assert!(
+        text.contains("/etc/nginx/sites-available/livediff-absent"),
+        "{text}"
+    );
+    assert!(text.contains("new file"), "{text}");
+}
+
+#[test]
+fn the_live_config_diff_never_prints_a_rendered_secret() {
+    let dir = tmpdir("livediff-redacted");
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/livediff-secret.conf"),
+        "server {\n  listen 80;\n  proxy_set_header X-Token __API_TOKEN__;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join(".env.deploy"), "API_TOKEN=zzz-livediff-token-88\n").unwrap();
+    write_config(
+        &dir,
+        r#"
+version: 1
+app: livediff2
+defaults: {target: box}
+secrets:
+  providers:
+    - file: .env.deploy
+  define: [API_TOKEN]
+targets:
+  box: {host: localhost, method: local, sudo: false, dir: /var/universal/livediff2}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config:
+      conf: nginx/livediff-secret.conf
+      provider: none
+      render:
+        __API_TOKEN__: "{secret:API_TOKEN}"
+"#,
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(dir.join("cfg.yml"))
+        .args(["deploy", "--dry-run"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("Live config on the target"), "{text}");
+    assert!(
+        !text.contains("zzz-livediff-token-88"),
+        "the diff printed the rendered secret:\n{text}"
+    );
+}
+
+#[test]
+fn the_live_file_a_step_will_overwrite_stays_out_of_plan_json() {
+    let dir = tmpdir("livediff-json");
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/livediff-json.conf"),
+        "server {\n  listen 80;\n  server_name json.example;\n}\n",
+    )
+    .unwrap();
+    write_config(
+        &dir,
+        r#"
+version: 1
+app: livediffjson
+defaults: {target: production}
+targets:
+  production: {host: json.example, user: root, dir: /var/universal/livediffjson}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config:
+      conf: nginx/livediff-json.conf
+      provider: none
+"#,
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(dir.join("cfg.yml"))
+        .args(["plan", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(parsed.is_array(), "{stdout}");
+    // The step carries the file's contents for the diff; --json must not.
+    assert!(!stdout.contains("live_config"), "{stdout}");
+    assert!(!stdout.contains("server_name json.example"), "{stdout}");
+}
+
+/// A live file that exists and differs. Needs a target directory the test owns,
+/// which is the compose deployer's `{target.dir}/{file}` rather than nginx's
+/// fixed `/etc/nginx` path — and a compose plan always compiles a `docker
+/// build`, so preflight needs to *find* a docker on PATH. It is never run: the
+/// deploy is a dry run.
+#[cfg(unix)]
+#[test]
+fn a_changed_compose_file_is_diffed_against_the_one_running_on_the_target() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmpdir("livediff-compose");
+    let live = dir.join("live");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let stub = bin.join("docker");
+    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  web:\n    image: demo:latest\n    ports:\n      - \"8080:80\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        live.join("docker-compose.yml"),
+        "services:\n  web:\n    image: demo:latest\n    ports:\n      - \"9090:80\"\n",
+    )
+    .unwrap();
+    write_config(
+        &dir,
+        &format!(
+            r#"
+version: 1
+app: livediffcompose
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  stack:
+    deployer: docker-compose
+    config: {{files: [docker-compose.yml]}}
+"#,
+            live.display()
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .env("PATH", path)
+        .arg("--config")
+        .arg(dir.join("cfg.yml"))
+        .args(["deploy", "--dry-run"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("Live config on the target"), "{text}");
+    // The port that is live goes, the port being shipped arrives.
+    assert!(text.contains("- ") && text.contains("9090:80"), "{text}");
+    assert!(text.contains("8080:80"), "{text}");
+    // Unchanged lines around the hunk are context, not additions.
+    assert!(text.contains("image: demo:latest"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_compose_file_that_already_matches_says_so_instead_of_diffing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmpdir("livediff-compose-same");
+    let live = dir.join("live");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let stub = bin.join("docker");
+    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let body = "services:\n  web:\n    image: demo:latest\n";
+    std::fs::write(dir.join("docker-compose.yml"), body).unwrap();
+    std::fs::write(live.join("docker-compose.yml"), body).unwrap();
+    write_config(
+        &dir,
+        &format!(
+            r#"
+version: 1
+app: livediffsame
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  stack:
+    deployer: docker-compose
+    config: {{files: [docker-compose.yml]}}
+"#,
+            live.display()
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .env("PATH", path)
+        .arg("--config")
+        .arg(dir.join("cfg.yml"))
+        .args(["deploy", "--dry-run"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("no changes to live config"), "{text}");
+}

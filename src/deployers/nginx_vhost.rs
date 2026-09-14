@@ -522,7 +522,11 @@ fn certbot_ensure_step(cert: &CertNeed, cfg: &Value, ctx: &PlanContext) -> Plann
     )
 }
 
-fn install_step(spec: &VhostSpec, ctx: &PlanContext) -> PlannedStep {
+/// `content` is what will land at `sites-available/<site>`: the rendered text
+/// when the vhost has a `render:` block, otherwise the conf as it sits in the
+/// repo. Passed in rather than re-derived so the diff can never disagree with
+/// what the step actually installs.
+fn install_step(spec: &VhostSpec, ctx: &PlanContext, content: Option<&str>) -> PlannedStep {
     let sudo = ctx.sudo_prefix();
     let root = ctx.target.dir.trim_end_matches('/');
     let site = &spec.site_name;
@@ -547,10 +551,14 @@ fn install_step(spec: &VhostSpec, ctx: &PlanContext) -> PlannedStep {
          rm -f \"$BAK\"; echo \"installed {site}\"",
         spec.conf
     );
-    PlannedStep::ssh(
+    let step = PlannedStep::ssh(
         format!("install vhost {site} (validate + rollback on failure)"),
         script,
-    )
+    );
+    match content {
+        Some(text) => step.with_live_config(&available, text),
+        None => step,
+    }
 }
 
 pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
@@ -582,6 +590,9 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // --- render placeholders --------------------------------------------------
     // Substituted here rather than on the target: the value never crosses the
     // wire as an argument, and a missing secret fails before anything installs.
+    // What each vhost will actually contain once installed, so the install step
+    // can carry it for the pre-deploy diff.
+    let mut rendered_confs: std::collections::BTreeMap<String, String> = Default::default();
     if let Some(map) = cfg.get("render").and_then(|v| v.as_mapping()) {
         let mut subs = Vec::new();
         for (key, template) in map {
@@ -607,6 +618,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                 rendered = rendered.replace(key.as_str(), value);
             }
             let staged = format!("{}/{}", ctx.work_dir(), default_site_name(&spec.conf));
+            rendered_confs.insert(spec.conf.clone(), rendered.clone());
             steps.push(PlannedStep::write_file(
                 format!("render {} ({} placeholder(s))", spec.conf, subs.len()),
                 staged.clone(),
@@ -716,7 +728,18 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         other => bail!("nginx-vhost: unknown cert provider '{other}' (certbot|none)"),
     }
 
-    steps.extend(specs.iter().map(|spec| install_step(spec, ctx)));
+    for spec in &specs {
+        // A conf with no `render:` block ships byte-for-byte from the repo, so
+        // reading it here is reading exactly what will be installed. A conf we
+        // cannot read is not a new failure: the step still compiles, it just
+        // carries nothing to diff (and preflight already reports the missing
+        // file).
+        let content = match rendered_confs.get(&spec.conf) {
+            Some(text) => Some(text.clone()),
+            None => std::fs::read_to_string(ctx.repo_root.join(&spec.conf)).ok(),
+        };
+        steps.push(install_step(spec, ctx, content.as_deref()));
+    }
 
     // An nginx deploy is only "done" if the config parses and the running nginx
     // has picked it up. That's true of every vhost deploy, so it's implicit —

@@ -313,10 +313,15 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         format!("{sudo}mkdir -p {root}"),
     ));
     for file in &files {
-        steps.push(PlannedStep::command(
-            format!("ship {file}"),
-            ctx.copy(file, &root),
-        ));
+        let step = PlannedStep::command(format!("ship {file}"), ctx.copy(file, &root));
+        // The compose file is shipped byte-for-byte, so what is in the repo is
+        // what lands on the target — which makes it diffable against the one
+        // currently running there. Unreadable is not a failure here; the copy
+        // step itself will say so, and preflight runs first.
+        steps.push(match std::fs::read_to_string(ctx.repo_root.join(file)) {
+            Ok(text) => step.with_live_config(format!("{root}/{file}"), text),
+            Err(_) => step,
+        });
     }
 
     // Anything else the stack reads off the host — a nats.conf, prometheus

@@ -3,6 +3,7 @@
 //! Exit codes: 0 ok · 1 step/verify failure · 2 config or usage error.
 
 mod config;
+mod configdiff;
 mod deployers;
 mod detect;
 mod exec;
@@ -721,6 +722,43 @@ fn cmd_plan(
     Ok(0)
 }
 
+/// Show what the release changes in the target's live infrastructure config,
+/// and — when something does change — let the operator stop before it happens.
+///
+/// Returns false only when a human said no. Every failure mode here (an
+/// unreadable file, an unreachable host, no stdin) prints and continues: this
+/// is a window onto the deploy, not a new gate in front of it.
+fn live_config_approved(
+    config: &config::Config,
+    plan: &[plan::ServicePlan],
+    assume_yes: bool,
+    dry_run: bool,
+) -> bool {
+    let pending = configdiff::collect(plan);
+    if pending.is_empty() {
+        return true;
+    }
+    ui::phase("Live config on the target");
+    let changes = configdiff::read_live(pending, &config.targets);
+    if let Some(report) = configdiff::render(&changes) {
+        for line in report.lines() {
+            ui::detail(line);
+        }
+    }
+    if !configdiff::any_changes(&changes) {
+        return true;
+    }
+    // A dry run never blocks (see `resolve_release`), and --yes already said so.
+    if dry_run || assume_yes {
+        return true;
+    }
+    match prompt_yes_no("Apply these changes to the live config?") {
+        Ok(Some(answer)) => answer,
+        // No stdin is not a refusal — it is CI, which chose this deploy already.
+        Ok(None) | Err(_) => true,
+    }
+}
+
 fn cmd_deploy(
     explicit: Option<&Path>,
     only: &[String],
@@ -780,6 +818,15 @@ fn cmd_deploy(
         ui::phase("Aborted");
         ui::note("preflight failed — nothing was built, shipped, or changed.");
         return Ok(2);
+    }
+
+    // What this release changes in the config already running on the target.
+    // Read-only, so a dry run gets it too — "what would this do to the box?" is
+    // exactly the question a preview is for.
+    if !verify_only && !live_config_approved(&config, &plan, assume_yes, dry_run) {
+        ui::phase("Aborted");
+        ui::note("canceled — nothing was built, shipped, or changed.");
+        return Ok(0);
     }
 
     ui::phase(match (verify_only, dry_run) {

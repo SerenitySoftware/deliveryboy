@@ -41,6 +41,20 @@ pub enum StepKind {
     },
 }
 
+/// A long-lived config file on the target that a step overwrites, carried
+/// alongside the step so `deliver` can diff it against what is running there
+/// before the swap (see [`crate::configdiff`]).
+///
+/// Attached at compile time, by the deployer that already computed the content,
+/// so there is no second code path deriving the same bytes a second way.
+#[derive(Debug, Clone)]
+pub struct LiveConfig {
+    /// Absolute path of the file as it exists on the target.
+    pub remote_path: String,
+    /// Exactly what this deploy will put there.
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PlannedStep {
     pub label: String,
@@ -59,6 +73,11 @@ pub struct PlannedStep {
     /// artifacts survive for debugging.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cleanup: bool,
+    /// The live file this step replaces, when it replaces one. Never
+    /// serialized: a rendered vhost carries resolved secrets, exactly like
+    /// `WriteFile::content`.
+    #[serde(skip_serializing)]
+    pub live_config: Option<LiveConfig>,
 }
 
 impl PlannedStep {
@@ -72,6 +91,7 @@ impl PlannedStep {
             rollback: None,
             cleanup: false,
             secret: false,
+            live_config: None,
         }
     }
     pub fn command_in(
@@ -88,6 +108,7 @@ impl PlannedStep {
             rollback: None,
             cleanup: false,
             secret: false,
+            live_config: None,
         }
     }
     pub fn ssh(label: impl Into<String>, command: impl Into<String>) -> Self {
@@ -99,6 +120,7 @@ impl PlannedStep {
             rollback: None,
             cleanup: false,
             secret: false,
+            live_config: None,
         }
     }
 
@@ -119,6 +141,7 @@ impl PlannedStep {
             rollback: None,
             cleanup: false,
             secret: true,
+            live_config: None,
         }
     }
 
@@ -147,11 +170,26 @@ impl PlannedStep {
             rollback: None,
             cleanup: false,
             secret: false,
+            live_config: None,
         }
     }
 
     pub fn with_rollback(mut self, rollback: impl Into<String>) -> Self {
         self.rollback = Some(rollback.into());
+        self
+    }
+
+    /// Declare the live file this step overwrites, so a deploy can show what it
+    /// changes on the target before changing it.
+    pub fn with_live_config(
+        mut self,
+        remote_path: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        self.live_config = Some(LiveConfig {
+            remote_path: remote_path.into(),
+            content: content.into(),
+        });
         self
     }
 
