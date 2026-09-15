@@ -26,6 +26,7 @@ pub fn compile(check: &Value, ctx: &PlanContext) -> Result<PlannedStep> {
             cleanup: false,
             secret: false,
             live_config: None,
+            release_state: None,
         });
     }
     if let Some(cmd) = check.get("remote_command").and_then(|v| v.as_str()) {

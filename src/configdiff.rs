@@ -23,8 +23,8 @@
 
 use crate::config::Target;
 use crate::plan::ServicePlan;
+use crate::remote::{capture, nonce, shell_quote};
 use std::collections::BTreeMap;
-use std::process::{Command, Stdio};
 
 /// Lines of unchanged context printed around each hunk.
 const CONTEXT: usize = 3;
@@ -99,21 +99,6 @@ pub fn collect(plan: &[ServicePlan]) -> Vec<Pending> {
     pending
 }
 
-/// A marker no config file will contain, used to frame each file in the output
-/// of the one batched read.
-fn nonce() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
-        .unwrap_or(0);
-    format!("__DELIVER_CFG_{:016x}_{}__", nanos, std::process::id())
-}
-
-/// Single-quote a path for `sh`.
-fn shell_quote(path: &str) -> String {
-    format!("'{}'", path.replace('\'', r"'\''"))
-}
-
 /// Build the one script that reads every path for a host.
 ///
 /// `cat` writes no trailing newline of its own, so the script always adds
@@ -174,27 +159,6 @@ fn parse_read(output: &str, nonce: &str) -> BTreeMap<String, Live> {
         }
     }
     found
-}
-
-/// Run the read on the target. `method: local` reads this machine, matching how
-/// [`crate::exec::run_ssh`] treats a local target.
-fn capture(target: &Target, host: &str, script: &str) -> std::io::Result<String> {
-    let out = if target.is_local() {
-        Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .stderr(Stdio::null())
-            .output()?
-    } else {
-        Command::new("ssh")
-            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
-            .args(target.ssh_args())
-            .arg(format!("{}@{host}", target.ssh.user))
-            .arg(script)
-            .stderr(Stdio::null())
-            .output()?
-    };
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 /// Read the live side of every pending file, one connection per (target, host).

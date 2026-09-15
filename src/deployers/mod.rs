@@ -55,6 +55,26 @@ pub struct LiveConfig {
     pub content: String,
 }
 
+/// Where a service keeps its deploy state on the target, carried alongside the
+/// step that writes it so `deliver status` / `deliver history` can read back
+/// what is live (see [`crate::readback`]).
+///
+/// Declared at compile time by the deployer that already computed these paths,
+/// for the same reason [`LiveConfig`] is: the read-back must look exactly where
+/// the deploy wrote, and a second derivation of the same paths is a second
+/// thing to drift.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReleaseState {
+    /// The append-only TSV of past deploys (`.deliver/history.tsv`).
+    pub history_path: String,
+    /// The symlink pointing at the live release, for deployers that use the
+    /// atomic release layout. `None` for a deployer that has no such layout
+    /// (Compose replaces containers in place).
+    pub live_path: Option<String>,
+    /// The directory holding retained releases, when there is one.
+    pub releases_dir: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PlannedStep {
     pub label: String,
@@ -78,6 +98,11 @@ pub struct PlannedStep {
     /// `WriteFile::content`.
     #[serde(skip_serializing)]
     pub live_config: Option<LiveConfig>,
+    /// Where this step records what was deployed, when it records anything.
+    /// Not serialized: it is compile-time metadata for a local read-back, not
+    /// part of the step the executor runs.
+    #[serde(skip_serializing)]
+    pub release_state: Option<ReleaseState>,
 }
 
 impl PlannedStep {
@@ -92,6 +117,7 @@ impl PlannedStep {
             cleanup: false,
             secret: false,
             live_config: None,
+            release_state: None,
         }
     }
     pub fn command_in(
@@ -109,6 +135,7 @@ impl PlannedStep {
             cleanup: false,
             secret: false,
             live_config: None,
+            release_state: None,
         }
     }
     pub fn ssh(label: impl Into<String>, command: impl Into<String>) -> Self {
@@ -121,6 +148,7 @@ impl PlannedStep {
             cleanup: false,
             secret: false,
             live_config: None,
+            release_state: None,
         }
     }
 
@@ -142,6 +170,7 @@ impl PlannedStep {
             cleanup: false,
             secret: true,
             live_config: None,
+            release_state: None,
         }
     }
 
@@ -171,6 +200,7 @@ impl PlannedStep {
             cleanup: false,
             secret: false,
             live_config: None,
+            release_state: None,
         }
     }
 
@@ -189,6 +219,22 @@ impl PlannedStep {
         self.live_config = Some(LiveConfig {
             remote_path: remote_path.into(),
             content: content.into(),
+        });
+        self
+    }
+
+    /// Declare where this step records the deploy, so `status` and `history`
+    /// can read it back from the target later.
+    pub fn with_release_state(
+        mut self,
+        history_path: impl Into<String>,
+        live_path: Option<String>,
+        releases_dir: Option<String>,
+    ) -> Self {
+        self.release_state = Some(ReleaseState {
+            history_path: history_path.into(),
+            live_path,
+            releases_dir,
         });
         self
     }

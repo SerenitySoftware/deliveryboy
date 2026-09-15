@@ -4,6 +4,11 @@
 
 ### Added
 
+- `deliver status` and `deliver history` read back what is deployed: the release
+  the live symlink points at, when it landed and from which commit, the retained
+  releases, and the deploys recorded in `.deliver/history.tsv`. Read-only, one
+  connection per target, `--json` for scripts. A target that cannot be read
+  exits `1` rather than reporting an empty deployment.
 - `deliver deploy` diffs the nginx vhost and Docker Compose file it is about to
   install against the ones running on the target, and asks before applying a
   change. The read is read-only and never fails a release; secrets are elided

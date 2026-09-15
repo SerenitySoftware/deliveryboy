@@ -51,6 +51,28 @@ deliver deploy --version 1.2.3
 
 `--service NAME` can be repeated. `--version` supplies the release version without a prompt. `--yes` accepts a tag already present on `HEAD`; it does not invent an untagged release.
 
+## `deliver status`
+
+Read back what is live on the target right now: the release the live symlink points at, when it was deployed and from which commit, how many releases are retained, and how many deploys are on record. Nothing is modified — it is one read per target.
+
+```bash
+deliver status
+deliver status --service web --json
+```
+
+Services deployed with `files` or `hugo` answer from the release symlink; `docker-compose` services have no symlink, so they answer from the newest recorded deploy and say so. A target that cannot be read is reported as such and exits `1`, so a failed read never looks like "nothing is deployed".
+
+## `deliver history`
+
+List the deploys recorded on the target, newest first, marking the one that is live.
+
+```bash
+deliver history
+deliver history --limit 0
+```
+
+`--limit N` shows the newest `N` per service (default 10); `--limit 0` shows every recorded deploy.
+
 ## `deliver verify`
 
 Run only the checks from the selected services.

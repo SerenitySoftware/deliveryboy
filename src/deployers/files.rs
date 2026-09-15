@@ -243,7 +243,15 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                | {sudo}tee -a {state}/.deliver/history.tsv >/dev/null; \
              echo \"deploy #$N · {stamp} · release {release}\""
         ),
-    ));
+        )
+        // The read-back looks exactly where this step writes: `deliver status`
+        // and `deliver history` are this record read back off the target.
+        .with_release_state(
+            format!("{state}/.deliver/history.tsv"),
+            Some(live.clone()),
+            Some(releases.clone()),
+        ),
+    );
 
     // Cleanup: the shipped archive has served its purpose once unpacked. Left
     // alone it accumulates in the deploy directory forever.

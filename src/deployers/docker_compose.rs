@@ -591,7 +591,11 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                | {sudo}tee -a {root}/.deliver/history.tsv >/dev/null; \
              echo \"deploy #$N · {stamp} · release {release}\""
         ),
-    ));
+        )
+        // Compose replaces containers in place, so there is no live symlink and
+        // no retained release directory — the history is the whole record.
+        .with_release_state(format!("{root}/.deliver/history.tsv"), None, None),
+    );
 
     // --- tidy ----------------------------------------------------------------
     if cfg_bool(cfg, "prune", true) {

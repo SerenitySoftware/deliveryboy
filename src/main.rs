@@ -10,6 +10,8 @@ mod exec;
 mod notifications;
 mod plan;
 mod preflight;
+mod readback;
+mod remote;
 mod secrets;
 mod ui;
 mod verify;
@@ -98,6 +100,25 @@ enum Commands {
         #[arg(long)]
         service: Vec<String>,
     },
+    /// Show what is live on the target right now
+    Status {
+        #[arg(long)]
+        service: Vec<String>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the deploys recorded on the target, newest first
+    History {
+        #[arg(long)]
+        service: Vec<String>,
+        /// How many deploys to show per service (0 for all)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Roll back to the previous release (repoints the live symlink)
     Rollback {
         #[arg(long)]
@@ -163,6 +184,19 @@ fn run(cli: &Cli) -> Result<i32> {
         Commands::Verify { service } => {
             cmd_deploy(cli.config.as_deref(), service, false, true, true, None)
         }
+        Commands::Status { service, json } => {
+            cmd_readback(cli.config.as_deref(), service, Readback::Status, *json)
+        }
+        Commands::History {
+            service,
+            limit,
+            json,
+        } => cmd_readback(
+            cli.config.as_deref(),
+            service,
+            Readback::History { limit: *limit },
+            *json,
+        ),
         Commands::Rollback { service } => cmd_rollback(cli.config.as_deref(), service),
         Commands::Preflight { service } => cmd_preflight(cli.config.as_deref(), service),
         Commands::Secrets { action } => cmd_secrets(cli.config.as_deref(), action),
@@ -932,6 +966,87 @@ fn cmd_deploy(
         }
         Ok(1)
     }
+}
+
+/// Which read-back the operator asked for.
+enum Readback {
+    Status,
+    History { limit: usize },
+}
+
+/// `deliver status` / `deliver history` — read the target's own record of what
+/// was deployed, and print it.
+///
+/// Both commands compile the plan for the same reason `rollback` does: the plan
+/// is where the deployers declare the paths they write, so the read looks
+/// exactly where the write went. Nothing on the target is modified, and no
+/// release is resolved — there is no deploy here to version.
+fn cmd_readback(
+    explicit: Option<&Path>,
+    only: &[String],
+    what: Readback,
+    json: bool,
+) -> Result<i32> {
+    ui::banner();
+    let (config, path) = load_announced(explicit)?;
+    let root = repo_root(&path);
+    // Quietly: announcing a "deploy version" here would invite reading it as
+    // the thing that is live, which is the one question this command answers.
+    let v = version::resolve(
+        &root,
+        config
+            .versioning
+            .as_ref()
+            .and_then(|r| r.version_from.as_deref()),
+    );
+    let plan = plan::build(&config, only, &root, &v)?;
+    let requests = readback::collect(&plan);
+    if requests.is_empty() {
+        ui::phase("Nothing to read back");
+        ui::note(
+            "no service in this config records deploy state on the target — \
+             that record is written by the files/hugo and docker-compose deployers.",
+        );
+        return Ok(0);
+    }
+
+    ui::phase("Reading the target");
+    ui::detail(format!(
+        "{} service(s): {}",
+        requests.len(),
+        requests
+            .iter()
+            .map(|r| r.service.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    let statuses = readback::read(requests, &config.targets);
+
+    if json {
+        println!(
+            "{}",
+            secrets::redact::scrub(&serde_json::to_string_pretty(&statuses)?)
+        );
+    } else {
+        ui::phase(match what {
+            Readback::Status => "Live on the target",
+            Readback::History { .. } => "Deploy history",
+        });
+        println!(
+            "{}",
+            match what {
+                Readback::Status => readback::render_status(&statuses),
+                Readback::History { limit } => readback::render_history(&statuses, limit),
+            }
+        );
+    }
+
+    // A target that could not be read is a failed answer, not an empty one —
+    // scripts calling this must be able to tell the difference.
+    if statuses.iter().any(|s| !s.reachable) {
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 fn cmd_rollback(explicit: Option<&Path>, only: &[String]) -> Result<i32> {

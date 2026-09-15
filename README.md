@@ -50,6 +50,27 @@ deliver deploy
 `--write`. Treat `.deliver.yml` as release code: it can run local commands,
 upload files, and run commands on remote hosts.
 
+## What is live right now
+
+Every release-based deploy writes its own record on the target — the live path
+is a symlink named after the deploy id, retained releases sit beside it, and
+`.deliver/history.tsv` gets a row per deploy. `deliver status` and
+`deliver history` read that back, so "what version is on prod?" does not mean an
+ssh session and a `readlink`.
+
+```
+▸ web  → production (box.example.com)
+    live          v0.2.0 · 20260202-1000-bbb2222
+    deployed      2026-02-02T10:00:00Z · sha bbb2222dea
+    path          /var/universal/demo/web → /var/universal/demo/releases/20260202-1000-bbb2222
+    retained      5 release(s)
+    history       12 deploy(s) recorded
+```
+
+Both are read-only and take one connection per target. `--json` gives the same
+answer for scripts; a target that cannot be read is reported and exits `1`,
+never rendered as "nothing is deployed".
+
 ## What a release changes on the target
 
 Before `deliver deploy` executes anything, it reads the nginx vhost and Docker

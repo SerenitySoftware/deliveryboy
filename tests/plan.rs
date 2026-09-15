@@ -4226,3 +4226,410 @@ services:
     assert!(out.status.success(), "{text}");
     assert!(text.contains("no changes to live config"), "{text}");
 }
+
+// --- release read-back (`deliver status` / `deliver history`) ----------------
+// The read is read-only, so these run against a `method: local` target: the
+// "remote" is this machine, and a fixture directory laid out the way a deploy
+// leaves one exercises the whole path — compile, probe, parse, render.
+
+/// Build the on-target layout a `files` deploy produces: two releases, a live
+/// symlink at the newer one, and the history rows the record step appends.
+#[cfg(unix)]
+fn deployed_fixture(dir: &std::path::Path, live_release: Option<&str>) -> std::path::PathBuf {
+    let root = dir.join("live");
+    std::fs::create_dir_all(root.join("releases/20260101-0900-aaa1111")).unwrap();
+    std::fs::create_dir_all(root.join("releases/20260202-1000-bbb2222")).unwrap();
+    std::fs::create_dir_all(root.join(".deliver")).unwrap();
+    std::fs::write(
+        root.join(".deliver/history.tsv"),
+        "1\t20260101-0900-aaa1111\tv0.1.0\taaa1111deadbeef00\t2026-01-01T09:00:00Z\n\
+         2\t20260202-1000-bbb2222\tv0.2.0\tbbb2222deadbeef00\t2026-02-02T10:00:00Z\n",
+    )
+    .unwrap();
+    if let Some(release) = live_release {
+        std::os::unix::fs::symlink(root.join("releases").join(release), root.join("web")).unwrap();
+    }
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi\n").unwrap();
+    root
+}
+
+#[cfg(unix)]
+fn files_config(dir: &std::path::Path, root: &std::path::Path) -> std::path::PathBuf {
+    write_config(
+        dir,
+        &format!(
+            r#"
+version: 1
+app: readback
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+"#,
+            root.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn status_reads_back_the_release_the_live_symlink_points_at() {
+    let dir = tmpdir("readback-status");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    // The symlink is the authority on what is live, and history names it.
+    assert!(text.contains("v0.2.0 · 20260202-1000-bbb2222"), "{text}");
+    assert!(text.contains("2026-02-02T10:00:00Z"), "{text}");
+    assert!(text.contains("2 release(s)"), "{text}");
+    assert!(text.contains("2 deploy(s) recorded"), "{text}");
+    // The older release is retained, not live.
+    assert!(!text.contains("v0.1.0 · "), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn history_lists_recorded_deploys_newest_first_and_marks_the_live_one() {
+    let dir = tmpdir("readback-history");
+    let root = deployed_fixture(&dir, Some("20260101-0900-aaa1111"));
+    let cfg = files_config(&dir, &root);
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("history")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let newer = stdout.find("20260202-1000-bbb2222").unwrap();
+    let older = stdout.find("20260101-0900-aaa1111").unwrap();
+    assert!(newer < older, "newest deploy should come first:\n{stdout}");
+    // The symlink points at the *older* release here, so that is the live row.
+    let live_line = stdout
+        .lines()
+        .find(|l| l.contains("← live"))
+        .unwrap_or_default();
+    assert!(live_line.contains("20260101-0900-aaa1111"), "{stdout}");
+    // Full shas are shortened for the column, not printed whole.
+    assert!(!stdout.contains("aaa1111deadbeef00"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn history_limit_shows_the_newest_rows_and_says_how_many_it_hid() {
+    let dir = tmpdir("readback-limit");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .args(["history", "--limit", "1"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("20260202-1000-bbb2222"), "{stdout}");
+    assert!(!stdout.contains("20260101-0900-aaa1111"), "{stdout}");
+    assert!(stdout.contains("1 older deploy(s)"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn status_on_a_target_that_has_never_been_deployed_to_says_so() {
+    let dir = tmpdir("readback-never");
+    let root = dir.join("empty");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi\n").unwrap();
+    let cfg = files_config(&dir, &root);
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Nothing deployed is a complete, successful answer — not a failure.
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("nothing deployed yet"), "{text}");
+    assert!(text.contains("0 deploy(s) recorded"), "{text}");
+}
+
+#[test]
+fn status_exits_nonzero_when_the_target_cannot_be_read() {
+    let dir = tmpdir("readback-unreachable");
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi\n").unwrap();
+    // Port 1 refuses immediately, so this is a fast, offline failure.
+    let cfg = write_config(
+        &dir,
+        r#"
+version: 1
+app: readback
+defaults: {target: box}
+targets:
+  box: {host: 127.0.0.1, user: nobody, port: 1, dir: /var/universal/readback}
+services:
+  web:
+    deployer: files
+    config: {src: site, remote_subdir: web}
+"#,
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("could not read the target"), "{text}");
+    // An unreadable target must never be rendered as "nothing is deployed".
+    assert!(!text.contains("nothing deployed yet"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn status_json_is_machine_readable() {
+    let dir = tmpdir("readback-json");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let web = &parsed[0];
+    assert_eq!(web["service"], "web");
+    assert_eq!(web["reachable"], true);
+    assert_eq!(web["live"]["kind"], "release");
+    assert_eq!(web["history"][0]["release"], "v0.2.0");
+    assert_eq!(web["history"][0]["deploy_id"], "20260202-1000-bbb2222");
+    assert_eq!(web["releases"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn a_config_that_records_nothing_on_the_target_says_so_instead_of_reading_it() {
+    let dir = tmpdir("readback-nothing");
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/readback.conf"),
+        "server {\n  listen 80;\n  server_name readback.example;\n}\n",
+    )
+    .unwrap();
+    let cfg = write_config(
+        &dir,
+        r#"
+version: 1
+app: readbacknone
+defaults: {target: production}
+targets:
+  production: {host: readback.example, user: root, dir: /var/universal/readbacknone}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config: {conf: nginx/readback.conf, provider: none}
+"#,
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("Nothing to read back"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_compose_service_reads_back_from_its_history_because_it_has_no_symlink() {
+    let dir = tmpdir("readback-compose");
+    let root = dir.join("live");
+    std::fs::create_dir_all(root.join(".deliver")).unwrap();
+    std::fs::write(
+        root.join(".deliver/history.tsv"),
+        "7\t20260404-1100-ddd4444\tv1.0.0\tddd4444deadbeef00\t2026-04-04T11:00:00Z\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  web:\n    image: demo:latest\n",
+    )
+    .unwrap();
+    let cfg = write_config(
+        &dir,
+        &format!(
+            r#"
+version: 1
+app: readbackcompose
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  stack:
+    deployer: docker-compose
+    config: {{files: [docker-compose.yml]}}
+"#,
+            root.display()
+        ),
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("v1.0.0 · 20260404-1100-ddd4444"), "{text}");
+    assert!(text.contains("no live symlink"), "{text}");
+    // Compose keeps no release directories, so it must claim no retained count.
+    assert!(!text.contains("retained"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_read_back_never_prints_a_resolved_secret() {
+    let dir = tmpdir("readback-redacted");
+    let root = dir.join("live");
+    std::fs::create_dir_all(root.join("releases/20260505-1200-eee5555")).unwrap();
+    std::fs::create_dir_all(root.join(".deliver")).unwrap();
+    // A release name carrying a value that is also a declared secret: whatever
+    // route a secret takes into this output, it stops at the console boundary.
+    std::fs::write(
+        root.join(".deliver/history.tsv"),
+        "1\t20260505-1200-eee5555\tzzz-readback-token-77\teee5555deadbeef00\t2026-05-05T12:00:00Z\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        root.join("releases/20260505-1200-eee5555"),
+        root.join("web"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi\n").unwrap();
+    std::fs::write(dir.join(".env.deploy"), "API_TOKEN=zzz-readback-token-77\n").unwrap();
+    let cfg = write_config(
+        &dir,
+        &format!(
+            r#"
+version: 1
+app: readbacksecret
+defaults: {{target: box}}
+secrets:
+  providers:
+    - file: .env.deploy
+  define: [API_TOKEN]
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+"#,
+            root.display()
+        ),
+    );
+    for command in [vec!["status"], vec!["history"], vec!["status", "--json"]] {
+        let out = deliver()
+            .current_dir(&dir)
+            .arg("--config")
+            .arg(&cfg)
+            .args(&command)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        assert!(
+            !text.contains("zzz-readback-token-77"),
+            "`deliver {}` printed a resolved secret:\n{text}",
+            command.join(" ")
+        );
+        assert!(text.contains("[redacted:API_TOKEN]"), "{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_live_path_that_is_a_plain_directory_is_not_reported_as_a_release() {
+    let dir = tmpdir("readback-unmanaged");
+    let root = dir.join("live");
+    // What a box looks like before its first release-layout deploy: the served
+    // path is a real directory, not a symlink into releases/.
+    std::fs::create_dir_all(root.join("web")).unwrap();
+    std::fs::write(root.join("web/index.html"), "old\n").unwrap();
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi\n").unwrap();
+    let cfg = files_config(&dir, &root);
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("not a release symlink"), "{text}");
+}
