@@ -231,6 +231,11 @@ fn cmd_init(
         return Ok(0);
     }
 
+    let host = host.unwrap_or("CHANGEME.example.com");
+    let dir = dir
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("/var/universal/{app}"));
+
     ui::phase("Detected deploy strategies");
     for f in &findings {
         let status = match f.deployer {
@@ -238,12 +243,16 @@ fn cmd_init(
             None => "→ no deployer yet (informational)".to_string(),
         };
         println!("  • {}  {status}", f.evidence);
+        // What the scaffold could not work out for itself. Saying it here, next
+        // to the evidence, is the difference between a config that is ready and
+        // one that only looks ready.
+        for note in &f.notes {
+            println!(
+                "      ! {}",
+                note.replace("{app}", &app).replace("{host}", host)
+            );
+        }
     }
-
-    let host = host.unwrap_or("CHANGEME.example.com");
-    let dir = dir
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("/var/universal/{app}"));
     let yaml = detect::scaffold(&app, host, &dir, &findings);
     let dest = root.join(config::CONFIG_FILENAME);
 

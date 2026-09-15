@@ -23,6 +23,10 @@ deliver init
 deliver init --write --host example.com --dir /var/www/example
 ```
 
+It scaffolds every shape it can map to a deployer: a Hugo site, an nginx vhost, a Docker Compose project, and a macOS app. What it writes comes from what the repo says — the Compose file's own Postgres service and named volumes become the `backup:` block, an Xcode project becomes the `xcodebuild:` block, a `fastlane/Fastfile` becomes a lane — and `--host` fills in the URLs.
+
+Anything it cannot work out is printed as a `!` note under the finding rather than guessed at. In particular no `env_file:` block is scaffolded: that block makes Delivery Boy *render* the env file from literals and resolved secrets, so an empty one would ship an empty `.env` over a working one. Add it yourself with `from_secrets:` once the secret names are declared.
+
 ## `deliver validate`
 
 Check the config schema, service references, deployer names, and target names.

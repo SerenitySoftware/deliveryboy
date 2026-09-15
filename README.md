@@ -111,6 +111,11 @@ $ deliver plan
 - signed and notarized macOS applications
 - explicit local and SSH commands
 
+`deliver init` scaffolds a config for every one of these it finds, reading the
+repo for the details — the Compose file's Postgres service and named volumes
+become the backup block, an Xcode project or fastlane lane becomes the macOS
+build strategy. What it cannot work out it prints as a note instead of guessing.
+
 Delivery Boy uses the tools each release needs, such as Git, SSH, Hugo, Docker,
 or Xcode. The `deliver` binary itself does not require a hosted service.
 

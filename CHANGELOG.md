@@ -4,6 +4,13 @@
 
 ### Added
 
+- `deliver init` scaffolds the `docker-compose` and `macos-app` deployers. Both
+  shapes were detected before but emitted no deployer, so a Compose-only repo
+  dead-ended at "No known deploy strategy detected". The Compose `backup:` block
+  is read out of the Compose file (its Postgres service, declared user and
+  database, named volumes) and the macOS stub from the Xcode project or fastlane
+  lane, with appcast URLs filled from `--host`. What `init` cannot work out is
+  printed as a note rather than guessed at.
 - `deliver status` and `deliver history` read back what is deployed: the release
   the live symlink points at, when it landed and from which commit, the retained
   releases, and the deploys recorded in `.deliver/history.tsv`. Read-only, one

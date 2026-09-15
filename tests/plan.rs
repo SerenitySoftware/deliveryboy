@@ -4633,3 +4633,203 @@ fn a_live_path_that_is_a_plain_directory_is_not_reported_as_a_release() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("not a release symlink"), "{text}");
 }
+
+// --- `deliver init` scaffolding for compose and macOS ------------------------
+// Before this, both shapes were detected but emitted no deployer, so
+// `scaffold()` dropped them: a Compose-only repo — the commonest shape in the
+// fleet this tool was built for — dead-ended at "No known deploy strategy
+// detected".
+
+fn compose_only_repo(name: &str, compose: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::write(dir.join("docker-compose.yml"), compose).unwrap();
+    std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+    dir
+}
+
+fn init_output(dir: &std::path::Path, extra: &[&str]) -> String {
+    let mut cmd = deliver();
+    cmd.args(["init", "--path"]).arg(dir).args(extra);
+    let out = cmd.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    text
+}
+
+const COMPOSE_WITH_DB: &str = r#"
+services:
+  app:
+    build: .
+    env_file: .env
+    depends_on: [db]
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: demouser
+      POSTGRES_DB: demodb
+volumes:
+  demo_pgdata:
+  demo_media:
+"#;
+
+#[test]
+fn init_scaffolds_the_compose_deployer_instead_of_dead_ending() {
+    let dir = compose_only_repo("init-compose", COMPOSE_WITH_DB);
+    let text = init_output(&dir, &["--host", "demo.example.com"]);
+    assert!(
+        !text.contains("No known deploy strategy detected"),
+        "{text}"
+    );
+    assert!(text.contains("deployer: docker-compose"), "{text}");
+    // A list must be a YAML sequence, not a string with a comma in it.
+    assert!(text.contains("files: [docker-compose.yml]"), "{text}");
+    assert!(text.contains("platform: linux/amd64"), "{text}");
+}
+
+#[test]
+fn the_compose_backup_block_comes_from_the_compose_file_not_a_guess() {
+    let dir = compose_only_repo("init-compose-backup", COMPOSE_WITH_DB);
+    let text = init_output(&dir, &["--host", "demo.example.com"]);
+    assert!(text.contains("service: db"), "{text}");
+    // user/name are written only because the compose file states them.
+    assert!(text.contains("user: demouser"), "{text}");
+    assert!(text.contains("name: demodb"), "{text}");
+    assert!(
+        text.contains("volumes: [demo_pgdata, demo_media]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_compose_project_with_no_database_scaffolds_no_backup_block() {
+    let dir = compose_only_repo("init-compose-nodb", "services:\n  app:\n    build: .\n");
+    let text = init_output(&dir, &["--host", "demo.example.com"]);
+    assert!(text.contains("deployer: docker-compose"), "{text}");
+    // Nothing to back up, so nothing claimed.
+    assert!(!text.contains("backup:"), "{text}");
+}
+
+#[test]
+fn the_scaffolded_compose_config_is_a_config_the_cli_can_actually_run() {
+    let dir = compose_only_repo("init-compose-roundtrip", COMPOSE_WITH_DB);
+    // Write it, then feed it straight back in: the scaffold is only worth
+    // anything if `validate` and `plan` accept it unedited.
+    init_output(&dir, &["--host", "demo.example.com", "--write"]);
+    let cfg = dir.join(".deliver.yml");
+    assert!(cfg.exists());
+
+    let validated = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert!(
+        validated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validated.stderr)
+    );
+
+    let planned = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("plan")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&planned.stdout).to_string();
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    assert!(
+        text.contains("docker build --platform linux/amd64"),
+        "{text}"
+    );
+    assert!(
+        text.contains("docker compose -f docker-compose.yml"),
+        "{text}"
+    );
+    assert!(text.contains("pg_dump -U demouser"), "{text}");
+    assert!(text.contains("back up volume demo_pgdata"), "{text}");
+}
+
+#[test]
+fn init_says_what_the_compose_scaffold_could_not_work_out() {
+    let dir = tmpdir("init-compose-notes");
+    // No Dockerfile and no `build:` — the deployer always builds, so this would
+    // fail at `docker build` and the operator should hear it now.
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  app:\n    image: demo:latest\n    env_file: [.env, .env.prod]\n",
+    )
+    .unwrap();
+    let text = init_output(&dir, &["--host", "demo.example.com"]);
+    assert!(text.contains("no Dockerfile found"), "{text}");
+    assert!(text.contains(".env, .env.prod"), "{text}");
+    assert!(text.contains("env_file:"), "{text}");
+    // The note is advice, not a scaffolded block that would ship an empty .env.
+    assert!(!text.contains("      env_file:"), "{text}");
+}
+
+#[test]
+fn init_scaffolds_a_macos_app_stub_from_an_xcode_project() {
+    let dir = tmpdir("init-macos");
+    std::fs::create_dir_all(dir.join("apps/macos/Demo.xcodeproj")).unwrap();
+    let text = init_output(&dir, &["--host", "demo.example.com"]);
+    assert!(
+        !text.contains("No known deploy strategy detected"),
+        "{text}"
+    );
+    assert!(text.contains("deployer: macos-app"), "{text}");
+    assert!(text.contains("strategy: xcodebuild"), "{text}");
+    assert!(
+        text.contains("project: apps/macos/Demo.xcodeproj"),
+        "{text}"
+    );
+    assert!(text.contains("scheme: Demo"), "{text}");
+    // The appcast URL is the host init was given, not a hardcoded placeholder.
+    assert!(
+        text.contains("url: https://demo.example.com/download/mac/appcast.xml"),
+        "{text}"
+    );
+    assert!(text.contains("-sparkle-private"), "{text}");
+    assert!(text.contains("Sparkle EdDSA private key"), "{text}");
+}
+
+#[test]
+fn init_prefers_a_fastlane_lane_over_raw_xcodebuild_when_one_exists() {
+    let dir = tmpdir("init-macos-fastlane");
+    std::fs::create_dir_all(dir.join("apps/macos/Demo.xcodeproj")).unwrap();
+    std::fs::create_dir_all(dir.join("fastlane")).unwrap();
+    std::fs::write(dir.join("fastlane/Fastfile"), "lane :release do\nend\n").unwrap();
+    let text = init_output(&dir, &["--host", "demo.example.com"]);
+    assert!(text.contains("strategy: fastlane"), "{text}");
+    assert!(text.contains("lane: release"), "{text}");
+    assert!(!text.contains("strategy: xcodebuild"), "{text}");
+}
+
+#[test]
+fn the_scaffolded_macos_stub_is_a_config_the_cli_can_actually_load() {
+    let dir = tmpdir("init-macos-roundtrip");
+    std::fs::create_dir_all(dir.join("apps/macos/Demo.xcodeproj")).unwrap();
+    init_output(&dir, &["--host", "demo.example.com", "--write"]);
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(dir.join(".deliver.yml"))
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
