@@ -12,6 +12,7 @@ mod plan;
 mod preflight;
 mod readback;
 mod remote;
+mod rollback;
 mod secrets;
 mod ui;
 mod verify;
@@ -123,6 +124,10 @@ enum Commands {
     Rollback {
         #[arg(long)]
         service: Vec<String>,
+        /// Roll back to this retained deploy id instead of one step back
+        /// (`deliver history` lists the ids)
+        #[arg(long, value_name = "DEPLOY_ID")]
+        to: Option<String>,
     },
     /// Run the preflight checks only (tools, input files, ssh reachability)
     Preflight {
@@ -197,7 +202,10 @@ fn run(cli: &Cli) -> Result<i32> {
             Readback::History { limit: *limit },
             *json,
         ),
-        Commands::Rollback { service } => cmd_rollback(cli.config.as_deref(), service),
+        Commands::Rollback { service, to } => match to {
+            Some(deploy_id) => cmd_rollback_to(cli.config.as_deref(), service, deploy_id),
+            None => cmd_rollback(cli.config.as_deref(), service),
+        },
         Commands::Preflight { service } => cmd_preflight(cli.config.as_deref(), service),
         Commands::Secrets { action } => cmd_secrets(cli.config.as_deref(), action),
         Commands::Clean => cmd_clean(cli.config.as_deref()),
@@ -1072,6 +1080,123 @@ fn cmd_rollback(explicit: Option<&Path>, only: &[String]) -> Result<i32> {
         Ok(0)
     } else {
         ui::phase("Failed");
+        Ok(1)
+    }
+}
+
+/// `deliver rollback --to <deploy-id>` — restore any *retained* release, not
+/// just the one step back `.deliver-previous` records.
+///
+/// Reads the target first (the same read `deliver status` does), resolves
+/// every selected service against the requested id, and only then swaps. A
+/// service that cannot be satisfied refuses the whole run while the target is
+/// still untouched, so a multi-service rollback never half-lands.
+fn cmd_rollback_to(explicit: Option<&Path>, only: &[String], deploy_id: &str) -> Result<i32> {
+    ui::banner();
+    let timer = ui::Timer::start();
+    if !rollback::id_is_addressable(deploy_id) {
+        ui::phase("Failed");
+        ui::fail(format!("{deploy_id} is not a deploy id"));
+        ui::note("a deploy id is one directory name — `deliver history` lists them.");
+        return Ok(2);
+    }
+    let (config, path) = load_announced(explicit)?;
+    let root = repo_root(&path);
+    // Quietly, as the read-back does: the release being restored is already on
+    // the target, so announcing a "deploy version" resolved from this checkout
+    // would name something this command has no intention of shipping.
+    let v = version::resolve(
+        &root,
+        config
+            .versioning
+            .as_ref()
+            .and_then(|r| r.version_from.as_deref()),
+    );
+    let plan = plan::build(&config, only, &root, &v)?;
+    let requests = readback::collect(&plan);
+    if requests.is_empty() {
+        ui::phase("Failed");
+        ui::fail("no service in this config keeps releases on the target");
+        ui::note("`--to` addresses a retained release directory, which the files and hugo deployers write.");
+        return Ok(2);
+    }
+
+    ui::phase("Reading the target");
+    ui::detail(format!(
+        "{} service(s): {}",
+        requests.len(),
+        requests
+            .iter()
+            .map(|r| r.service.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    let statuses = readback::read(requests, &config.targets);
+    let resolved = rollback::resolve(&statuses, &config.targets, deploy_id);
+
+    // Every refusal is reported, not just the first: an operator fixing a
+    // multi-service run wants the whole list in one pass.
+    let refusals: Vec<&rollback::Refusal> = resolved
+        .iter()
+        .filter_map(|r| match r {
+            rollback::Resolution::Refused(refusal) => Some(refusal),
+            _ => None,
+        })
+        .collect();
+    if !refusals.is_empty() {
+        ui::phase("Failed");
+        for refusal in &refusals {
+            ui::fail(format!("{}: {}", refusal.service, refusal.reason));
+        }
+        ui::note("nothing was changed on the target.");
+        return Ok(refusals.iter().map(|r| r.exit_code).max().unwrap_or(2));
+    }
+
+    let swaps: Vec<&rollback::Swap> = resolved
+        .iter()
+        .filter_map(|r| match r {
+            rollback::Resolution::Ready(swap) => Some(swap),
+            _ => None,
+        })
+        .collect();
+    if swaps.is_empty() {
+        ui::phase("Done");
+        ui::ok(format!("{deploy_id} is already live everywhere selected"));
+        return Ok(0);
+    }
+
+    ui::phase(&format!("Rolling back to {deploy_id}"));
+    for resolution in &resolved {
+        if let rollback::Resolution::AlreadyLive { service, .. } = resolution {
+            ui::detail(format!("{service}: already live, left alone"));
+        }
+    }
+    for swap in &swaps {
+        ui::detail(rollback::describe(swap));
+    }
+
+    let mut all_ok = true;
+    for swap in &swaps {
+        let target = &config.targets[&swap.target];
+        match exec::run_ssh(target, &swap.host, &swap.command) {
+            Ok(true) => {}
+            _ => {
+                all_ok = false;
+                ui::fail(format!("{}: rollback failed", swap.service));
+            }
+        }
+    }
+    if all_ok {
+        ui::phase("Done");
+        ui::ok(format!(
+            "rolled back {} service(s) to {deploy_id} in {}",
+            swaps.len(),
+            timer.elapsed()
+        ));
+        Ok(0)
+    } else {
+        ui::phase("Failed");
+        ui::note("some services did not swap — `deliver status` says where each one stands.");
         Ok(1)
     }
 }

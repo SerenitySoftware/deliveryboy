@@ -85,6 +85,24 @@ Run only the checks from the selected services.
 
 Restore the previous release for services that support rollback.
 
+```bash
+deliver rollback
+deliver rollback --to 20260202-1000-bbb2222
+```
+
+Without `--to`, each service goes one step back, to the release that was live
+before the last deploy. `--to <deploy-id>` restores any release still retained
+on the target instead, so you can skip past a release that was itself bad.
+`deliver history` lists the ids.
+
+The target is read before anything is changed. A deploy id that is no longer
+retained is refused with the list of ids that are, an id that is already live
+is left alone, and a deployer that keeps no release directories (`docker-compose`
+replaces containers in place) is told to use plain `deliver rollback`. If any
+selected service cannot be satisfied, nothing is changed anywhere — so a
+multi-service rollback never half-lands. Narrow the run with `--service NAME`
+when only one app should move.
+
 ## `deliver secrets`
 
 Show every declared secret and whether a configured provider can resolve it. Values are not printed.

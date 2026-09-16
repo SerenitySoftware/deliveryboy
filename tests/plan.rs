@@ -4833,3 +4833,212 @@ fn the_scaffolded_macos_stub_is_a_config_the_cli_can_actually_load() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// --- targeted rollback (`deliver rollback --to <deploy-id>`) -----------------
+// `--to` reads the target and then mutates it, so like the read-back tests
+// these run against a `method: local` target whose "remote" is a fixture
+// directory laid out the way a `files` deploy leaves one.
+
+/// The atomic swap both `deliver deploy` and `deliver rollback` perform is
+/// `mv -Tf`, which is GNU coreutils only — BSD `mv` (macOS) has no `-T`. The
+/// deployers target Linux hosts, so that is the right command to ship and the
+/// wrong thing to fork per platform; the tests that actually execute a swap
+/// therefore only assert where `mv` can perform one. Everything up to the
+/// swap — validation, refusals, the no-op — is portable and runs everywhere.
+fn mv_can_replace_a_symlink() -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("mv -Tf /nonexistent-deliver-probe /nonexistent-deliver-probe2 2>&1")
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).contains("illegal option"))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn live_release_of(root: &std::path::Path) -> String {
+    std::fs::read_link(root.join("web"))
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string()
+}
+
+#[cfg(unix)]
+fn rollback_to(dir: &std::path::Path, cfg: &std::path::Path, id: &str) -> std::process::Output {
+    deliver()
+        .current_dir(dir)
+        .arg("--config")
+        .arg(cfg)
+        .args(["rollback", "--to", id])
+        .output()
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_to_repoints_the_live_symlink_at_a_retained_release() {
+    if !mv_can_replace_a_symlink() {
+        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
+        return;
+    }
+    let dir = tmpdir("rollback-to-retained");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    let out = rollback_to(&dir, &cfg, "20260101-0900-aaa1111");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    // The one thing that matters: what the web server will now follow.
+    assert_eq!(live_release_of(&root), "20260101-0900-aaa1111", "{text}");
+    // Both ends are named before it acts, by release as well as by id.
+    assert!(
+        text.contains("v0.2.0 · 20260202-1000-bbb2222 → v0.1.0 · 20260101-0900-aaa1111"),
+        "{text}"
+    );
+    // And the previous-release marker now names what *was* live, so a plain
+    // `deliver rollback` after this one steps back to it rather than to a
+    // release two swaps stale.
+    let marker = std::fs::read_to_string(root.join("releases/.deliver-previous")).unwrap();
+    assert!(marker.trim().ends_with("20260202-1000-bbb2222"), "{marker}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_plain_rollback_after_a_targeted_one_steps_back_to_where_it_came_from() {
+    if !mv_can_replace_a_symlink() {
+        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
+        return;
+    }
+    let dir = tmpdir("rollback-to-then-back");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    assert!(rollback_to(&dir, &cfg, "20260101-0900-aaa1111")
+        .status
+        .success());
+    assert_eq!(live_release_of(&root), "20260101-0900-aaa1111");
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("rollback")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_to_an_unretained_id_refuses_and_lists_what_is_retained() {
+    let dir = tmpdir("rollback-to-unretained");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    let out = rollback_to(&dir, &cfg, "20251212-0000-zzz9999");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("20260101-0900-aaa1111"), "{text}");
+    assert!(text.contains("20260202-1000-bbb2222"), "{text}");
+    assert!(text.contains("nothing was changed on the target"), "{text}");
+    // Refused before it acted: the symlink is exactly where it was.
+    assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_to_the_release_that_is_already_live_is_a_successful_no_op() {
+    let dir = tmpdir("rollback-to-already-live");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    let out = rollback_to(&dir, &cfg, "20260202-1000-bbb2222");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("already live"), "{text}");
+    assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{text}");
+    // A no-op must not rewrite the previous-release marker either.
+    assert!(!root.join("releases/.deliver-previous").exists(), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_to_rejects_an_id_that_is_not_a_single_directory_name() {
+    let dir = tmpdir("rollback-to-traversal");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    for bogus in ["../../etc", "20260101-0900-aaa1111/..", "$(whoami)"] {
+        let out = rollback_to(&dir, &cfg, bogus);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(2), "{bogus}: {text}");
+        assert!(text.contains("is not a deploy id"), "{bogus}: {text}");
+        assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{bogus}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_to_refuses_a_deployer_that_keeps_no_release_directories() {
+    // A local target, so the read succeeds and the refusal is about the
+    // *layout* rather than about an unreachable host.
+    let dir = tmpdir("rollback-to-compose");
+    let root = dir.join("live");
+    std::fs::create_dir_all(root.join(".deliver")).unwrap();
+    std::fs::write(
+        root.join(".deliver/history.tsv"),
+        "1\t20260101-0900-aaa1111\tv0.1.0\taaa1111deadbeef00\t2026-01-01T09:00:00Z\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services: {app: {image: demo:latest}}\n",
+    )
+    .unwrap();
+    let cfg = write_config(
+        &dir,
+        &format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  app:
+    deployer: docker-compose
+    config: {{file: docker-compose.yml}}
+"#,
+            root.display()
+        ),
+    );
+    let out = rollback_to(&dir, &cfg, "20260101-0900-aaa1111");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    // Compose replaces containers in place: there is no symlink to repoint,
+    // and the refusal has to say which command *does* work.
+    assert!(text.contains("no release directories"), "{text}");
+    assert!(text.contains("deliver rollback"), "{text}");
+    assert!(text.contains("nothing was changed on the target"), "{text}");
+}

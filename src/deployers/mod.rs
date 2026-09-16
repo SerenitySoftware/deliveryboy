@@ -73,6 +73,12 @@ pub struct ReleaseState {
     pub live_path: Option<String>,
     /// The directory holding retained releases, when there is one.
     pub releases_dir: Option<String>,
+    /// The file the activate step writes the outgoing release path to, so a
+    /// one-step `deliver rollback` can find it. `Some` wherever
+    /// `releases_dir` is, because a targeted rollback has to keep it honest:
+    /// after swapping the live symlink somewhere else, the marker must name
+    /// what *was* live, not what was live two rollbacks ago.
+    pub previous_marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -223,19 +229,10 @@ impl PlannedStep {
         self
     }
 
-    /// Declare where this step records the deploy, so `status` and `history`
-    /// can read it back from the target later.
-    pub fn with_release_state(
-        mut self,
-        history_path: impl Into<String>,
-        live_path: Option<String>,
-        releases_dir: Option<String>,
-    ) -> Self {
-        self.release_state = Some(ReleaseState {
-            history_path: history_path.into(),
-            live_path,
-            releases_dir,
-        });
+    /// Declare where this step records the deploy, so `status`, `history` and
+    /// `rollback --to` can read it back from the target later.
+    pub fn with_release_state(mut self, state: ReleaseState) -> Self {
+        self.release_state = Some(state);
         self
     }
 

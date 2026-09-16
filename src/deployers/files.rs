@@ -18,7 +18,7 @@
 //!
 //! With `unpack: false` it's a plain copy of a single file; no releases needed.
 
-use super::{cfg_bool, cfg_str, PlanContext, PlannedStep};
+use super::{cfg_bool, cfg_str, PlanContext, PlannedStep, ReleaseState};
 use anyhow::{Context, Result};
 use serde_yaml::Value;
 
@@ -245,12 +245,15 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         ),
         )
         // The read-back looks exactly where this step writes: `deliver status`
-        // and `deliver history` are this record read back off the target.
-        .with_release_state(
-            format!("{state}/.deliver/history.tsv"),
-            Some(live.clone()),
-            Some(releases.clone()),
-        ),
+        // and `deliver history` are this record read back off the target, and
+        // `deliver rollback --to` swaps the same symlink this step's activate
+        // swapped, rewriting the same marker.
+        .with_release_state(ReleaseState {
+            history_path: format!("{state}/.deliver/history.tsv"),
+            live_path: Some(live.clone()),
+            releases_dir: Some(releases.clone()),
+            previous_marker: Some(prev_marker.clone()),
+        }),
     );
 
     // Cleanup: the shipped archive has served its purpose once unpacked. Left

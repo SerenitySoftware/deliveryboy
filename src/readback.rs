@@ -75,6 +75,9 @@ pub struct Status {
     pub history_path: String,
     pub live_path: Option<String>,
     pub releases_dir: Option<String>,
+    /// Where the activate step records the outgoing release, carried through
+    /// so `deliver rollback --to` can keep it honest after a targeted swap.
+    pub previous_marker: Option<String>,
 }
 
 impl Status {
@@ -347,6 +350,7 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                 history_path: request.state.history_path,
                 live_path: request.state.live_path,
                 releases_dir: request.state.releases_dir,
+                previous_marker: request.state.previous_marker,
             }
         })
         .collect()
@@ -492,6 +496,7 @@ mod tests {
             history_path: "/var/app/.deliver/history.tsv".into(),
             live_path: Some("/var/app/web".into()),
             releases_dir: Some("/var/app/releases".into()),
+            previous_marker: Some("/var/app/releases/.deliver-previous".into()),
         }
     }
 
@@ -567,6 +572,7 @@ mod tests {
             history_path: state().history_path,
             live_path: state().live_path,
             releases_dir: state().releases_dir,
+            previous_marker: state().previous_marker,
         };
         assert_eq!(status.live_deploy_id().as_deref(), Some("20260202-b"));
         assert_eq!(status.live_deploy().unwrap().release, "v0.2.0");
@@ -594,6 +600,7 @@ mod tests {
             history_path: state().history_path,
             live_path: state().live_path,
             releases_dir: state().releases_dir,
+            previous_marker: state().previous_marker,
         };
         let text = render_status(&[status]);
         assert!(text.contains("unknown release · 20260303-c"), "{text}");
@@ -613,6 +620,7 @@ mod tests {
             history_path: state().history_path,
             live_path: state().live_path,
             releases_dir: state().releases_dir,
+            previous_marker: state().previous_marker,
         };
         let text = render_status(&[status]);
         assert!(text.contains("could not read the target"), "{text}");
@@ -632,6 +640,7 @@ mod tests {
             history_path: state().history_path,
             live_path: None,
             releases_dir: None,
+            previous_marker: None,
         };
         assert!(!status.live_is_recorded());
         let text = render_status(&[status]);

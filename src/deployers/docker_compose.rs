@@ -32,7 +32,7 @@
 //!       command: curl -fsS http://localhost:8000/healthz
 //! ```
 
-use super::{cfg_bool, cfg_str, PlanContext, PlannedStep};
+use super::{cfg_bool, cfg_str, PlanContext, PlannedStep, ReleaseState};
 use crate::secrets::Resolver;
 use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
@@ -594,7 +594,14 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         )
         // Compose replaces containers in place, so there is no live symlink and
         // no retained release directory — the history is the whole record.
-        .with_release_state(format!("{root}/.deliver/history.tsv"), None, None),
+        // No release layout: Compose replaces containers in place, so there is
+        // no symlink to repoint and nothing for `rollback --to` to address.
+        .with_release_state(ReleaseState {
+            history_path: format!("{root}/.deliver/history.tsv"),
+            live_path: None,
+            releases_dir: None,
+            previous_marker: None,
+        }),
     );
 
     // --- tidy ----------------------------------------------------------------

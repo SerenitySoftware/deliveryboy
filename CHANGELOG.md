@@ -4,6 +4,14 @@
 
 ### Added
 
+- `deliver rollback --to <deploy-id>` restores any release still retained on the
+  target, not just the one step back `.deliver-previous` records — so a release
+  that was itself bad can be skipped past. The ids are the ones `deliver history`
+  prints. Every selected service is resolved against the target before anything
+  is swapped: an id that is not retained is refused with the list of ids that
+  are, an id already live is left alone, and if any service cannot be satisfied
+  nothing is changed anywhere. A targeted swap rewrites `.deliver-previous`, so a
+  plain `deliver rollback` afterwards steps back to where it came from.
 - `deliver init` scaffolds the `docker-compose` and `macos-app` deployers. Both
   shapes were detected before but emitted no deployer, so a Compose-only repo
   dead-ended at "No known deploy strategy detected". The Compose `backup:` block
