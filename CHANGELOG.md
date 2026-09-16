@@ -4,6 +4,16 @@
 
 ### Added
 
+- `deliver init` detects a built front-end and scaffolds the `files` deployer
+  with its `build:` step. `files` has supported `build`/`build_dir`/`env`
+  feeding the atomic release path all along, but nothing detected a JavaScript
+  project, so a whole common app class dead-ended at "No known deploy strategy
+  detected". Vite, Next.js, Astro, SvelteKit, Nuxt, Angular, Create React App,
+  Vue CLI and Parcel are recognised at the repo root or in `apps/web`, `web`,
+  `frontend`, `client` or `ui`. The install command follows whichever lockfile
+  is present, the output directory is the framework's default unless the repo
+  has been built and shows a real one, and the scaffold says plainly that
+  build-time variables are baked into the bundle and need an `env:` block.
 - `deliver rollback --to <deploy-id>` restores any release still retained on the
   target, not just the one step back `.deliver-previous` records — so a release
   that was itself bad can be skipped past. The ids are the ones `deliver history`

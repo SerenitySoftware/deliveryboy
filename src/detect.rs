@@ -224,6 +224,179 @@ fn find_xcodeproj(root: &Path) -> Option<String> {
     None
 }
 
+/// A built front-end: a `package.json` with a `build` script, plus the output
+/// directory that build writes.
+///
+/// This is the shape `files` with a `build:` step was written for — the
+/// deployer supports it fully, so detecting it is wiring rather than new
+/// machinery.
+#[derive(Debug, Clone, PartialEq)]
+struct WebBuild {
+    /// Where `package.json` lives, relative to the repo root ("." at the top).
+    dir: String,
+    framework: &'static str,
+    /// Output directory, relative to `dir`.
+    out_dir: String,
+    /// `npm ci && npm run build`, or the lockfile's equivalent.
+    build: String,
+    notes: Vec<String>,
+}
+
+/// The install + build pair implied by the lockfile that is actually present.
+///
+/// Reproducible installs matter more here than anywhere else in a deploy: the
+/// bundle is compiled on the operator's machine and then frozen into a
+/// release, so a floating dependency resolution is baked in permanently.
+fn package_manager(dir: &Path) -> (&'static str, &'static str) {
+    for (lock, install, run) in [
+        (
+            "pnpm-lock.yaml",
+            "pnpm install --frozen-lockfile",
+            "pnpm run build",
+        ),
+        ("yarn.lock", "yarn install --frozen-lockfile", "yarn build"),
+        (
+            "bun.lockb",
+            "bun install --frozen-lockfile",
+            "bun run build",
+        ),
+        ("bun.lock", "bun install --frozen-lockfile", "bun run build"),
+    ] {
+        if dir.join(lock).exists() {
+            return (install, run);
+        }
+    }
+    // `npm ci` needs a lockfile; without one only `npm install` works.
+    if dir.join("package-lock.json").exists() {
+        ("npm ci", "npm run build")
+    } else {
+        ("npm install", "npm run build")
+    }
+}
+
+/// Map a dependency set onto the framework, its default output directory and
+/// the prefix its build-time variables need.
+///
+/// Ordered most specific first: a Next or Astro project also depends on Vite,
+/// and answering "Vite" for it would scaffold the wrong output directory.
+fn framework_of(
+    deps: &serde_json::Map<String, serde_json::Value>,
+) -> (&'static str, &'static str, &'static str) {
+    for (dep, name, out, prefix) in [
+        ("next", "Next.js", "out", "NEXT_PUBLIC_"),
+        ("@sveltejs/kit", "SvelteKit", "build", "PUBLIC_"),
+        ("astro", "Astro", "dist", "PUBLIC_"),
+        ("nuxt", "Nuxt", ".output/public", "NUXT_PUBLIC_"),
+        ("@angular/cli", "Angular", "dist", "NG_"),
+        ("react-scripts", "Create React App", "build", "REACT_APP_"),
+        ("@vue/cli-service", "Vue CLI", "dist", "VUE_APP_"),
+        ("parcel", "Parcel", "dist", ""),
+        ("vite", "Vite", "dist", "VITE_"),
+    ] {
+        if deps.contains_key(dep) {
+            return (name, out, prefix);
+        }
+    }
+    ("a JavaScript build", "dist", "")
+}
+
+/// Where a front-end lives: the repo root, or the one conventional subdirectory
+/// that holds one. Deliveryboy's own `apps/web` is this shape.
+const WEB_DIRS: [&str; 6] = [".", "apps/web", "web", "frontend", "client", "ui"];
+
+/// Find a built front-end and work out how to build and ship it.
+///
+/// Returns `None` when there is no `package.json`, or when it declares no
+/// `build` script — a package with nothing to build is a library or a tooling
+/// manifest (a Hugo site's Tailwind pipeline, say), not a deployable site.
+fn web_build(root: &Path) -> Option<WebBuild> {
+    for dir in WEB_DIRS {
+        let base = if dir == "." {
+            root.to_path_buf()
+        } else {
+            root.join(dir)
+        };
+        let Ok(text) = std::fs::read_to_string(base.join("package.json")) else {
+            continue;
+        };
+        let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if pkg
+            .get("scripts")
+            .and_then(|s| s.get("build"))
+            .and_then(|b| b.as_str())
+            .is_none()
+        {
+            continue;
+        }
+        let mut deps = serde_json::Map::new();
+        for key in ["dependencies", "devDependencies"] {
+            if let Some(map) = pkg.get(key).and_then(|d| d.as_object()) {
+                deps.extend(map.clone());
+            }
+        }
+        let (framework, default_out, env_prefix) = framework_of(&deps);
+        let (install, run) = package_manager(&base);
+        let mut notes = Vec::new();
+
+        // Prefer an output directory that is actually on disk: a repo that has
+        // been built once is telling us where its build lands, which beats the
+        // framework default whenever the project has overridden it.
+        let candidates = [default_out, "dist", "build", "out", "public"];
+        let out_dir = candidates
+            .iter()
+            .find(|c| base.join(c).is_dir())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| {
+                notes.push(format!(
+                    "`src` assumes this build writes to {default_out}/ — nothing is \
+                         built yet, so check it against one real `{run}` before deploying"
+                ));
+                default_out.to_string()
+            });
+
+        if framework == "Next.js" {
+            notes.push(
+                "Next.js only writes a static `out/` with `output: 'export'` in \
+                 next.config — a default `next build` produces a server application, \
+                 which this deployer cannot serve"
+                    .to_string(),
+            );
+        }
+        if framework == "SvelteKit" {
+            notes.push(
+                "SvelteKit's output depends on its adapter — `build/` here assumes \
+                 adapter-static"
+                    .to_string(),
+            );
+        }
+        // The failure this scaffold exists to prevent. `files` runs the build
+        // locally, so anything the bundler reads has to be declared here or it
+        // falls back to a development default and ships that.
+        notes.push(match env_prefix {
+            "" => "build-time variables are baked into the bundle — declare every one the \
+                   build reads in an `env:` block, or it ships whatever default it \
+                   falls back to"
+                .to_string(),
+            prefix => format!(
+                "build-time variables are baked into the bundle — add an `env:` block for \
+                 every `{prefix}*` the build reads (a missing one does not fail the \
+                 build, it silently ships the development default)"
+            ),
+        });
+
+        return Some(WebBuild {
+            dir: dir.to_string(),
+            framework,
+            out_dir,
+            build: format!("{install} && {run}"),
+            notes,
+        });
+    }
+    None
+}
+
 pub fn detect(root: &Path) -> Vec<Finding> {
     let mut found = Vec::new();
 
@@ -240,6 +413,43 @@ pub fn detect(root: &Path) -> Vec<Finding> {
             ],
             notes: Vec::new(),
         });
+    }
+
+    // A built front-end, but only when Hugo has not already claimed the web
+    // service: a Hugo site with a `package.json` is its asset pipeline, not a
+    // second site to deploy.
+    if found.is_empty() {
+        if let Some(web) = web_build(root) {
+            let src = if web.dir == "." {
+                web.out_dir.clone()
+            } else {
+                format!("{}/{}", web.dir, web.out_dir)
+            };
+            let mut config = vec![("build".into(), ConfigValue::Scalar(web.build.clone()))];
+            // `build_dir` defaults to the repo root, so writing "." would be a
+            // scaffolded copy of a default.
+            if web.dir != "." {
+                config.push(("build_dir".into(), ConfigValue::Scalar(web.dir.clone())));
+            }
+            config.push(("src".into(), ConfigValue::Scalar(src.clone())));
+            config.push(("remote_subdir".into(), ConfigValue::scalar("web")));
+            config.push(("owner".into(), ConfigValue::scalar("www-data:www-data")));
+            found.push(Finding {
+                deployer: Some("files"),
+                service: "web".into(),
+                evidence: format!(
+                    "{} front-end at {} (package.json + build script → {src})",
+                    web.framework,
+                    if web.dir == "." {
+                        "the repo root"
+                    } else {
+                        &web.dir
+                    },
+                ),
+                config,
+                notes: web.notes,
+            });
+        }
     }
 
     let compose: Vec<&str> = ["docker-compose.yml", "compose.yaml", "docker-compose.yaml"]

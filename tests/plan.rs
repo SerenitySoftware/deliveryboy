@@ -5043,3 +5043,184 @@ services:
     assert!(text.contains("deliver rollback"), "{text}");
     assert!(text.contains("nothing was changed on the target"), "{text}");
 }
+
+// --- static/SPA detection (`deliver init` scaffolds `files` with `build`) ----
+// `files.rs` has fully supported a build/build_dir/env step feeding the atomic
+// release path for a long time, but `detect.rs` recognized no JavaScript
+// project — so a whole common app class (deliveryboy's own `apps/web` among
+// them) dead-ended at "No known deploy strategy detected".
+
+fn spa_repo(
+    name: &str,
+    dir: &str,
+    package_json: &str,
+    lockfile: Option<&str>,
+) -> std::path::PathBuf {
+    let root = tmpdir(name);
+    let base = if dir == "." {
+        root.clone()
+    } else {
+        root.join(dir)
+    };
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("package.json"), package_json).unwrap();
+    if let Some(lock) = lockfile {
+        std::fs::write(base.join(lock), "\n").unwrap();
+    }
+    root
+}
+
+const VITE_PKG: &str = r#"{
+  "name": "web",
+  "scripts": {"dev": "vite", "build": "vite build"},
+  "devDependencies": {"vite": "^5.0.0"}
+}"#;
+
+#[test]
+fn init_detects_a_vite_front_end_and_scaffolds_the_files_deployer() {
+    let dir = spa_repo("init-spa-vite", ".", VITE_PKG, Some("package-lock.json"));
+    let text = init_output(&dir, &["--host", "box.example.com", "--write"]);
+    assert!(
+        !text.contains("No known deploy strategy detected"),
+        "{text}"
+    );
+    assert!(text.contains("Vite front-end"), "{text}");
+    let yaml = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    assert!(yaml.contains("deployer: files"), "{yaml}");
+    // A lockfile is present, so the reproducible install is the one to scaffold.
+    assert!(yaml.contains("build: npm ci && npm run build"), "{yaml}");
+    assert!(yaml.contains("src: dist"), "{yaml}");
+    // `build_dir` defaults to the repo root — writing "." would scaffold a copy
+    // of a default.
+    assert!(!yaml.contains("build_dir:"), "{yaml}");
+}
+
+#[test]
+fn a_front_end_in_a_subdirectory_gets_a_build_dir_and_a_prefixed_src() {
+    let dir = spa_repo(
+        "init-spa-subdir",
+        "apps/web",
+        VITE_PKG,
+        Some("pnpm-lock.yaml"),
+    );
+    let text = init_output(&dir, &["--host", "box.example.com", "--write"]);
+    assert!(text.contains("apps/web"), "{text}");
+    let yaml = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    assert!(yaml.contains("build_dir: apps/web"), "{yaml}");
+    assert!(yaml.contains("src: apps/web/dist"), "{yaml}");
+    // The lockfile that is actually present decides the install command.
+    assert!(
+        yaml.contains("build: pnpm install --frozen-lockfile && pnpm run build"),
+        "{yaml}"
+    );
+}
+
+#[test]
+fn the_scaffold_warns_that_build_time_variables_are_baked_into_the_bundle() {
+    let dir = spa_repo(
+        "init-spa-env-note",
+        ".",
+        VITE_PKG,
+        Some("package-lock.json"),
+    );
+    let text = init_output(&dir, &["--host", "box.example.com"]);
+    // The failure this scaffold exists to prevent: a missing VITE_* does not
+    // fail the build, it ships the development default.
+    assert!(text.contains("VITE_*"), "{text}");
+    assert!(
+        text.contains("silently ships the development default"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_output_directory_that_exists_on_disk_beats_the_framework_default() {
+    let dir = spa_repo(
+        "init-spa-real-outdir",
+        ".",
+        r#"{"scripts": {"build": "webpack"}, "devDependencies": {"react-scripts": "^5"}}"#,
+        Some("package-lock.json"),
+    );
+    // Create React App defaults to `build/`, but this repo has been built and
+    // plainly writes to `dist/`. What is on disk is evidence; the default is a
+    // guess.
+    std::fs::create_dir_all(dir.join("dist")).unwrap();
+    let yaml_text = init_output(&dir, &["--host", "box.example.com", "--write"]);
+    let yaml = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    assert!(yaml.contains("src: dist"), "{yaml}\n{yaml_text}");
+    // And with real evidence there is nothing to warn about.
+    assert!(!yaml_text.contains("nothing is built yet"), "{yaml_text}");
+}
+
+#[test]
+fn a_next_project_is_scaffolded_but_told_it_needs_a_static_export() {
+    let dir = spa_repo(
+        "init-spa-next",
+        ".",
+        r#"{"scripts": {"build": "next build"}, "dependencies": {"next": "^14", "vite": "^5"}}"#,
+        None,
+    );
+    let text = init_output(&dir, &["--host", "box.example.com", "--write"]);
+    // Next also depends on Vite in this fixture; answering "Vite" would
+    // scaffold the wrong output directory.
+    assert!(text.contains("Next.js front-end"), "{text}");
+    assert!(text.contains("output: 'export'"), "{text}");
+    let yaml = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    assert!(yaml.contains("src: out"), "{yaml}");
+    // No lockfile at all, so `npm ci` would fail.
+    assert!(
+        yaml.contains("build: npm install && npm run build"),
+        "{yaml}"
+    );
+}
+
+#[test]
+fn a_package_json_with_no_build_script_is_not_a_deployable_site() {
+    let dir = spa_repo(
+        "init-spa-no-build",
+        ".",
+        r#"{"scripts": {"test": "vitest"}, "devDependencies": {"vite": "^5"}}"#,
+        None,
+    );
+    let text = init_output(&dir, &["--host", "box.example.com"]);
+    // A package with nothing to build is tooling, not a site.
+    assert!(text.contains("No known deploy strategy detected"), "{text}");
+}
+
+#[test]
+fn a_hugo_sites_asset_pipeline_is_not_detected_as_a_second_front_end() {
+    let dir = hugo_site_repo("init-spa-hugo");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"scripts": {"build": "tailwindcss -o static/app.css"}, "devDependencies": {"vite": "^5"}}"#,
+    )
+    .unwrap();
+    let text = init_output(&dir, &["--host", "box.example.com", "--write"]);
+    let yaml = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    assert!(yaml.contains("deployer: hugo"), "{yaml}");
+    // One `web` service, not two — and no `files` deployer competing for it.
+    assert!(!yaml.contains("deployer: files"), "{yaml}\n{text}");
+}
+
+#[test]
+fn the_scaffolded_spa_config_is_a_config_the_cli_can_actually_load() {
+    let dir = spa_repo(
+        "init-spa-roundtrip",
+        "apps/web",
+        VITE_PKG,
+        Some("yarn.lock"),
+    );
+    init_output(&dir, &["--host", "box.example.com", "--write"]);
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(dir.join(".deliver.yml"))
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
