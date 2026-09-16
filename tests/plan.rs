@@ -4845,6 +4845,7 @@ fn the_scaffolded_macos_stub_is_a_config_the_cli_can_actually_load() {
 /// wrong thing to fork per platform; the tests that actually execute a swap
 /// therefore only assert where `mv` can perform one. Everything up to the
 /// swap — validation, refusals, the no-op — is portable and runs everywhere.
+#[cfg(unix)]
 fn mv_can_replace_a_symlink() -> bool {
     std::process::Command::new("sh")
         .arg("-c")
