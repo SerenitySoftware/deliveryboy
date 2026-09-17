@@ -5430,3 +5430,89 @@ services:
         assert!(stderr.contains(needle), "{block}: {stderr}");
     }
 }
+
+/// A vhost whose `server_name` and cert path both come from a `render:`
+/// placeholder — the shape that had certbot provisioning the placeholder.
+fn rendered_domain_repo(name: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/site.conf"),
+        "server {\n    listen 443 ssl;\n    server_name __SITE_DOMAIN__;\n    \
+         ssl_certificate /etc/letsencrypt/live/__SITE_DOMAIN__/fullchain.pem;\n    \
+         ssl_certificate_key /etc/letsencrypt/live/__SITE_DOMAIN__/privkey.pem;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: example
+defaults: {target: production}
+targets:
+  production: {host: example.md, user: root, dir: /var/universal/example}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config:
+      conf: nginx/site.conf
+      ssl: true
+      render:
+        __SITE_DOMAIN__: site.example.md
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn certs_are_provisioned_for_the_rendered_domain_not_the_placeholder() {
+    let dir = rendered_domain_repo("nginx-cert-rendered");
+    let out = run_in(&dir, &["plan"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Asking Let's Encrypt for `__SITE_DOMAIN__` is not a no-op: the name is
+    // refused, and failed authorizations are rate-limited, so a repeated deploy
+    // can lock the account out of issuing the real certificate.
+    assert!(
+        !text.contains("__SITE_DOMAIN__"),
+        "certbot steps still carry the placeholder:\n{text}"
+    );
+    assert!(text.contains("-d site.example.md"), "{text}");
+    assert!(text.contains("--cert-name site.example.md"), "{text}");
+}
+
+#[test]
+fn a_vhost_with_no_render_block_still_reads_the_conf_from_disk() {
+    let dir = tmpdir("nginx-cert-no-render");
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/site.conf"),
+        "server {\n    listen 443 ssl;\n    server_name plain.example.md;\n    \
+         ssl_certificate /etc/letsencrypt/live/plain.example.md/fullchain.pem;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: example
+defaults: {target: production}
+targets:
+  production: {host: example.md, user: root, dir: /var/universal/example}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config: {conf: nginx/site.conf, ssl: true}
+"#,
+    )
+    .unwrap();
+    let out = run_in(&dir, &["plan"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("-d plain.example.md"), "{text}");
+    assert!(text.contains("--cert-name plain.example.md"), "{text}");
+}

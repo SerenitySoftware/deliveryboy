@@ -19,6 +19,19 @@
   service at a time rather than interleaving two streams. Read-only, and the
   command is printed before it runs.
 
+### Fixed
+
+- `nginx-vhost` provisioned certificates from the **unrendered** conf. Cert
+  needs were derived by reading the conf off disk, while the `render:`
+  substitution happened separately further down, so a vhost whose `server_name`
+  came from a placeholder had its certbot steps built from the placeholder
+  text — `certbot certonly … -d __SITE_DOMAIN__`, plus a temporary ACME vhost
+  with the same name. Let's Encrypt refuses that name, and failed
+  authorizations are rate-limited, so a repeated deploy could lock the account
+  out of issuing the real certificate. Cert needs are now derived from the
+  rendered text the install step will actually put on the target; a conf with
+  no `render:` block still ships byte-for-byte and is still read from disk.
+
 ## 0.2.0 — 2026-09-16
 
 ### Added

@@ -320,13 +320,32 @@ fn resolve_vhosts(cfg: &Value) -> Result<Vec<VhostSpec>> {
 }
 
 /// What certs a vhost needs, honoring per-vhost overrides.
-fn cert_needs_for(spec: &VhostSpec, ctx: &PlanContext) -> Result<Vec<CertNeed>> {
+///
+/// `rendered` is what this deploy will actually install, when a `render:` block
+/// produced it. It has to be, rather than the conf on disk: a `server_name`
+/// that comes from a placeholder would otherwise have its certbot steps built
+/// from the placeholder text, and certbot would be asked to issue a
+/// certificate for `__SITE_DOMAIN__`. Let's Encrypt refuses that name, and
+/// **failed authorizations are rate-limited** — so a repeated deploy can lock
+/// the account out of issuing the real certificate.
+fn cert_needs_for(
+    spec: &VhostSpec,
+    ctx: &PlanContext,
+    rendered: Option<&str>,
+) -> Result<Vec<CertNeed>> {
     if !spec.ssl {
         return Ok(Vec::new());
     }
-    let local = ctx.repo_root.join(&spec.conf);
-    let text = std::fs::read_to_string(&local)
-        .with_context(|| format!("nginx-vhost: cannot read {}", local.display()))?;
+    // No `render:` block means the conf ships byte-for-byte, so the file on
+    // disk *is* what gets installed.
+    let text = match rendered {
+        Some(text) => text.to_string(),
+        None => {
+            let local = ctx.repo_root.join(&spec.conf);
+            std::fs::read_to_string(&local)
+                .with_context(|| format!("nginx-vhost: cannot read {}", local.display()))?
+        }
+    };
     let facts = parse_vhost(&text);
 
     // An explicit cert_name forces provisioning even if the conf pulls its TLS
@@ -700,7 +719,13 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     let provider = cfg_str(cfg, "provider").unwrap_or_else(|| "certbot".into());
     let mut certs: Vec<CertNeed> = Vec::new();
     for spec in &specs {
-        for need in cert_needs_for(spec, ctx)? {
+        // The rendered text, so the domains certbot is asked for are the
+        // domains nginx will actually serve.
+        for need in cert_needs_for(
+            spec,
+            ctx,
+            rendered_confs.get(&spec.conf).map(String::as_str),
+        )? {
             match certs.iter_mut().find(|c| c.cert_name == need.cert_name) {
                 Some(existing) => {
                     for d in &need.domains {
