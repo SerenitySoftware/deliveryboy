@@ -71,6 +71,10 @@ Both are read-only and take one connection per target. `--json` gives the same
 answer for scripts; a target that cannot be read is reported and exits `1`,
 never rendered as "nothing is deployed".
 
+`deliver logs` finishes that loop — it tails a Compose service with the deploy's
+own `docker compose` invocation, and any other service with the `logs:` block
+that says where its logs are.
+
 ## What a release changes on the target
 
 Before `deliver deploy` executes anything, it reads the nginx vhost and Docker

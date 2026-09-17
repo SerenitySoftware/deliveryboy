@@ -118,6 +118,39 @@ verify:
       interval: 5
 ```
 
+## Where the logs are
+
+`deliver logs` tails a `docker-compose` service with the deploy's own compose
+invocation. Any other service says where to look, with exactly one of `unit:`,
+`files:` or `command:`:
+
+```yaml
+services:
+  api:
+    deployer: commands
+    logs:
+      unit: example-api        # journalctl -u example-api
+  site:
+    deployer: hugo
+    logs:
+      files:                   # tail -F
+        - /var/log/nginx/example.com.access.log
+        - /var/log/nginx/example.com.error.log
+  worker:
+    deployer: commands
+    logs:
+      command: "docker logs {follow} --tail {tail} worker"
+```
+
+`command:` runs verbatim on the target: `{tail}` becomes the line count and
+`{follow}` becomes `-f` when `--follow` is given. `unit:` and `files:` are read
+with the target's own `sudo`, because that is how the deploy wrote them;
+`command:` is not, on the grounds that whoever wrote the command wrote all of
+it.
+
+A `logs:` block wins over what the deployer declares, so a Compose project
+fronted by nginx can be pointed at the access log instead.
+
 ## Version rules
 
 Projects can refuse releases from the wrong branch, a dirty tree, or a commit that does not match its upstream:

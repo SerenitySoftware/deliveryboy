@@ -32,7 +32,7 @@
 //!       command: curl -fsS http://localhost:8000/healthz
 //! ```
 
-use super::{cfg_bool, cfg_str, PlanContext, PlannedStep, ReleaseState};
+use super::{cfg_bool, cfg_str, LogSource, PlanContext, PlannedStep, ReleaseState};
 use crate::secrets::Resolver;
 use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
@@ -601,6 +601,12 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             live_path: None,
             releases_dir: None,
             previous_marker: None,
+        })
+        // The same invocation that brought the project up, so `deliver logs`
+        // cannot tail a different project than the one that was deployed.
+        .with_log_source(LogSource::Compose {
+            compose: compose.clone(),
+            dir: root.clone(),
         }),
     );
 

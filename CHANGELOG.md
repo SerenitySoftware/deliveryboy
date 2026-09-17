@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `deliver logs [--service S] [--follow] [--tail N]` tails what the deploy is
+  running, closing the operational loop next to `status`/`history`: deploy →
+  see what is live → watch it run, without an ssh session. A `docker-compose`
+  service is tailed with the deploy's own compose invocation — the same `-f`
+  files and `-p` project it brought the containers up with, declared by the
+  deployer on the step that records the deploy, so the tail cannot drift from
+  what was started. Every other service says where to look with a `logs:`
+  block (`unit:` for a systemd unit, `files:` for log files, `command:` for
+  anything else), because a `files` or `hugo` release is served by a web server
+  Delivery Boy never configured and a guessed path would be wrong on half of
+  the hosts this tool targets; a service with neither is reported and exits
+  `2`. A `logs:` block wins over the deployer's own answer. Following tails one
+  service at a time rather than interleaving two streams. Read-only, and the
+  command is printed before it runs.
+
 ## 0.2.0 — 2026-09-16
 
 ### Added

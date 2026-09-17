@@ -7,6 +7,7 @@ mod configdiff;
 mod deployers;
 mod detect;
 mod exec;
+mod logs;
 mod notifications;
 mod plan;
 mod preflight;
@@ -120,6 +121,17 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Tail the deployed logs from the target
+    Logs {
+        #[arg(long)]
+        service: Vec<String>,
+        /// Keep the stream open (one service at a time)
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// How many existing lines to show first
+        #[arg(long, short = 'n', default_value_t = 50)]
+        tail: usize,
+    },
     /// Roll back to the previous release (repoints the live symlink)
     Rollback {
         #[arg(long)]
@@ -202,6 +214,11 @@ fn run(cli: &Cli) -> Result<i32> {
             Readback::History { limit: *limit },
             *json,
         ),
+        Commands::Logs {
+            service,
+            follow,
+            tail,
+        } => cmd_logs(cli.config.as_deref(), service, *follow, *tail),
         Commands::Rollback { service, to } => match to {
             Some(deploy_id) => cmd_rollback_to(cli.config.as_deref(), service, deploy_id),
             None => cmd_rollback(cli.config.as_deref(), service),
@@ -1064,6 +1081,73 @@ fn cmd_readback(
         return Ok(1);
     }
     Ok(0)
+}
+
+fn cmd_logs(explicit: Option<&Path>, only: &[String], follow: bool, tail: usize) -> Result<i32> {
+    ui::banner();
+    let (config, path) = load_announced(explicit)?;
+    let root = repo_root(&path);
+    // Quietly, like the read-back commands: this run deploys nothing, and
+    // announcing a "deploy version" would invite reading it as what is live.
+    let v = version::resolve(
+        &root,
+        config
+            .versioning
+            .as_ref()
+            .and_then(|r| r.version_from.as_deref()),
+    );
+    let plan = plan::build(&config, only, &root, &v)?;
+    let (requests, unknown) = logs::collect(&config, &plan);
+
+    if requests.is_empty() {
+        ui::phase("Nowhere to look");
+        for service in &unknown {
+            ui::detail(format!(
+                "{} ({}) does not say where its logs are",
+                service.service, service.deployer
+            ));
+        }
+        ui::note(
+            "only `docker-compose` services can be tailed without being told where to look. \
+             Give the others a `logs:` block — `unit:` for a systemd unit, `files:` for log \
+             files, or `command:` to run something else on the target.",
+        );
+        return Ok(2);
+    }
+
+    // Two attached streams would interleave into something neither of them
+    // said. Narrowing is the operator's call, so name the choices and stop.
+    if follow && requests.len() > 1 {
+        ui::phase("More than one service");
+        for request in &requests {
+            ui::detail(logs::describe(request));
+        }
+        ui::note("--follow tails one service at a time — narrow the run with --service NAME.");
+        return Ok(2);
+    }
+
+    let mut failed = false;
+    for request in &requests {
+        ui::phase(&format!(
+            "{} on {}",
+            request.service,
+            config
+                .targets
+                .get(&request.target)
+                .map(|t| t.describe(&request.host))
+                .unwrap_or_else(|| request.host.clone())
+        ));
+        if !logs::run(request, &config, follow, tail) {
+            failed = true;
+        }
+    }
+    for service in &unknown {
+        ui::note(format!(
+            "{} ({}) has no `logs:` block — skipped",
+            service.service, service.deployer
+        ));
+    }
+    Ok(if failed { 1 } else { 0 })
 }
 
 fn cmd_rollback(explicit: Option<&Path>, only: &[String]) -> Result<i32> {

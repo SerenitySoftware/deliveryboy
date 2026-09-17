@@ -5224,3 +5224,209 @@ fn the_scaffolded_spa_config_is_a_config_the_cli_can_actually_load() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// --- `deliver logs` ---------------------------------------------------------
+//
+// A `method: local` target runs the read through `sh` on this machine, so the
+// whole path — collect the source, render the command, stream it — is exercised
+// end to end without a remote host.
+
+/// A repo with one service whose logs are a real file on disk.
+fn logs_repo(name: &str, service_block: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = tmpdir(name);
+    let log = dir.join("app.log");
+    std::fs::write(&log, "first line\nsecond line\nthird line\n").unwrap();
+    let body = format!(
+        r#"
+version: 1
+app: demo
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, dir: {dir}}}
+services:
+{service_block}
+"#,
+        dir = dir.display()
+    );
+    std::fs::write(dir.join(".deliver.yml"), body).unwrap();
+    (dir, log)
+}
+
+#[test]
+fn logs_tails_the_files_a_service_declares() {
+    let (dir, log) = logs_repo(
+        "logs-files",
+        "  api:\n    deployer: commands\n    config: {steps: [{command: \"true\"}]}\n    logs:\n      files: [LOGPATH]\n",
+    );
+    // The fixture's placeholder, filled in now that the temp path is known.
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("LOGPATH", &log.display().to_string());
+    std::fs::write(&cfg, body).unwrap();
+
+    let out = run_in(&dir, &["logs"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stdout.contains("second line"), "{stdout}");
+    // The command it ran is announced, so what was read is never a mystery.
+    assert!(stderr.contains("tail -n 50"), "{stderr}");
+}
+
+#[test]
+fn logs_tail_flag_sets_the_line_count() {
+    let (dir, log) = logs_repo(
+        "logs-tail-n",
+        "  api:\n    deployer: commands\n    config: {steps: [{command: \"true\"}]}\n    logs:\n      files: [LOGPATH]\n",
+    );
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("LOGPATH", &log.display().to_string());
+    std::fs::write(&cfg, body).unwrap();
+
+    let out = run_in(&dir, &["logs", "--tail", "1"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("third line"), "{stdout}");
+    assert!(!stdout.contains("first line"), "{stdout}");
+}
+
+#[test]
+fn a_service_that_cannot_say_where_its_logs_are_says_so() {
+    let (dir, _) = logs_repo(
+        "logs-unknown",
+        "  site:\n    deployer: hugo\n    config: {source: apps/web}\n",
+    );
+    let out = run_in(&dir, &["logs"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Usage error, not "no logs": nothing was read, and a script must be able
+    // to tell an empty log from a config that never said where to look.
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("does not say where its logs are"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("`logs:` block"), "{stderr}");
+}
+
+#[test]
+fn a_compose_service_is_tailed_with_the_project_the_deploy_started() {
+    let dir = compose_repo("logs-compose", "");
+    let out = run_in(&dir, &["logs", "--tail", "7"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The exit status depends on whether docker is on this machine; what the
+    // test pins is that the command is the deploy's own compose invocation.
+    assert!(
+        stderr.contains("-p demo logs --no-color --tail 7"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("-f docker-compose.yml"), "{stderr}");
+    assert!(stderr.contains("cd '/var/universal/demo'"), "{stderr}");
+}
+
+#[test]
+fn a_logs_block_overrides_what_the_deployer_declares() {
+    let dir = tmpdir("logs-override");
+    let log = dir.join("access.log");
+    std::fs::write(&log, "GET / 200\n").unwrap();
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services: {app: {image: demo:latest}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, dir: {dir}}}
+services:
+  app:
+    deployer: docker-compose
+    config: {{files: [docker-compose.yml]}}
+    logs:
+      files: [{log}]
+"#,
+            dir = dir.display(),
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    let out = run_in(&dir, &["logs"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stdout.contains("GET / 200"), "{stdout}");
+    assert!(!stderr.contains("docker compose"), "{stderr}");
+}
+
+#[test]
+fn follow_refuses_to_interleave_several_services() {
+    let dir = tmpdir("logs-follow-many");
+    std::fs::write(dir.join("a.log"), "a\n").unwrap();
+    std::fs::write(dir.join("b.log"), "b\n").unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, dir: {dir}}}
+services:
+  one:
+    deployer: commands
+    config: {{steps: [{{command: "true"}}]}}
+    logs: {{files: [{dir}/a.log]}}
+  two:
+    deployer: commands
+    config: {{steps: [{{command: "true"}}]}}
+    logs: {{files: [{dir}/b.log]}}
+"#,
+            dir = dir.display()
+        ),
+    )
+    .unwrap();
+    let out = run_in(&dir, &["logs", "--follow"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("one service at a time"), "{stderr}");
+    assert!(stderr.contains("--service"), "{stderr}");
+}
+
+#[test]
+fn a_logs_block_must_name_exactly_one_source() {
+    let dir = tmpdir("logs-schema");
+    let base = |block: &str| {
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, dir: {dir}}}
+services:
+  api:
+    deployer: commands
+    config: {{steps: [{{command: "true"}}]}}
+    logs: {block}
+"#,
+            dir = dir.display()
+        )
+    };
+    for (block, needle) in [
+        ("{}", "needs one of"),
+        ("{unit: api, files: [/var/log/a.log]}", "use exactly one"),
+    ] {
+        std::fs::write(dir.join(".deliver.yml"), base(block)).unwrap();
+        let out = run_in(&dir, &["validate"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{block}: {stderr}");
+        assert!(stderr.contains(needle), "{block}: {stderr}");
+    }
+}

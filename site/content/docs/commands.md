@@ -79,6 +79,33 @@ deliver history --limit 0
 
 `--limit N` shows the newest `N` per service (default 10); `--limit 0` shows every recorded deploy.
 
+## `deliver logs`
+
+Tail what the deploy is running, without an ssh session.
+
+```bash
+deliver logs
+deliver logs --service api --follow
+deliver logs --tail 200
+```
+
+`--tail N` sets how many existing lines to show first (default 50) and
+`--follow` keeps the stream open. Following tails one service at a time: with
+several services in range it lists them and asks you to narrow the run with
+`--service NAME`, rather than interleaving two streams into something neither
+of them said.
+
+Where the log is comes from one of two places. A `docker-compose` service is
+tailed with the deploy's own `docker compose` invocation — the same `-f` files
+and `-p` project it brought the containers up with. Every other service has to
+say, because the deploy does not know: a `files` or `hugo` release is served by
+a web server Delivery Boy never configured, so guessing a path would be wrong
+on half of the hosts this tool targets. Give those services a
+[`logs:` block](../configuration/#where-the-logs-are); a service with neither
+is reported as such and exits `2`.
+
+The command it runs is printed before it runs, and the read is read-only.
+
 ## `deliver verify`
 
 Run only the checks from the selected services.

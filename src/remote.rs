@@ -51,3 +51,23 @@ pub fn capture(target: &Target, host: &str, script: &str) -> std::io::Result<Str
     };
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
+
+/// Run a read-only command on the target with this process's stdio attached.
+///
+/// The streaming counterpart to [`capture`], for `deliver logs`: the output is
+/// the point, it can be unbounded (`--follow`), and unlike the batched probes
+/// its stderr is kept — `journalctl`'s "no such unit" and `tail`'s "no such
+/// file" are the answer when the log is not where the config says.
+pub fn stream(target: &Target, host: &str, script: &str) -> std::io::Result<bool> {
+    let status = if target.is_local() {
+        Command::new("sh").arg("-c").arg(script).status()?
+    } else {
+        Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+            .args(target.ssh_args())
+            .arg(format!("{}@{host}", target.ssh.user))
+            .arg(script)
+            .status()?
+    };
+    Ok(status.success())
+}

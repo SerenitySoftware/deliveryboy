@@ -284,6 +284,55 @@ pub struct SecretsConfig {
     pub define: Option<serde_yaml::Value>,
 }
 
+/// Where a service's runtime logs live on the target, for `deliver logs`.
+///
+/// Only the `docker-compose` deployer can answer this from the deploy itself;
+/// a `files` or `hugo` release is served by a web server the deploy never
+/// configured, and a `commands` service could be anything. Rather than guess a
+/// path that would be wrong on half of the hosts this tool targets, those
+/// services say where to look.
+///
+/// Exactly one of `unit`, `files` or `command` is set — see [`LogsConfig::validate`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsConfig {
+    /// A systemd unit, read with `journalctl -u`.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// Log files on the target, read with `tail`.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Escape hatch: run this exact command on the target. `{tail}` becomes the
+    /// line count and `{follow}` becomes `-f` when `--follow` is given.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+impl LogsConfig {
+    /// One source, not none and not several: two answers to "where are the
+    /// logs?" would mean the command silently picks one of them.
+    fn validate(&self, service: &str) -> Result<()> {
+        let set: Vec<&str> = [
+            self.unit.as_ref().map(|_| "unit"),
+            (!self.files.is_empty()).then_some("files"),
+            self.command.as_ref().map(|_| "command"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match set.len() {
+            1 => Ok(()),
+            0 => bail!(
+                "service '{service}': `logs:` needs one of `unit:`, `files:` or `command:`"
+            ),
+            _ => bail!(
+                "service '{service}': `logs:` sets {} — use exactly one of `unit:`, `files:` or `command:`",
+                set.join(" and ")
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
@@ -304,6 +353,9 @@ pub struct Service {
     pub config: serde_yaml::Value,
     #[serde(default)]
     pub verify: Vec<serde_yaml::Value>,
+    /// Where this service's runtime logs are, when the deployer cannot say.
+    #[serde(default)]
+    pub logs: Option<LogsConfig>,
 }
 
 fn default_true() -> bool {
@@ -451,6 +503,9 @@ pub fn load(path: &Path) -> Result<Config> {
             if !config.services.contains_key(dep) {
                 bail!("service '{name}': needs unknown service '{dep}'");
             }
+        }
+        if let Some(logs) = &service.logs {
+            logs.validate(name)?;
         }
     }
     if let Some(versioning) = &config.versioning {

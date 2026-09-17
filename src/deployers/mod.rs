@@ -81,6 +81,73 @@ pub struct ReleaseState {
     pub previous_marker: Option<String>,
 }
 
+/// Where a service's runtime logs can be read on the target, carried alongside
+/// a step so `deliver logs` can tail them (see [`crate::logs`]).
+///
+/// Declared by the deployer that already knows the answer, for the same reason
+/// [`ReleaseState`] is: the Compose invocation that tails the logs must be the
+/// one that started the containers, down to the `-f` files and the `-p`
+/// project, and a second derivation of it is a second thing to drift.
+///
+/// Deployers that genuinely cannot know are silent rather than guessing — a
+/// `files` release is served by somebody else's web server, and where *that*
+/// writes its logs is a fact about the host, not about the deploy. Those
+/// services say so themselves, with a `logs:` block on the service.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogSource {
+    /// A Compose project: its own `docker compose … logs`, run from `dir`.
+    Compose { compose: String, dir: String },
+    /// A systemd unit, read with `journalctl -u`.
+    Unit { name: String },
+    /// Log files on the target, read with `tail`.
+    Files { paths: Vec<String> },
+    /// An exact command from the config's `logs.command`.
+    Command { command: String },
+}
+
+impl LogSource {
+    /// The shell command that reads this log on the target.
+    ///
+    /// `tail` is the number of existing lines to show first and `follow` keeps
+    /// the stream open. `sudo` is the target's own prefix: the deploy writes
+    /// these logs under sudo, so reading them usually needs the same.
+    pub fn command(&self, sudo: &str, follow: bool, tail: usize) -> String {
+        match self {
+            LogSource::Compose { compose, dir } => {
+                let follow = if follow { " --follow" } else { "" };
+                format!(
+                    "cd {} && {sudo}{compose} logs --no-color --tail {tail}{follow}",
+                    crate::remote::shell_quote(dir)
+                )
+            }
+            LogSource::Unit { name } => {
+                let follow = if follow { " -f" } else { "" };
+                format!(
+                    "{sudo}journalctl --no-pager -u {} -n {tail}{follow}",
+                    crate::remote::shell_quote(name)
+                )
+            }
+            LogSource::Files { paths } => {
+                // `-F` rather than `-f`: a log file that rotates mid-tail is the
+                // normal case, and `-f` would sit on the renamed inode forever.
+                let follow = if follow { " -F" } else { "" };
+                let quoted: Vec<String> = paths
+                    .iter()
+                    .map(|p| crate::remote::shell_quote(p))
+                    .collect();
+                format!("{sudo}tail -n {tail}{follow} -- {}", quoted.join(" "))
+            }
+            // Verbatim, with the two things the command cannot know filled in.
+            // No sudo: an operator who wrote the command wrote the whole of it.
+            LogSource::Command { command } => command
+                .replace("{follow}", if follow { "-f" } else { "" })
+                .replace("{tail}", &tail.to_string())
+                .trim()
+                .to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PlannedStep {
     pub label: String,
@@ -109,6 +176,11 @@ pub struct PlannedStep {
     /// part of the step the executor runs.
     #[serde(skip_serializing)]
     pub release_state: Option<ReleaseState>,
+    /// How this step's service can be tailed on the target, when the deployer
+    /// knows. Not serialized, for the same reason `release_state` is not: it is
+    /// compile-time metadata for a local read, not part of the step.
+    #[serde(skip_serializing)]
+    pub log_source: Option<LogSource>,
 }
 
 impl PlannedStep {
@@ -124,6 +196,7 @@ impl PlannedStep {
             secret: false,
             live_config: None,
             release_state: None,
+            log_source: None,
         }
     }
     pub fn command_in(
@@ -142,6 +215,7 @@ impl PlannedStep {
             secret: false,
             live_config: None,
             release_state: None,
+            log_source: None,
         }
     }
     pub fn ssh(label: impl Into<String>, command: impl Into<String>) -> Self {
@@ -155,6 +229,7 @@ impl PlannedStep {
             secret: false,
             live_config: None,
             release_state: None,
+            log_source: None,
         }
     }
 
@@ -177,6 +252,7 @@ impl PlannedStep {
             secret: true,
             live_config: None,
             release_state: None,
+            log_source: None,
         }
     }
 
@@ -207,6 +283,7 @@ impl PlannedStep {
             secret: false,
             live_config: None,
             release_state: None,
+            log_source: None,
         }
     }
 
@@ -233,6 +310,13 @@ impl PlannedStep {
     /// `rollback --to` can read it back from the target later.
     pub fn with_release_state(mut self, state: ReleaseState) -> Self {
         self.release_state = Some(state);
+        self
+    }
+
+    /// Declare how this step's service writes its runtime logs, so
+    /// `deliver logs` can tail exactly what this deploy started.
+    pub fn with_log_source(mut self, source: LogSource) -> Self {
+        self.log_source = Some(source);
         self
     }
 
