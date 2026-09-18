@@ -75,6 +75,32 @@ never rendered as "nothing is deployed".
 own `docker compose` invocation, and any other service with the `logs:` block
 that says where its logs are.
 
+## Every app on the box, one command
+
+The founding case is a handful of apps sharing one host, so `deliver fleet`
+runs the per-repo command across all of them. `deliver.fleet.yml` is a list of
+repo paths; each repo is entered and run exactly as if you had `cd`-ed into it,
+with its own config, its own release and its own relative paths.
+
+```yaml
+version: 1
+repos:
+  - ../conduit
+  - ../toothpick
+```
+
+```
+$ deliver fleet status
+▸ Fleet summary
+    ✓ conduit    ok
+    ✓ toothpick  ok
+```
+
+`fleet deploy` stops at the first repo that fails (`--keep-going` runs the
+rest), `fleet preflight` and `fleet status` always report on every repo, and
+the run exits with the worst code any repo returned. It is a loop, not a
+scheduler — no state, no daemon, no cross-repo graph.
+
 ## What a release changes on the target
 
 Before `deliver deploy` executes anything, it reads the nginx vhost and Docker

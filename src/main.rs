@@ -7,6 +7,7 @@ mod configdiff;
 mod deployers;
 mod detect;
 mod exec;
+mod fleet;
 mod logs;
 mod notifications;
 mod plan;
@@ -49,6 +50,37 @@ enum SecretsAction {
         /// Keychain account (default: release)
         #[arg(long, default_value = "release")]
         account: String,
+    },
+}
+
+/// What `deliver fleet` runs in each repo. Three read/act commands, not the
+/// whole surface: the fleet file answers "is everything ready", "ship it", and
+/// "what is live" — the questions that stop making sense one repo at a time.
+#[derive(Subcommand)]
+enum FleetAction {
+    /// Run preflight in every repo
+    Preflight {
+        #[arg(long)]
+        service: Vec<String>,
+    },
+    /// Deploy every repo, in fleet-file order
+    Deploy {
+        #[arg(long)]
+        service: Vec<String>,
+        /// Walk every step without running it
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't prompt: accept the tag on HEAD (fails if there isn't one)
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Carry on to the remaining repos after one fails
+        #[arg(long)]
+        keep_going: bool,
+    },
+    /// Show what is live across the fleet
+    Status {
+        #[arg(long)]
+        service: Vec<String>,
     },
 }
 
@@ -151,6 +183,17 @@ enum Commands {
         #[command(subcommand)]
         action: Option<SecretsAction>,
     },
+    /// Run one command across every repo in deliver.fleet.yml
+    Fleet {
+        /// Path to the fleet file (default: search up from the current directory)
+        #[arg(long)]
+        fleet: Option<PathBuf>,
+        /// Only these repos (by directory name or the path as written)
+        #[arg(long)]
+        repo: Vec<String>,
+        #[command(subcommand)]
+        action: FleetAction,
+    },
     /// Remove this app's build artifacts from the system temp dir
     Clean,
     /// Schema-check .deliver.yml
@@ -224,6 +267,11 @@ fn run(cli: &Cli) -> Result<i32> {
             None => cmd_rollback(cli.config.as_deref(), service),
         },
         Commands::Preflight { service } => cmd_preflight(cli.config.as_deref(), service),
+        Commands::Fleet {
+            fleet,
+            repo,
+            action,
+        } => cmd_fleet(cli.config.as_deref(), fleet.as_deref(), repo, action),
         Commands::Secrets { action } => cmd_secrets(cli.config.as_deref(), action),
         Commands::Clean => cmd_clean(cli.config.as_deref()),
         Commands::Validate => cmd_validate(cli.config.as_deref()),
@@ -1283,6 +1331,120 @@ fn cmd_rollback_to(explicit: Option<&Path>, only: &[String], deploy_id: &str) ->
         ui::note("some services did not swap — `deliver status` says where each one stands.");
         Ok(1)
     }
+}
+
+/// `deliver fleet …` — the same per-repo command, once per repo.
+///
+/// The whole command is the loop: each repo is entered and the existing
+/// `cmd_preflight` / `cmd_deploy` / `cmd_readback` runs there with no config
+/// path, so it discovers the repo's own `.deliver.yml` exactly as it would if
+/// you had typed the command in that directory. Nothing about a repo's release
+/// is decided here; this only decides *which* repos run and what happens when
+/// one of them fails.
+fn cmd_fleet(
+    config: Option<&Path>,
+    fleet_path: Option<&Path>,
+    only_repos: &[String],
+    action: &FleetAction,
+) -> Result<i32> {
+    ui::banner();
+    // One config cannot describe several repos, and silently ignoring it would
+    // hide that from whoever typed it.
+    if config.is_some() {
+        ui::fail("--config names one repo's config, so it cannot be used with `fleet`");
+        ui::note("pass --fleet PATH to choose the fleet file, or --repo NAME to narrow the run.");
+        return Ok(2);
+    }
+
+    ui::phase("Loading fleet");
+    let path = fleet::resolve(fleet_path)?;
+    ui::detail(format!("fleet: {}", path.display()));
+    let fleet = fleet::load(&path)?;
+    let (selected, unmatched) = fleet.select(only_repos);
+    // A selector that matched nothing is a typo, and running the fleet minus a
+    // repo the operator thinks is in it is the worst possible answer.
+    if !unmatched.is_empty() {
+        ui::fail(format!("no repo named {}", unmatched.join(", ")));
+        ui::detail(format!(
+            "{} lists: {}",
+            fleet.path.display(),
+            fleet
+                .repos
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return Ok(2);
+    }
+    ui::detail(format!(
+        "{} repo(s): {}",
+        selected.len(),
+        selected
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+
+    // A deploy stops at the first failure: the repo that failed has already
+    // unwound itself, and carrying on would put more of the box in flight while
+    // an operator is still working out what happened. Reads never stop — the
+    // point of asking the fleet is the whole answer.
+    let stop_on_failure = match action {
+        FleetAction::Deploy { keep_going, .. } => !keep_going,
+        _ => false,
+    };
+
+    let mut outcomes: Vec<(&fleet::Repo, fleet::RepoOutcome)> = Vec::new();
+    let mut stopped = false;
+    for repo in &selected {
+        if stopped {
+            outcomes.push((repo, fleet::RepoOutcome::NotAttempted));
+            continue;
+        }
+        ui::phase(&format!("{} — {}", repo.name, repo.path.display()));
+        let outcome = fleet::run_in(repo, || match action {
+            FleetAction::Preflight { service } => cmd_preflight(None, service),
+            FleetAction::Deploy {
+                service,
+                dry_run,
+                yes,
+                ..
+            } => cmd_deploy(None, service, *dry_run, false, *yes, None),
+            FleetAction::Status { service } => cmd_readback(None, service, Readback::Status, false),
+        });
+        if !outcome.ok() && stop_on_failure {
+            stopped = true;
+        }
+        outcomes.push((repo, outcome));
+    }
+
+    ui::phase("Fleet summary");
+    let width = outcomes
+        .iter()
+        .map(|(repo, _)| repo.name.len())
+        .max()
+        .unwrap_or(0);
+    for (repo, outcome) in &outcomes {
+        let line = format!("{:width$}  {}", repo.name, outcome.describe());
+        match outcome {
+            fleet::RepoOutcome::Ran(0) => ui::ok(line),
+            fleet::RepoOutcome::NotAttempted => ui::detail(format!("- {line}")),
+            _ => ui::fail(line),
+        }
+    }
+    if stopped {
+        ui::note("stopped at the first failure — pass --keep-going to run the rest anyway.");
+    }
+
+    // The worst per-repo code, so a script sees the same thing it would have
+    // seen running the repos one at a time and taking the worst answer.
+    Ok(outcomes
+        .iter()
+        .map(|(_, outcome)| outcome.exit_code())
+        .max()
+        .unwrap_or(0))
 }
 
 fn cmd_preflight(explicit: Option<&Path>, only: &[String]) -> Result<i32> {

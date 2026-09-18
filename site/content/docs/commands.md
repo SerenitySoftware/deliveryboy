@@ -132,6 +132,63 @@ selected service cannot be satisfied, nothing is changed anywhere — so a
 multi-service rollback never half-lands. Narrow the run with `--service NAME`
 when only one app should move.
 
+## `deliver fleet`
+
+Run one command across every repo listed in `deliver.fleet.yml`, instead of
+`cd`-ing through them one at a time.
+
+```bash
+deliver fleet status
+deliver fleet preflight
+deliver fleet deploy
+deliver fleet --repo conduit deploy
+```
+
+The fleet file is a list of repo paths, relative to the file itself (`~` works):
+
+```yaml
+version: 1
+repos:
+  - ../conduit
+  - ../toothpick
+  - ~/dev/ampersand
+```
+
+It is found by searching up from the current directory, so the command works
+from the fleet directory or from inside any of its repos; `--fleet PATH` names
+one explicitly. `--repo NAME` narrows the run and can be repeated, matching
+either a repo's directory name or the path as written in the file — a selector
+that matches nothing stops the run and lists what the file holds, rather than
+quietly running a smaller fleet than you asked for.
+
+Each repo is entered and the ordinary per-repo command runs there, exactly as
+if you had typed it in that directory: it discovers that repo's own
+`.deliver.yml`, resolves that repo's release, and runs relative commands
+against that repo's files. `--service NAME` applies inside every repo.
+
+`deliver fleet deploy` stops at the first repo that fails — that repo has
+already unwound itself, and the ones after it are reported as `not attempted`.
+Pass `--keep-going` to run them anyway. `fleet preflight` and `fleet status`
+never stop early, because the whole answer is the point of asking. `--dry-run`
+and `--yes` mean on a fleet deploy what they mean on a single one; without
+`--yes` each repo asks about its own release in turn.
+
+Every run ends with a summary naming each repo and what happened to it, and the
+fleet exits with the worst code any repo returned — the same answer you would
+get running them one at a time and keeping the worst.
+
+```
+▸ Fleet summary
+    ✓ conduit    ok
+    ✗ toothpick  failed (exit 1)
+    - ampersand  not attempted
+```
+
+This is a loop, not a scheduler: no state is kept, nothing runs in parallel, and
+there is no cross-repo dependency graph. It is the multi-app view of one host —
+run history, schedules and approvals across a fleet are what
+[Teams](../teams/) is for.
+
 ## `deliver secrets`
 
 Show every declared secret and whether a configured provider can resolve it. Values are not printed.

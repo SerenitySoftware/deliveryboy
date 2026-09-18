@@ -13,8 +13,14 @@
 use crate::secrets::redact::scrub;
 use std::time::Instant;
 
+/// Once per process, not once per call: a `fleet` run drives the same per-repo
+/// commands in a loop, and repeating the version line between repos would push
+/// the thing the operator is reading further apart for no information.
 pub fn banner() {
-    eprintln!("Delivery Boy CLI v{}", env!("CARGO_PKG_VERSION"));
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!("Delivery Boy CLI v{}", env!("CARGO_PKG_VERSION"));
+    });
 }
 
 /// Announce what happens next.

@@ -4,6 +4,25 @@
 
 ### Added
 
+- `deliver fleet preflight|deploy|status` runs one command across every repo in
+  `deliver.fleet.yml`, which is a list of repo paths relative to itself. The
+  founding case is ~8–10 apps on one host, and every command until now operated
+  on one repo, so "deploy everything" or "what is live across the fleet?" meant
+  N invocations. Each repo is *entered* and the existing per-repo command runs
+  there — discovering that repo's own `.deliver.yml`, resolving that repo's
+  release, and running relative commands against that repo's files — because a
+  local `command:` step inherits the process's working directory, so anything
+  less would silently run one repo's build in another repo's directory. The
+  fleet file is found by walking up from the current directory (past a `.git`,
+  unlike config discovery, since it lives above the repos it lists);
+  `--repo NAME` narrows by directory name or the path as written, and a
+  selector that matches nothing stops the run rather than quietly running a
+  smaller fleet. `fleet deploy` stops at the first failure and reports the rest
+  as `not attempted` (`--keep-going` runs them anyway); the reads never stop
+  early. Every run ends with a per-repo summary and exits with the worst code
+  any repo returned. A loop, not a scheduler: no state, no daemon, no
+  cross-repo dependency graph.
+
 - `deliver logs [--service S] [--follow] [--tail N]` tails what the deploy is
   running, closing the operational loop next to `status`/`history`: deploy →
   see what is live → watch it run, without an ssh session. A `docker-compose`

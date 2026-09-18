@@ -5516,3 +5516,298 @@ services:
     assert!(text.contains("-d plain.example.md"), "{text}");
     assert!(text.contains("--cert-name plain.example.md"), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// `deliver fleet` — one command across the repos in `deliver.fleet.yml`.
+//
+// The fleet is a loop over the per-repo commands, so these build a real
+// directory of real repos and run the real binary against them. Everything
+// deploys to a `method: local` target, which makes even a non-dry-run fleet
+// deploy exercisable with no network and no server.
+
+/// A fleet root holding `deliver.fleet.yml`, listing `repos` by relative path.
+fn fleet_root(name: &str, repos: &[&str]) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    let listed: String = repos
+        .iter()
+        .map(|r| format!("  - ./{r}\n"))
+        .collect::<Vec<_>>()
+        .join("");
+    std::fs::write(
+        dir.join("deliver.fleet.yml"),
+        format!("version: 1\nrepos:\n{listed}"),
+    )
+    .unwrap();
+    dir
+}
+
+/// A repo inside a fleet that deploys one file to a directory of its own, and
+/// whose `before:` step copies a repo-local file — so a run from the wrong
+/// working directory fails loudly instead of shipping the wrong repo.
+fn fleet_repo(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let dir = root.join(name);
+    std::fs::create_dir_all(dir.join("dest")).unwrap();
+    std::fs::write(dir.join("payload.txt"), format!("{name}\n")).unwrap();
+    std::fs::write(dir.join("marker.txt"), format!("i am {name}\n")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: {name}
+defaults: {{target: local}}
+targets:
+  local: {{method: local, dir: {}}}
+services:
+  ship:
+    deployer: files
+    before: [{{command: "cp marker.txt proof.txt"}}]
+    config: {{src: payload.txt}}
+"#,
+            dir.join("dest").display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    dir
+}
+
+/// Does the fleet summary carry this line? The name column is padded to the
+/// widest repo name, so match on the words rather than on the spacing.
+fn summary_says(text: &str, repo: &str, state: &str) -> bool {
+    text.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(at) = words.iter().position(|w| *w == repo) else {
+            return false;
+        };
+        words[at + 1..].join(" ") == state
+    })
+}
+
+fn fleet_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn fleet_deploy_runs_each_repo_in_its_own_directory() {
+    let root = fleet_root("fleet-deploy", &["alpha", "beta"]);
+    let alpha = fleet_repo(&root, "alpha");
+    let beta = fleet_repo(&root, "beta");
+
+    let out = run_in(&root, &["fleet", "deploy", "-y"]);
+    let text = fleet_text(&out);
+    assert!(out.status.success(), "{text}");
+
+    // Each repo's relative `before:` step resolved against that repo, and each
+    // shipped its own payload — the property the whole loop rests on.
+    for (dir, name) in [(&alpha, "alpha"), (&beta, "beta")] {
+        let proof = std::fs::read_to_string(dir.join("proof.txt"))
+            .unwrap_or_else(|e| panic!("{name} did not run in its own directory: {e}\n{text}"));
+        assert_eq!(proof, format!("i am {name}\n"), "{text}");
+    }
+    assert!(text.contains("Fleet summary"), "{text}");
+    for name in ["alpha", "beta"] {
+        assert!(summary_says(&text, name, "ok"), "{text}");
+    }
+}
+
+#[test]
+fn fleet_deploy_stops_at_the_first_failure() {
+    let root = fleet_root("fleet-stop", &["alpha", "beta"]);
+    let alpha = fleet_repo(&root, "alpha");
+    fleet_repo(&root, "beta");
+    // alpha ships a file that is not there: it fails before the target is
+    // touched, which is exactly the shape a fleet must not deploy past.
+    std::fs::remove_file(alpha.join("payload.txt")).unwrap();
+
+    let out = run_in(&root, &["fleet", "deploy", "-y"]);
+    let text = fleet_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(summary_says(&text, "beta", "not attempted"), "{text}");
+    assert!(text.contains("--keep-going"), "{text}");
+    // Nothing ran in beta at all.
+    assert!(!root.join("beta/proof.txt").exists(), "{text}");
+}
+
+#[test]
+fn fleet_deploy_keeps_going_when_asked() {
+    let root = fleet_root("fleet-keep-going", &["alpha", "beta"]);
+    let alpha = fleet_repo(&root, "alpha");
+    fleet_repo(&root, "beta");
+    std::fs::remove_file(alpha.join("payload.txt")).unwrap();
+
+    let out = run_in(&root, &["fleet", "deploy", "-y", "--keep-going"]);
+    let text = fleet_text(&out);
+    // The fleet still reports the failure, but beta got its turn.
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(summary_says(&text, "beta", "ok"), "{text}");
+    assert!(root.join("beta/proof.txt").exists(), "{text}");
+}
+
+#[test]
+fn fleet_preflight_reports_every_repo_in_one_pass() {
+    let root = fleet_root("fleet-preflight", &["alpha", "beta"]);
+    fleet_repo(&root, "alpha");
+    let beta = fleet_repo(&root, "beta");
+    std::fs::remove_file(beta.join("payload.txt")).unwrap();
+
+    let out = run_in(&root, &["fleet", "preflight"]);
+    let text = fleet_text(&out);
+    // A read never stops early: the point of asking the fleet is the whole answer.
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(summary_says(&text, "alpha", "ok"), "{text}");
+    assert!(summary_says(&text, "beta", "failed (exit 2)"), "{text}");
+    assert!(!text.contains("not attempted"), "{text}");
+}
+
+#[test]
+fn fleet_narrows_to_the_repos_named() {
+    let root = fleet_root("fleet-narrow", &["alpha", "beta"]);
+    fleet_repo(&root, "alpha");
+    fleet_repo(&root, "beta");
+
+    let out = run_in(&root, &["fleet", "--repo", "beta", "deploy", "-y"]);
+    let text = fleet_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(root.join("beta/proof.txt").exists(), "{text}");
+    assert!(!root.join("alpha/proof.txt").exists(), "{text}");
+    assert!(!text.contains("alpha"), "{text}");
+}
+
+#[test]
+fn fleet_refuses_a_repo_selector_that_matches_nothing() {
+    let root = fleet_root("fleet-typo", &["alpha"]);
+    fleet_repo(&root, "alpha");
+
+    let out = run_in(&root, &["fleet", "--repo", "alhpa", "preflight"]);
+    let text = fleet_text(&out);
+    // Running the fleet minus a repo the operator thinks is in it would be the
+    // worst possible answer, so a typo stops the run and names what is listed.
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("no repo named alhpa"), "{text}");
+    assert!(text.contains("lists: alpha"), "{text}");
+    assert!(!root.join("alpha/proof.txt").exists(), "{text}");
+}
+
+#[test]
+fn fleet_skips_a_repo_with_no_config_and_still_answers_for_the_others() {
+    let root = fleet_root("fleet-no-config", &["alpha", "bare", "gone"]);
+    fleet_repo(&root, "alpha");
+    std::fs::create_dir_all(root.join("bare")).unwrap();
+
+    let out = run_in(&root, &["fleet", "preflight"]);
+    let text = fleet_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(summary_says(&text, "alpha", "ok"), "{text}");
+    assert!(text.contains("skipped — no .deliver.yml"), "{text}");
+    assert!(text.contains("is not a directory"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn fleet_status_reads_back_every_repo() {
+    let root = fleet_root("fleet-status", &["alpha", "beta"]);
+    for name in ["alpha", "beta"] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+        std::fs::write(
+            dir.join(".deliver.yml"),
+            format!(
+                r#"
+version: 1
+app: {name}
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+"#,
+                live.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    let out = run_in(&root, &["fleet", "status"]);
+    let text = fleet_text(&out);
+    assert!(out.status.success(), "{text}");
+    // Both repos answered, and the banner was printed once rather than per repo.
+    assert_eq!(
+        text.matches("v0.2.0 · 20260202-1000-bbb2222").count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(text.matches("Delivery Boy CLI v").count(), 1, "{text}");
+    assert!(
+        summary_says(&text, "alpha", "ok") && summary_says(&text, "beta", "ok"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_fleet_file_is_found_by_walking_up_from_inside_a_repo() {
+    let root = fleet_root("fleet-walkup", &["alpha"]);
+    let alpha = fleet_repo(&root, "alpha");
+
+    // A repo root has a `.git` — config discovery stops there, fleet discovery
+    // must not, because the fleet file lives above the repos it lists.
+    let out = run_in(&alpha, &["fleet", "preflight"]);
+    let text = fleet_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("deliver.fleet.yml"), "{text}");
+    assert!(summary_says(&text, "alpha", "ok"), "{text}");
+}
+
+#[test]
+fn fleet_explains_a_missing_fleet_file() {
+    let dir = tmpdir("fleet-missing");
+    let out = run_in(&dir, &["fleet", "status"]);
+    let text = fleet_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("no fleet file found"), "{text}");
+    assert!(
+        text.contains("repos:"),
+        "the error shows the file's shape: {text}"
+    );
+}
+
+#[test]
+fn fleet_refuses_a_single_repo_config_flag() {
+    let root = fleet_root("fleet-config-flag", &["alpha"]);
+    fleet_repo(&root, "alpha");
+
+    let out = run_in(
+        &root,
+        &["--config", "alpha/.deliver.yml", "fleet", "status"],
+    );
+    let text = fleet_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("cannot be used with `fleet`"), "{text}");
+}
+
+#[test]
+fn an_empty_fleet_file_is_an_error_not_an_empty_run() {
+    let dir = tmpdir("fleet-empty");
+    std::fs::write(dir.join("deliver.fleet.yml"), "version: 1\nrepos: []\n").unwrap();
+    let out = run_in(&dir, &["fleet", "status"]);
+    let text = fleet_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("`repos:` is empty"), "{text}");
+}
+
+#[test]
+fn a_fleet_file_from_a_later_version_is_refused() {
+    let dir = tmpdir("fleet-version");
+    std::fs::write(dir.join("deliver.fleet.yml"), "version: 2\nrepos: [./x]\n").unwrap();
+    let out = run_in(&dir, &["fleet", "status"]);
+    let text = fleet_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("unsupported version 2"), "{text}");
+}
