@@ -5811,3 +5811,182 @@ fn a_fleet_file_from_a_later_version_is_refused() {
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(text.contains("unsupported version 2"), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// Scaffolded `verify:` blocks.
+//
+// A failed verify check fails the deploy and triggers the rollback `exec.rs`
+// unwinds, so a service with none can never roll itself back. `init` used to
+// scaffold one for exactly two deployers, and the one it did write hardcoded
+// `url: https://EXAMPLE/` — a check that fails every release until someone
+// edits it, which is worse than no check at all. These pin both halves: every
+// deployer gets a default, and every default is derived from something `init`
+// was actually told.
+
+/// Write the scaffold `init` proposes, then prove the config it wrote is one
+/// the CLI accepts: a verify block that does not round-trip is a trap.
+fn scaffold_and_validate(dir: &std::path::Path, extra: &[&str]) -> String {
+    let mut cmd = deliver();
+    cmd.args(["init", "--write", "--path"])
+        .arg(dir)
+        .args(extra)
+        .stdin(std::process::Stdio::null());
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+
+    let check = run_in(dir, &["validate"]);
+    assert!(
+        check.status.success(),
+        "the scaffold does not validate:\n{written}\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    written
+}
+
+#[test]
+fn the_scaffolded_verify_url_is_the_host_init_was_given_not_example() {
+    let dir = hugo_repo("verify-url");
+    let written = scaffold_and_validate(&dir, &["--host", "demo.example.com"]);
+    assert!(
+        !written.contains("EXAMPLE"),
+        "a check that fails every good release:\n{written}"
+    );
+    assert!(
+        written.contains("url: https://demo.example.com/"),
+        "{written}"
+    );
+    // And it survives compilation into a real step.
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(
+        text.contains("verify http https://demo.example.com/"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_compose_service_is_scaffolded_with_a_container_up_probe() {
+    let dir = compose_only_repo("verify-compose", COMPOSE_WITH_DB);
+    let written =
+        scaffold_and_validate(&dir, &["--host", "demo.example.com", "--dir", "/srv/demo"]);
+    // The probe is built from the same -f files and -p project the deployer
+    // will bring the project up with, so it cannot drift from what was started.
+    assert!(
+        written.contains("remote_command: cd /srv/demo &&"),
+        "{written}"
+    );
+    assert!(written.contains("-f docker-compose.yml"), "{written}");
+    assert!(
+        written.contains(&format!(
+            "-p {} ",
+            dir.file_name().unwrap().to_string_lossy()
+        )),
+        "{written}"
+    );
+    assert!(
+        written.contains("ps --status running -q | grep -q ."),
+        "{written}"
+    );
+}
+
+#[test]
+fn the_compose_probe_says_it_runs_docker_as_the_deploy_user() {
+    let dir = compose_only_repo("verify-compose-note", COMPOSE_WITH_DB);
+    let text = init_output(&dir, &["--host", "demo.example.com"]);
+    // The one thing the scaffold cannot know about its own probe, said next to
+    // the evidence rather than guessed at inside the check.
+    assert!(text.contains("docker group"), "{text}");
+    assert!(text.contains("fail a good release"), "{text}");
+}
+
+#[test]
+fn a_front_end_files_service_is_scaffolded_with_a_check() {
+    let dir = tmpdir("verify-files");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"site","scripts":{"build":"vite build"},"devDependencies":{"vite":"^5"}}"#,
+    )
+    .unwrap();
+    let written = scaffold_and_validate(&dir, &["--host", "demo.example.com"]);
+    assert!(written.contains("deployer: files"), "{written}");
+    assert!(
+        written.contains("url: https://demo.example.com/"),
+        "{written}"
+    );
+    // A files service is usually one app under a host serving several, so the
+    // path is the part the scaffold says it is guessing at.
+    let text = init_output(&dir, &["--host", "demo.example.com"]);
+    assert!(text.contains("remote_subdir"), "{text}");
+}
+
+#[test]
+fn a_macos_service_verifies_the_appcast_it_just_uploaded() {
+    let dir = tmpdir("verify-macos");
+    std::fs::create_dir_all(dir.join("apps/macos/Demo.xcodeproj")).unwrap();
+    let written = scaffold_and_validate(&dir, &["--host", "demo.example.com"]);
+    // Exact, not a guess: the check names the same URL the appcast block does,
+    // read out of that block so the two cannot drift apart.
+    assert!(
+        written.contains("url: https://demo.example.com/download/mac/appcast.xml"),
+        "{written}"
+    );
+    assert_eq!(
+        written
+            .matches("https://demo.example.com/download/mac/appcast.xml")
+            .count(),
+        2,
+        "the check should quote the appcast block, not invent a URL:\n{written}"
+    );
+}
+
+#[test]
+fn plan_says_which_services_ship_without_a_verification_step() {
+    let dir = tmpdir("verify-blind");
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: blind
+defaults: {target: production}
+targets:
+  production: {host: box.example.com, dir: /var/universal/blind}
+services:
+  migrate:
+    deployer: commands
+    config: {steps: [{ssh: "echo migrating"}]}
+  checked:
+    deployer: commands
+    needs: [migrate]
+    config: {steps: [{ssh: "echo ok"}]}
+    verify: [{remote_command: "true"}]
+"#,
+    )
+    .unwrap();
+    let out = run_in(&dir, &["plan"]);
+    let text = fleet_text(&out);
+    assert!(out.status.success(), "{text}");
+    // Named, so a blind release is a decision rather than an oversight.
+    assert!(text.contains("no verification step: migrate"), "{text}");
+    assert!(
+        !text.contains("no verification step: migrate, checked")
+            && !text.contains("checked, migrate"),
+        "the verified service should not be listed:\n{text}"
+    );
+    assert!(text.contains("cannot roll itself back"), "{text}");
+}
+
+#[test]
+fn plan_says_nothing_about_verification_when_every_service_has_it() {
+    let dir = hugo_repo("verify-quiet");
+    scaffold_and_validate(&dir, &["--host", "demo.example.com"]);
+    let out = run_in(&dir, &["plan"]);
+    let text = fleet_text(&out);
+    assert!(
+        !text.contains("no verification step"),
+        "the scaffold verifies every service it writes:\n{text}"
+    );
+}

@@ -4,6 +4,18 @@
 
 ### Added
 
+- `deliver init` scaffolds a `verify:` block for every deployer it writes, and
+  `deliver plan` names the services that have none. A failed check fails the
+  deploy and triggers the rollback `exec.rs` unwinds — the CLI's single best
+  safety property — but it was opt-in YAML scaffolded for exactly two
+  deployers, so a `docker-compose`, `files` or `macos-app` service written by
+  `init` shipped blind and could never roll itself back. Every default is now
+  derived from something `init` was actually told: the site root on `--host`
+  for `hugo` and `files`, the appcast URL it just wrote for `macos-app`, and
+  for `docker-compose` a container-up probe built from the same `-f` files and
+  `-p` project the deployer will bring the project up with. What it still
+  cannot know is a note under the finding rather than a guess inside the check.
+
 - `deliver fleet preflight|deploy|status` runs one command across every repo in
   `deliver.fleet.yml`, which is a list of repo paths relative to itself. The
   founding case is ~8–10 apps on one host, and every command until now operated
@@ -39,6 +51,11 @@
   command is printed before it runs.
 
 ### Fixed
+
+- The one `verify:` check `deliver init` did scaffold hardcoded
+  `url: https://EXAMPLE/`, so an operator who did not edit it got a check that
+  fails on a *good* release — worse than no check at all, because it teaches
+  that a red verify means nothing. It is now the host `init` was given.
 
 - `nginx-vhost` provisioned certificates from the **unrendered** conf. Cert
   needs were derived by reading the conf off disk, while the `render:`

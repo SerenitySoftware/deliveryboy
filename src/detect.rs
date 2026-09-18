@@ -699,6 +699,103 @@ fn render_value(
     }
 }
 
+/// Look up a nested scalar in a finding's scaffolded config, so a default
+/// derived from another block cannot drift from the block it was derived from.
+fn config_scalar<'a>(config: &'a [(String, ConfigValue)], path: &[&str]) -> Option<&'a str> {
+    let (head, rest) = path.split_first()?;
+    let value = config.iter().find(|(k, _)| k == head).map(|(_, v)| v)?;
+    match (value, rest.is_empty()) {
+        (ConfigValue::Scalar(v), true) => Some(v),
+        (ConfigValue::Block(entries), false) => config_scalar(entries, rest),
+        _ => None,
+    }
+}
+
+/// The default `verify:` block for a finding, plus the one thing the scaffold
+/// still cannot know about it.
+///
+/// A failed verify check fails the deploy and triggers the rollback `exec.rs`
+/// already unwinds — the CLI's single best safety property — and it is opt-in
+/// YAML most configs will not have. So `init` writes one.
+///
+/// The bar every default here has to clear: **a check that fails on a good
+/// release is worse than no check at all.** That is not hypothetical — the
+/// hugo default used to be a hardcoded `url: https://EXAMPLE/`, which fails
+/// every release until someone edits it, and teaches operators that a red
+/// verify means nothing. So each default is derived from something `init` was
+/// actually told (the host it is writing into `targets:`, the compose files it
+/// found, the appcast URL it just scaffolded) and anything it still cannot know
+/// is a note under the finding rather than a guess inside the check.
+fn default_verify(finding: &Finding, app: &str, dir: &str) -> Option<(String, Option<String>)> {
+    let http = |url: &str| {
+        format!(
+            "    verify:\n      - http:\n          url: {url}\n          \
+             expect_status: 200\n          retries: 5\n          interval: 10\n"
+        )
+    };
+    match finding.deployer? {
+        // The site root on the host `init` was given. Still a guess about the
+        // *path*, which is why it says so.
+        "hugo" => Some((
+            http("https://{host}/"),
+            Some(
+                "verify.http.url is the site root on {host} — point it at a path this release \
+                 actually serves if the site is not served from /"
+                    .into(),
+            ),
+        )),
+        // Same, and more likely to need editing: a `files` service is often one
+        // app under a subdirectory of a host that serves several.
+        "files" => Some((
+            http("https://{host}/"),
+            Some(
+                "verify.http.url is the site root on {host} — a files service published under a \
+                 remote_subdir is usually served from a path, not /"
+                    .into(),
+            ),
+        )),
+        // Container-up probe, built from the same `-f` files and `-p` project
+        // the deployer will bring the project up with (`project` defaults to
+        // the app name, which is why the scaffold omits it).
+        "docker-compose" => {
+            let files = match finding.config.iter().find(|(k, _)| k == "files") {
+                Some((_, ConfigValue::List(files))) => files.clone(),
+                _ => vec!["docker-compose.yml".to_string()],
+            };
+            let flags: String = files.iter().map(|f| format!("-f {f} ")).collect();
+            let probe = format!(
+                "cd {dir} && docker compose {flags}-p {app} ps --status running -q | grep -q ."
+            );
+            Some((
+                format!(
+                    "    verify:\n      - remote_command: {}\n",
+                    quote_scalar(&probe)
+                ),
+                Some(
+                    "the verify probe runs docker as the deploy user — prefix it with `sudo ` if \
+                     that user is not in the docker group, or it will fail a good release"
+                        .into(),
+                ),
+            ))
+        }
+        // Exact, not a guess: the appcast this deploy just uploaded.
+        "macos-app" => {
+            config_scalar(&finding.config, &["appcast", "url"]).map(|url| (http(url), None))
+        }
+        "nginx-vhost" => Some((
+            "    verify:\n      - remote_command: nginx -t\n".into(),
+            None,
+        )),
+        _ => None,
+    }
+}
+
+/// The note that belongs with a finding's scaffolded `verify:` block, for
+/// `deliver init` to print under the evidence with the finding's other notes.
+pub fn verify_note(finding: &Finding, app: &str, dir: &str) -> Option<String> {
+    default_verify(finding, app, dir).and_then(|(_, note)| note)
+}
+
 /// Render a `.deliver.yml` from findings that map to a real deployer.
 pub fn scaffold(app: &str, host: &str, dir: &str, findings: &[Finding]) -> String {
     let fill = |value: &str| value.replace("{app}", app).replace("{host}", host);
@@ -726,11 +823,8 @@ pub fn scaffold(app: &str, host: &str, dir: &str, findings: &[Finding]) -> Strin
                 render_value(&mut out, 6, k, v, &fill);
             }
         }
-        if deployer == "hugo" {
-            out.push_str("    verify:\n      - http:\n          url: https://EXAMPLE/\n          expect_status: 200\n          retries: 5\n          interval: 10\n");
-        }
-        if deployer == "nginx-vhost" {
-            out.push_str("    verify:\n      - remote_command: nginx -t\n");
+        if let Some((block, _)) = default_verify(f, app, dir) {
+            out.push_str(&fill(&block));
         }
         previous = Some(f.service.clone());
     }

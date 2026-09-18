@@ -318,8 +318,11 @@ fn cmd_init(
         println!("  • {}  {status}", f.evidence);
         // What the scaffold could not work out for itself. Saying it here, next
         // to the evidence, is the difference between a config that is ready and
-        // one that only looks ready.
-        for note in &f.notes {
+        // one that only looks ready. The verify note rides along: a scaffolded
+        // check the operator never looks at is how a check ends up failing a
+        // good release.
+        let verify_note = detect::verify_note(f, &app, &dir);
+        for note in f.notes.iter().chain(verify_note.iter()) {
             println!(
                 "      ! {}",
                 note.replace("{app}", &app).replace("{host}", host)
@@ -778,6 +781,21 @@ fn compile_announced(
             .collect::<Vec<_>>()
             .join(" → ")
     ));
+    // A failed verify check is what triggers the rollback `exec.rs` unwinds, so
+    // a service with none can never roll itself back — it ships blind. That is
+    // a legitimate choice for some services and an oversight for most, and the
+    // difference is only visible if someone says it out loud.
+    let unverified: Vec<&str> = compiled
+        .iter()
+        .filter(|sp| !sp.steps.iter().any(|s| s.label.starts_with("verify")))
+        .map(|sp| sp.service.as_str())
+        .collect();
+    if !unverified.is_empty() {
+        ui::note(format!(
+            "no verification step: {} — a failed release there cannot roll itself back.",
+            unverified.join(", ")
+        ));
+    }
     Ok(compiled)
 }
 

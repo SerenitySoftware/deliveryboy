@@ -118,6 +118,26 @@ verify:
       interval: 5
 ```
 
+A check is the only thing that can roll a bad release back on its own, so
+`deliver init` scaffolds one for every deployer it writes, built from what it
+was actually told: the site root on the `--host` it was given for `hugo` and
+`files`, the appcast URL it just wrote for `macos-app`, `nginx -t` for
+`nginx-vhost`, and for `docker-compose` a container-up probe using the same
+`-f` files and `-p` project the deploy will bring the project up with. What it
+still cannot know — whether the site is served from `/`, whether the deploy
+user can reach `docker` without `sudo` — is printed as a note under the
+finding rather than guessed at inside the check, because a check that fails on
+a *good* release is worse than no check at all.
+
+Services that end up with none are named by `deliver plan`, so shipping blind
+is a decision rather than an oversight:
+
+```
+▸ Compiling plan
+    2 service(s), 7 step(s): migrate → web
+  no verification step: migrate — a failed release there cannot roll itself back.
+```
+
 ## Where the logs are
 
 `deliver logs` tails a `docker-compose` service with the deploy's own compose
