@@ -117,6 +117,24 @@ release, and resolved secrets are elided from both sides of the diff.
          +       - LOG=debug
 ```
 
+## One release at a time
+
+`deliver deploy` and `deliver rollback` take an advisory lock on each target
+before the first step that changes anything, and give it back on every way out —
+including the rollback unwind after a failed step. A second run refuses and names
+who holds it, since two releases interleaving on one host can leave the box
+running one release's artifact behind another's config.
+
+```
+▸ Deploy lock
+    ✗ production [box.example.com]:/var/universal/demo.deliver-lock — a deploy is already running
+    ✗ holder:   jordan@laptop (pid 51234)
+    ✗ started:  2026-02-02T14:02:11Z (7m ago)
+```
+
+A dry run takes no lock, `--force` takes one another run still holds, and a lock
+older than an hour is treated as abandoned and taken over.
+
 ## Secrets in output
 
 Values resolved from your provider chain (environment, dotenv, SOPS, Keychain,

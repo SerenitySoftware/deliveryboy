@@ -5990,3 +5990,277 @@ fn plan_says_nothing_about_verification_when_every_service_has_it() {
         "the scaffold verifies every service it writes:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The advisory deploy lock. The whole point is what happens when two runs reach
+// the same target, so these drive a `method: local` target — the "remote" is
+// this machine, which makes the real acquire/refuse/release path exercisable
+// with no server and no second process.
+
+/// Where `deliver` will look for the lock of a `local_deploy_repo` target.
+fn lock_dir(repo: &std::path::Path) -> std::path::PathBuf {
+    let dest = repo.join("dest");
+    repo.join(format!("{}.deliver-lock", dest.display()))
+}
+
+/// Pretend another run holds the lock, `age` seconds ago on this machine's clock.
+fn hold_lock(repo: &std::path::Path, age: u64) {
+    let dir = lock_dir(repo);
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        dir.join("owner"),
+        format!(
+            "owner=someone@otherbox\npid=4242\nservices=ship\nrelease=v9.9.9\n\
+             deploy=20260101-fff9999\nstarted_at=2026-01-01T00:00:00Z\n\
+             started_epoch={}\n",
+            now - age
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_deploy_refuses_while_another_run_holds_the_target() {
+    let dir = local_deploy_repo("lock-busy");
+    git_init_tagged(&dir, "v1.0.0");
+    hold_lock(&dir, 120);
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("a deploy is already running"), "{text}");
+    assert!(text.contains("someone@otherbox (pid 4242)"), "{text}");
+    assert!(text.contains("v9.9.9"), "{text}");
+    assert!(text.contains("2m ago"), "{text}");
+    assert!(
+        text.contains("nothing was built, shipped, or changed"),
+        "{text}"
+    );
+    // The refusal must leave the other run's lock exactly as it found it.
+    assert!(lock_dir(&dir).join("owner").is_file(), "{text}");
+    // And nothing can have shipped.
+    assert!(!dir.join("dest/payload.txt").exists(), "{text}");
+}
+
+#[test]
+fn a_finished_deploy_gives_the_lock_back() {
+    let dir = local_deploy_repo("lock-release");
+    git_init_tagged(&dir, "v1.0.0");
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("Deploy lock"), "{text}");
+    assert!(text.contains("locked"), "{text}");
+    assert!(
+        !lock_dir(&dir).exists(),
+        "the lock outlived the deploy:\n{text}"
+    );
+}
+
+#[test]
+fn a_lock_older_than_the_stale_window_is_taken_over() {
+    let dir = local_deploy_repo("lock-stale");
+    git_init_tagged(&dir, "v1.0.0");
+    hold_lock(&dir, 7_200); // two hours: past the one-hour default
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("took over an abandoned lock"), "{text}");
+    assert!(!lock_dir(&dir).exists(), "{text}");
+}
+
+#[test]
+fn a_stale_window_of_zero_never_takes_a_lock_over() {
+    let dir = local_deploy_repo("lock-nostale");
+    // The same repo, with the takeover disabled on the target.
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        cfg.replace("dir: ", "lock: {stale_after: 0}, dir: "),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    hold_lock(&dir, 7_200);
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("a deploy is already running"), "{text}");
+}
+
+#[test]
+fn force_takes_a_lock_another_run_still_holds() {
+    let dir = local_deploy_repo("lock-force");
+    git_init_tagged(&dir, "v1.0.0");
+    hold_lock(&dir, 60);
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0", "--force"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(!lock_dir(&dir).exists(), "{text}");
+}
+
+#[test]
+fn a_dry_run_is_not_gated_on_someone_elses_release() {
+    let dir = local_deploy_repo("lock-dryrun");
+    git_init_tagged(&dir, "v1.0.0");
+    hold_lock(&dir, 60);
+
+    let out = run_in(&dir, &["deploy", "--dry-run", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("a deploy is already running"), "{text}");
+    // A preview must not disturb the lock it did not take.
+    assert!(lock_dir(&dir).join("owner").is_file(), "{text}");
+}
+
+#[test]
+fn a_failed_deploy_still_gives_the_lock_back() {
+    let dir = tmpdir("lock-failed");
+    let dest = dir.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: local}}
+targets:
+  local: {{method: local, dir: {}}}
+services:
+  ship:
+    deployer: commands
+    config:
+      steps:
+        - command: "exit 3"
+"#,
+            dest.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        !lock_dir(&dir).exists(),
+        "a failed deploy left the target locked:\n{text}"
+    );
+}
+
+#[test]
+fn a_rollback_contends_for_the_same_lock_as_a_deploy() {
+    let dir = local_deploy_repo("lock-rollback");
+    git_init_tagged(&dir, "v1.0.0");
+    hold_lock(&dir, 90);
+
+    let out = run_in(&dir, &["rollback"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("a deploy is already running"), "{text}");
+    assert!(text.contains("nothing on the target was changed"), "{text}");
+    assert!(lock_dir(&dir).join("owner").is_file(), "{text}");
+}
+
+#[test]
+fn a_lock_taken_before_a_busy_one_is_given_straight_back() {
+    // Two targets, the second already held: the first must not be left locked
+    // by the run that refused.
+    let dir = tmpdir("lock-partial");
+    std::fs::write(dir.join("payload.txt"), "hi\n").unwrap();
+    let one = dir.join("one");
+    let two = dir.join("two");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: one}}
+targets:
+  one: {{method: local, dir: {}}}
+  two: {{method: local, dir: {}}}
+services:
+  a:
+    deployer: files
+    config: {{src: payload.txt}}
+  b:
+    deployer: files
+    target: two
+    needs: [a]
+    config: {{src: payload.txt}}
+"#,
+            one.display(),
+            two.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+
+    let held = dir.join(format!("{}.deliver-lock", two.display()));
+    std::fs::create_dir_all(&held).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        held.join("owner"),
+        format!("owner=someone@otherbox\nstarted_epoch={now}\n"),
+    )
+    .unwrap();
+
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        !dir.join(format!("{}.deliver-lock", one.display())).exists(),
+        "the first target stayed locked after the run refused:\n{text}"
+    );
+    assert!(held.join("owner").is_file(), "{text}");
+}

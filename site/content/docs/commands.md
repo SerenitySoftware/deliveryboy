@@ -59,6 +59,8 @@ deliver deploy --version 1.2.3
 
 `--service NAME` can be repeated. `--version` supplies the release version without a prompt. `--yes` accepts a tag already present on `HEAD`; it does not invent an untagged release.
 
+Before the first step that changes anything, `deploy` takes an advisory lock on each target and refuses if another run holds it (exit code `2`, nothing built or shipped). `--force` takes the lock anyway. A dry run takes no lock. See [Safety](../safety/).
+
 ## `deliver status`
 
 Read back what is live on the target right now: the release the live symlink points at, when it was deployed and from which commit, how many releases are retained, and how many deploys are on record. Nothing is modified — it is one read per target.

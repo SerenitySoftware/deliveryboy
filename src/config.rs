@@ -122,6 +122,10 @@ pub struct Target {
     /// directory is usually yours and a sudo prompt would just block.
     #[serde(default)]
     pub sudo: Option<bool>,
+    /// Advisory deploy-lock knobs. Locking itself is not optional — see
+    /// [`crate::lock`] — but how long an abandoned lock blocks the next run is.
+    #[serde(default)]
+    pub lock: Option<LockConfig>,
     /// Deprecated: `user`/`port` now live under `ssh:`. Still accepted so older
     /// configs keep working; the values are folded into `ssh` on load.
     #[serde(default)]
@@ -129,6 +133,23 @@ pub struct Target {
     #[serde(default)]
     port: Option<u16>,
 }
+
+/// How long a deploy lock may sit before a later run is allowed to take it
+/// over. The window exists because a Ctrl-C kills `deliver` outright, and a
+/// lock nobody can release is worse than one that is briefly too generous.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockConfig {
+    /// Seconds. `0` never takes a lock over, so a crashed run has to be cleared
+    /// by hand or with `--force`.
+    #[serde(default)]
+    pub stale_after: Option<u64>,
+}
+
+/// An hour is longer than any release this tool has been observed to run and
+/// far shorter than a working day, so an abandoned lock clears itself before
+/// the next person needs the box.
+pub const DEFAULT_LOCK_STALE_AFTER: u64 = 3600;
 
 fn default_method() -> String {
     "ssh".to_string()
@@ -197,6 +218,21 @@ impl Target {
 
     pub fn uses_sudo(&self) -> bool {
         self.sudo.unwrap_or(!self.is_local())
+    }
+
+    /// Where the advisory deploy lock lives: *beside* the target directory, not
+    /// inside it. When a `files` service serves the release root, `dir` is the
+    /// live symlink the deploy is about to swap, and a lock underneath it would
+    /// be carried away mid-release. `<root>.releases` is the same convention.
+    pub fn lock_dir(&self) -> String {
+        format!("{}.deliver-lock", self.dir.trim_end_matches('/'))
+    }
+
+    pub fn lock_stale_after(&self) -> u64 {
+        self.lock
+            .as_ref()
+            .and_then(|l| l.stale_after)
+            .unwrap_or(DEFAULT_LOCK_STALE_AFTER)
     }
 
     /// Arguments for invoking ssh.

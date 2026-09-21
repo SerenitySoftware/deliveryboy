@@ -8,6 +8,7 @@ mod deployers;
 mod detect;
 mod exec;
 mod fleet;
+mod lock;
 mod logs;
 mod notifications;
 mod plan;
@@ -76,6 +77,9 @@ enum FleetAction {
         /// Carry on to the remaining repos after one fails
         #[arg(long)]
         keep_going: bool,
+        /// Take each target's deploy lock even if another run holds it
+        #[arg(long)]
+        force: bool,
     },
     /// Show what is live across the fleet
     Status {
@@ -128,6 +132,9 @@ enum Commands {
         /// Create/use this release version without prompting (e.g. 0.4.1)
         #[arg(long)]
         version: Option<String>,
+        /// Take the target's deploy lock even if another run holds it
+        #[arg(long)]
+        force: bool,
     },
     /// Run only the verify checks
     Verify {
@@ -172,6 +179,9 @@ enum Commands {
         /// (`deliver history` lists the ids)
         #[arg(long, value_name = "DEPLOY_ID")]
         to: Option<String>,
+        /// Take the target's deploy lock even if another run holds it
+        #[arg(long)]
+        force: bool,
     },
     /// Run the preflight checks only (tools, input files, ssh reachability)
     Preflight {
@@ -233,6 +243,7 @@ fn run(cli: &Cli) -> Result<i32> {
             dry_run,
             yes,
             version,
+            force,
         } => cmd_deploy(
             cli.config.as_deref(),
             service,
@@ -240,10 +251,17 @@ fn run(cli: &Cli) -> Result<i32> {
             false,
             *yes,
             version.as_deref(),
+            *force,
         ),
-        Commands::Verify { service } => {
-            cmd_deploy(cli.config.as_deref(), service, false, true, true, None)
-        }
+        Commands::Verify { service } => cmd_deploy(
+            cli.config.as_deref(),
+            service,
+            false,
+            true,
+            true,
+            None,
+            false,
+        ),
         Commands::Status { service, json } => {
             cmd_readback(cli.config.as_deref(), service, Readback::Status, *json)
         }
@@ -262,9 +280,9 @@ fn run(cli: &Cli) -> Result<i32> {
             follow,
             tail,
         } => cmd_logs(cli.config.as_deref(), service, *follow, *tail),
-        Commands::Rollback { service, to } => match to {
-            Some(deploy_id) => cmd_rollback_to(cli.config.as_deref(), service, deploy_id),
-            None => cmd_rollback(cli.config.as_deref(), service),
+        Commands::Rollback { service, to, force } => match to {
+            Some(deploy_id) => cmd_rollback_to(cli.config.as_deref(), service, deploy_id, *force),
+            None => cmd_rollback(cli.config.as_deref(), service, *force),
         },
         Commands::Preflight { service } => cmd_preflight(cli.config.as_deref(), service),
         Commands::Fleet {
@@ -900,6 +918,7 @@ fn cmd_deploy(
     verify_only: bool,
     assume_yes: bool,
     version_arg: Option<&str>,
+    force_lock: bool,
 ) -> Result<i32> {
     ui::banner();
     let timer = ui::Timer::start();
@@ -962,6 +981,40 @@ fn cmd_deploy(
         ui::note("canceled — nothing was built, shipped, or changed.");
         return Ok(0);
     }
+
+    // Serialize against every other run touching these targets. Taken here,
+    // after the last human window and immediately before the first mutating
+    // step, so the lock is never held while someone reads a diff — and released
+    // by `_lock`'s `Drop` on every path out of this function, including the
+    // rollback unwind inside `exec::execute`.
+    //
+    // A dry run and `verify` mutate nothing, so neither takes the lock: gating
+    // a read-only preview on a colleague's release would answer "what would
+    // this do?" with "wait".
+    let _lock = if verify_only || dry_run {
+        lock::Guard::empty()
+    } else {
+        ui::phase("Deploy lock");
+        match lock::acquire(
+            &plan,
+            &config.targets,
+            &lock::Identity::new(&plan, &v),
+            force_lock,
+        ) {
+            lock::Taken::Held(guard) => guard,
+            lock::Taken::Busy(blocked) => {
+                ui::phase("Aborted");
+                for line in blocked.render() {
+                    ui::fail(line);
+                }
+                ui::note(
+                    "wait for that run to finish, or re-run with --force to take the lock anyway.",
+                );
+                ui::note("nothing was built, shipped, or changed.");
+                return Ok(2);
+            }
+        }
+    };
 
     ui::phase(match (verify_only, dry_run) {
         (true, _) => "Verifying",
@@ -1216,12 +1269,51 @@ fn cmd_logs(explicit: Option<&Path>, only: &[String], follow: bool, tail: usize)
     Ok(if failed { 1 } else { 0 })
 }
 
-fn cmd_rollback(explicit: Option<&Path>, only: &[String]) -> Result<i32> {
+/// Take the deploy lock for a rollback, or report who has it.
+///
+/// `Err(code)` is the exit code to return: the two rollback commands both stop
+/// with the target untouched rather than joining a release already in flight.
+fn take_deploy_lock(
+    plan: &[plan::ServicePlan],
+    config: &config::Config,
+    v: &version::DeployVersion,
+    force_lock: bool,
+) -> std::result::Result<lock::Guard, i32> {
+    ui::phase("Deploy lock");
+    match lock::acquire(
+        plan,
+        &config.targets,
+        &lock::Identity::new(plan, v),
+        force_lock,
+    ) {
+        lock::Taken::Held(guard) => Ok(guard),
+        lock::Taken::Busy(blocked) => {
+            ui::phase("Aborted");
+            for line in blocked.render() {
+                ui::fail(line);
+            }
+            ui::note(
+                "wait for that run to finish, or re-run with --force to take the lock anyway.",
+            );
+            ui::note("nothing on the target was changed.");
+            Err(2)
+        }
+    }
+}
+
+fn cmd_rollback(explicit: Option<&Path>, only: &[String], force_lock: bool) -> Result<i32> {
     ui::banner();
     let timer = ui::Timer::start();
     let (config, path) = load_announced(explicit)?;
     let v = version_announced(&config, &repo_root(&path));
     let plan = compile_announced(&config, only, &repo_root(&path), &v)?;
+    // A rollback swaps the same symlink a deploy does, so it contends for the
+    // same lock — the `rollback` fired at a target mid-deploy is one of the
+    // races this exists to stop.
+    let _lock = match take_deploy_lock(&plan, &config, &v, force_lock) {
+        Ok(guard) => guard,
+        Err(code) => return Ok(code),
+    };
     ui::phase("Rolling back");
     let ok = exec::rollback(&plan, &config.targets)?;
     if ok {
@@ -1241,7 +1333,12 @@ fn cmd_rollback(explicit: Option<&Path>, only: &[String]) -> Result<i32> {
 /// every selected service against the requested id, and only then swaps. A
 /// service that cannot be satisfied refuses the whole run while the target is
 /// still untouched, so a multi-service rollback never half-lands.
-fn cmd_rollback_to(explicit: Option<&Path>, only: &[String], deploy_id: &str) -> Result<i32> {
+fn cmd_rollback_to(
+    explicit: Option<&Path>,
+    only: &[String],
+    deploy_id: &str,
+    force_lock: bool,
+) -> Result<i32> {
     ui::banner();
     let timer = ui::Timer::start();
     if !rollback::id_is_addressable(deploy_id) {
@@ -1314,6 +1411,11 @@ fn cmd_rollback_to(explicit: Option<&Path>, only: &[String], deploy_id: &str) ->
         ui::ok(format!("{deploy_id} is already live everywhere selected"));
         return Ok(0);
     }
+
+    let _lock = match take_deploy_lock(&plan, &config, &v, force_lock) {
+        Ok(guard) => guard,
+        Err(code) => return Ok(code),
+    };
 
     ui::phase(&format!("Rolling back to {deploy_id}"));
     for resolution in &resolved {
@@ -1428,8 +1530,9 @@ fn cmd_fleet(
                 service,
                 dry_run,
                 yes,
+                force,
                 ..
-            } => cmd_deploy(None, service, *dry_run, false, *yes, None),
+            } => cmd_deploy(None, service, *dry_run, false, *yes, None, *force),
             FleetAction::Status { service } => cmd_readback(None, service, Readback::Status, false),
         });
         if !outcome.ok() && stop_on_failure {

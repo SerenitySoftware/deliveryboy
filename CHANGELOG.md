@@ -4,6 +4,28 @@
 
 ### Added
 
+- `deliver deploy` and `deliver rollback` hold an advisory lock on each target
+  for the length of the release. The model is an atomic symlink swap into
+  `releases/<stamp>` on a single shared host, and nothing serialized two runs
+  against it: a CI release and a hand-run deploy, two operators, or a `rollback`
+  fired mid-swap interleave their swaps, restarts and health checks, and the box
+  can end up running one release's artifact behind another's config with
+  `verify:` passing against whichever won. A second run now refuses with the
+  holder, services, release and how long ago it started. The lock is a `mkdir`
+  beside the target directory — never underneath it, since for a service that
+  serves the release root `dir` is the symlink the deploy is about to swap — and
+  it is released in `Drop`, so the abort paths and the rollback unwind give it
+  back without each caller remembering to. It is taken after the last prompt and
+  immediately before the first mutating step, so it is never held while a human
+  reads a diff. `--dry-run` and `deliver verify` change nothing and take no
+  lock; `--force` takes a lock another run still holds; a lock older than
+  `lock.stale_after` on the target (default one hour, `0` to disable) is treated
+  as abandoned and taken over, because a Ctrl-C kills `deliver` outright. A lock
+  that cannot be taken at all — no route to the host, an uncreatable directory —
+  prints a line and the deploy continues: that is not evidence of a concurrent
+  release, and failing closed on it would turn an unrelated permission problem
+  into a failed deploy.
+
 - `deliver init` scaffolds a `verify:` block for every deployer it writes, and
   `deliver plan` names the services that have none. A failed check fails the
   deploy and triggers the rollback `exec.rs` unwinds — the CLI's single best

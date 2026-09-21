@@ -54,6 +54,17 @@ targets:
       key: ~/.ssh/example.pem
 ```
 
+A target is also the unit `deliver deploy` and `deliver rollback` lock, so two runs never change it at once. An abandoned lock is taken over after an hour; `lock: stale_after` sets that window in seconds, and `0` means a lock is never taken over automatically.
+
+```yaml
+targets:
+  production:
+    host: app-1.example.com
+    dir: /var/www/example
+    lock:
+      stale_after: 7200
+```
+
 ## Services and order
 
 Each service uses one deployer. Use `needs` to order related services:
