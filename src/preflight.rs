@@ -127,7 +127,16 @@ fn ssh_reachable(target: &Target, host: &str) -> Result<(), String> {
     }
 }
 
-pub fn run(config: &Config, plan: &[ServicePlan], repo_root: &Path, check_remote: bool) -> Report {
+/// `also_hosts` are (target, host) pairs to probe on top of the plan's own —
+/// how `deliver preflight` still checks reachability for a service whose plan
+/// would not compile. Empty for every other caller.
+pub fn run(
+    config: &Config,
+    plan: &[ServicePlan],
+    repo_root: &Path,
+    check_remote: bool,
+    also_hosts: &[(String, String)],
+) -> Report {
     let mut problems = Vec::new();
     let mut checked = Vec::new();
 
@@ -164,18 +173,22 @@ pub fn run(config: &Config, plan: &[ServicePlan], repo_root: &Path, check_remote
     // 3. remote reachability (skipped for --dry-run / plan)
     if check_remote {
         let mut seen = BTreeSet::new();
-        for sp in plan {
+        let pairs = plan
+            .iter()
+            .map(|sp| (sp.target.clone(), sp.host.clone()))
+            .chain(also_hosts.iter().cloned());
+        for (target_name, host) in pairs {
             // One check per (target, host) pair.
-            if !seen.insert((sp.target.clone(), sp.host.clone())) {
+            if !seen.insert((target_name.clone(), host.clone())) {
                 continue;
             }
-            if let Some(target) = config.targets.get(&sp.target) {
-                match ssh_reachable(target, &sp.host) {
+            if let Some(target) = config.targets.get(&target_name) {
+                match ssh_reachable(target, &host) {
                     // Only claim a check passed when it actually did.
                     Ok(()) => checked.push(if target.is_local() {
                         "target is local (no ssh needed)".to_string()
                     } else {
-                        format!("{} reachable", target.describe(&sp.host))
+                        format!("{} reachable", target.describe(&host))
                     }),
                     Err(problem) => problems.push(problem),
                 }

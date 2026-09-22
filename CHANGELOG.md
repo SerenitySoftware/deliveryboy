@@ -74,6 +74,20 @@
 
 ### Fixed
 
+- `deliver preflight` stopped at plan compile, so its one-pass report was cut
+  short. The command's whole promise is that it "reports every problem it can
+  find in one pass", and `preflight::run` is built that way — it collects
+  problems rather than returning at the first — but the plan was compiled
+  *before* it with the error allowed to escape to the top level. A config with
+  one unresolvable secret therefore exited 2 with no tools line, no input-file
+  line and no ssh line, so an operator who was also missing `hugo` or could not
+  reach the box found that out one run at a time. A service that will not
+  compile is now a finding like any other: the services that do compile still
+  contribute their tool checks, the failing service's host is still probed
+  (derived from the config, since the plan is what broke), and everything is
+  reported together. `plan`, `deploy` and `rollback` are unchanged — one broken
+  service is still a hard error there, with the same message.
+
 - The one `verify:` check `deliver init` did scaffold hardcoded
   `url: https://EXAMPLE/`, so an operator who did not edit it got a check that
   fails on a *good* release — worse than no check at all, because it teaches

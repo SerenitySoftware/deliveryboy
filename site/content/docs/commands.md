@@ -47,6 +47,8 @@ deliver plan --version 1.2.3
 
 Check local tools, input files, secrets, and SSH access. It reports every problem it can find in one pass.
 
+That includes a service whose plan will not compile: unlike every other command, `preflight` reports it as one more finding and keeps checking, so a broken config and a missing `hugo` show up in the same run. Exit code `2` when anything is wrong.
+
 ## `deliver deploy`
 
 Run preflight, build, stage, activate, and verify. Use `--dry-run` to walk the flow without changing anything.

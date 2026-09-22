@@ -817,18 +817,82 @@ fn compile_announced(
     Ok(compiled)
 }
 
+/// What preflight should account for *beyond* the compiled plan.
+///
+/// Non-empty only for `deliver preflight`, which keeps going when the plan will
+/// not compile so it can still report everything else wrong in the same pass.
+#[derive(Default)]
+struct Unplanned {
+    /// Compile failures, reported as findings rather than as a fatal error.
+    problems: Vec<String>,
+    /// (target, host) pairs belonging to the services that failed.
+    hosts: Vec<(String, String)>,
+}
+
+/// `compile_announced` for preflight: the same phase line, but a plan that will
+/// not compile comes back as findings to report alongside the rest rather than
+/// as an error that ends the run.
+fn compile_reported(
+    config: &config::Config,
+    only: &[String],
+    root: &Path,
+    version: &version::DeployVersion,
+) -> (Vec<plan::ServicePlan>, Unplanned) {
+    ui::phase("Compiling plan");
+    let compiled = match plan::compile(config, only, root, version) {
+        Ok(c) => c,
+        // Not a service's fault (an unreadable provider, a dependency cycle),
+        // so there is no partial plan to go on — but the config's own checks
+        // still run.
+        Err(e) => {
+            return (
+                Vec::new(),
+                Unplanned {
+                    problems: vec![format!("plan will not compile — {e:#}")],
+                    hosts: plan::unplanned_hosts(config, only, &[]),
+                },
+            )
+        }
+    };
+    let steps: usize = compiled.plan.iter().map(|sp| sp.steps.len()).sum();
+    ui::detail(format!(
+        "{} service(s), {steps} step(s): {}",
+        compiled.plan.len(),
+        compiled
+            .plan
+            .iter()
+            .map(|sp| sp.service.as_str())
+            .collect::<Vec<_>>()
+            .join(" → ")
+    ));
+    let unplanned = Unplanned {
+        problems: compiled
+            .errors
+            .iter()
+            .map(|e| format!("plan will not compile — {e}"))
+            .collect(),
+        hosts: plan::unplanned_hosts(config, only, &compiled.plan),
+    };
+    (compiled.plan, unplanned)
+}
+
 /// Phase: preflight. Returns false when it found problems.
 fn preflight_announced(
     config: &config::Config,
     compiled: &[plan::ServicePlan],
     root: &Path,
     check_remote: bool,
+    unplanned: &Unplanned,
 ) -> bool {
     ui::phase("Preflight");
     if !check_remote {
         ui::detail("(dry run — skipping remote reachability)");
     }
-    let report = preflight::run(config, compiled, root, check_remote);
+    let mut report = preflight::run(config, compiled, root, check_remote, &unplanned.hosts);
+    // First, because everything after it is downstream of a plan that compiles.
+    for problem in unplanned.problems.iter().rev() {
+        report.problems.insert(0, problem.clone());
+    }
     for line in &report.checked {
         ui::ok(line);
     }
@@ -967,7 +1031,7 @@ fn cmd_deploy(
     }
 
     // Preflight before anything is built or shipped.
-    if !preflight_announced(&config, &plan, &root, !dry_run) {
+    if !preflight_announced(&config, &plan, &root, !dry_run, &Unplanned::default()) {
         ui::phase("Aborted");
         ui::note("preflight failed — nothing was built, shipped, or changed.");
         return Ok(2);
@@ -1573,8 +1637,13 @@ fn cmd_preflight(explicit: Option<&Path>, only: &[String]) -> Result<i32> {
     let (config, path) = load_announced(explicit)?;
     let secrets_ok = secrets_announced(&config, &repo_root(&path));
     let v = version_announced(&config, &repo_root(&path));
-    let compiled = compile_announced(&config, only, &repo_root(&path), &v)?;
-    let ok = preflight_announced(&config, &compiled, &repo_root(&path), true) && secrets_ok;
+    // A plan that will not compile is a *finding* here, not a fatal error:
+    // preflight is the command whose whole job is to list everything wrong at
+    // once, and an operator who is also missing `hugo` or cannot reach the box
+    // should learn that now rather than on the next run.
+    let (compiled, unplanned) = compile_reported(&config, only, &repo_root(&path), &v);
+    let ok =
+        preflight_announced(&config, &compiled, &repo_root(&path), true, &unplanned) && secrets_ok;
     ui::phase(if ok { "Done" } else { "Failed" });
     if ok {
         ui::ok("ready to deploy");

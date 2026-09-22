@@ -1176,6 +1176,123 @@ services:
     assert!(err.contains("nginx/missing.conf"), "{err}");
 }
 
+/// A config whose `nginx` service cannot compile (a `render:` placeholder wants
+/// a secret no provider has) while its `web` service compiles fine, plus an
+/// input file that is missing. One run should name all of it.
+fn wont_compile_repo(name: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/site.conf"),
+        "server { server_name __SITE_DOMAIN__; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: demo
+defaults: {target: production}
+targets:
+  production:
+    host: box.example.md
+    user: root
+    dir: /srv/demo
+    ssh: {key: /definitely/not/here.pem}
+secrets:
+  SITE_DOMAIN: {env: DELIVER_TEST_ABSENT_DOMAIN}
+services:
+  web:
+    deployer: hugo
+    config: {source: apps/web, remote_subdir: web}
+  nginx:
+    deployer: nginx-vhost
+    needs: [web]
+    config:
+      ssl: false
+      conf: nginx/site.conf
+      render:
+        __SITE_DOMAIN__: "{secret:SITE_DOMAIN}"
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn preflight_reports_a_plan_that_will_not_compile_as_one_more_problem() {
+    // The docs promise preflight "reports every problem it can find in one
+    // pass". A compile error used to escape as a top-level error instead, so
+    // the tools / input-file / ssh checks never ran at all and an operator who
+    // was *also* missing something found that out one run at a time.
+    let dir = wont_compile_repo("preflight-wont-compile");
+    let out = run_in(&dir, &["preflight"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+
+    // The compile failure is reported...
+    assert!(text.contains("plan will not compile"), "{text}");
+    assert!(text.contains("service 'nginx'"), "{text}");
+    // ...and it no longer cuts the report short: the phase runs,
+    assert!(text.contains("Preflight"), "{text}");
+    // the service that *did* compile still contributes its tool check,
+    assert!(text.contains("tool(s) present"), "{text}");
+    // the missing input is named in the same pass,
+    assert!(
+        text.contains("missing file referenced by config: apps/web"),
+        "{text}"
+    );
+    // and so is the host nobody can reach.
+    assert!(text.contains("cannot ssh non-interactively"), "{text}");
+}
+
+#[test]
+fn a_service_that_will_not_compile_still_gets_its_host_probed() {
+    // The failing service is the *only* one, so there is no plan at all to
+    // derive a (target, host) pair from — preflight falls back to the config.
+    let dir = wont_compile_repo("preflight-wont-compile-solo");
+    let out = run_in(&dir, &["preflight", "--service", "nginx"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("plan will not compile"), "{text}");
+    assert!(text.contains("cannot ssh non-interactively"), "{text}");
+}
+
+#[test]
+fn a_plan_that_will_not_compile_is_still_fatal_everywhere_else() {
+    // Preflight is the exception, not a new tolerance: `plan`, `deploy` and
+    // `rollback` must still refuse a config with a broken service, with the
+    // same message and the same first-failure ordering as before.
+    let dir = wont_compile_repo("wont-compile-fatal");
+    for args in [
+        vec!["plan"],
+        vec!["deploy", "--dry-run", "-y"],
+        vec!["rollback"],
+    ] {
+        let out = run_in(&dir, &args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {text}");
+        assert!(
+            text.contains("service 'nginx': nginx-vhost:"),
+            "{args:?}: {text}"
+        );
+        // Not the preflight wording — this is a hard error, not a finding.
+        assert!(!text.contains("plan will not compile"), "{args:?}: {text}");
+    }
+}
+
 #[test]
 fn deploy_runs_preflight_before_touching_anything() {
     let dir = hugo_site_repo("preflight-order");
