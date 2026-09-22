@@ -129,6 +129,55 @@ fn render_env(
     Ok(Some((path, format!("{}\n", lines.join("\n")))))
 }
 
+/// Whether this deploy has to build an image at all.
+///
+/// The deployer builds locally and ships the result, so it used to push a
+/// `docker build` unconditionally — which a project whose services only *pull*
+/// published images never asked for: it fails when there is no Dockerfile, and
+/// ships a meaningless image when one happens to be lying around.
+///
+/// Evidence, in order, and deliberately conservative — a build is skipped only
+/// when every Compose file parsed and none of them wanted one:
+///
+/// * an explicit `build: true` / `build: false` in the service config wins;
+/// * an `image:`/`images:` block is a statement of intent — something is built;
+/// * a Compose service with a `build:` key builds;
+/// * a Compose service whose `image:` is the tag this deploy would produce is
+///   waiting for that image, which is the shape the deployer was written for
+///   (the build happens here, not in Compose) even with no `build:` anywhere;
+/// * a file that cannot be read or parsed means we do not know, so we build.
+fn builds_image(cfg: &Value, ctx: &PlanContext, files: &[String], tag: &str) -> bool {
+    if let Some(explicit) = cfg.get("build").and_then(|v| v.as_bool()) {
+        return explicit;
+    }
+    if cfg.get("image").is_some() || cfg.get("images").is_some() {
+        return true;
+    }
+    let name = tag.split(':').next().unwrap_or(tag);
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(ctx.repo_root.join(file)) else {
+            return true;
+        };
+        let Ok(doc) = serde_yaml::from_str::<Value>(&text) else {
+            return true;
+        };
+        let Some(services) = doc.get("services").and_then(|v| v.as_mapping()) else {
+            continue;
+        };
+        for (_, service) in services {
+            if service.get("build").is_some() {
+                return true;
+            }
+            if let Some(image) = service.get("image").and_then(|v| v.as_str()) {
+                if image == tag || image.split(':').next().unwrap_or(image) == name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     let files = string_list(cfg.get("files"));
     let files = if files.is_empty() {
@@ -196,115 +245,124 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
 
     let mut steps = Vec::new();
 
+    // A project whose services only pull published images has nothing to build,
+    // nothing to save and nothing to load; shipping the files, backing up,
+    // `up -d`, health and record are the whole deploy.
+    let builds = builds_image(cfg, ctx, &files, &tag);
+
     // --- build ---------------------------------------------------------------
     // Built here, never on the target: a shared box tuned to the edge of its
     // memory can't afford a docker build.
-    let all_tags: Vec<String> = std::iter::once(tag.clone())
-        .chain(extra_tags.iter().map(|t| {
-            if t.contains(':') {
-                t.clone()
-            } else {
-                format!("{}:{t}", tag.split(':').next().unwrap_or(&tag))
-            }
-        }))
-        .collect();
-    let tag_flags: String = all_tags.iter().map(|t| format!("-t {t} ")).collect();
-    steps.push(PlannedStep::command(
-        format!("build {tag} ({platform})"),
-        format!("docker build --platform {platform} {dockerfile}{tag_flags}{context}"),
-    ));
-
-    // Any additional images in the project. They ride in the same archive, so
-    // the whole project lands on the target in one transfer and one load.
-    let mut extra_image_tags: Vec<String> = Vec::new();
-    for spec in image_specs.iter().skip(1) {
-        let spec_tag = spec
-            .get("tag")
-            .and_then(|v| v.as_str())
-            .map(|t| expand(t, ctx))
-            .context("docker-compose: each entry in `images` needs a `tag`")?;
-        let spec_context = spec.get("context").and_then(|v| v.as_str()).unwrap_or(".");
-        let dockerfile = spec
-            .get("dockerfile")
-            .and_then(|v| v.as_str())
-            .map(|f| format!("-f {f} "))
-            .unwrap_or_default();
-        let spec_platform = spec
-            .get("platform")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&platform);
+    if builds {
+        let all_tags: Vec<String> = std::iter::once(tag.clone())
+            .chain(extra_tags.iter().map(|t| {
+                if t.contains(':') {
+                    t.clone()
+                } else {
+                    format!("{}:{t}", tag.split(':').next().unwrap_or(&tag))
+                }
+            }))
+            .collect();
+        let tag_flags: String = all_tags.iter().map(|t| format!("-t {t} ")).collect();
         steps.push(PlannedStep::command(
-            format!("build {spec_tag} ({spec_platform})"),
-            format!(
+            format!("build {tag} ({platform})"),
+            format!("docker build --platform {platform} {dockerfile}{tag_flags}{context}"),
+        ));
+
+        // Any additional images in the project. They ride in the same archive, so
+        // the whole project lands on the target in one transfer and one load.
+        let mut extra_image_tags: Vec<String> = Vec::new();
+        for spec in image_specs.iter().skip(1) {
+            let spec_tag = spec
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .map(|t| expand(t, ctx))
+                .context("docker-compose: each entry in `images` needs a `tag`")?;
+            let spec_context = spec.get("context").and_then(|v| v.as_str()).unwrap_or(".");
+            let dockerfile = spec
+                .get("dockerfile")
+                .and_then(|v| v.as_str())
+                .map(|f| format!("-f {f} "))
+                .unwrap_or_default();
+            let spec_platform = spec
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&platform);
+            steps.push(PlannedStep::command(
+                format!("build {spec_tag} ({spec_platform})"),
+                format!(
                 "docker build --platform {spec_platform} {dockerfile}-t {spec_tag} {spec_context}"
             ),
-        ));
-        extra_image_tags.push(spec_tag);
-    }
-    let shipped_tags: Vec<String> = all_tags
-        .iter()
-        .cloned()
-        .chain(extra_image_tags.iter().cloned())
-        .collect();
-
-    // --- ship the image ------------------------------------------------------
-    match transport.as_str() {
-        "tarball" => {
-            let tar = format!("{}/{}-image.tar.gz", ctx.work_dir(), ctx.app);
-            steps.push(PlannedStep::command(
-                format!("save {tag} → tarball"),
-                format!(
-                    "mkdir -p \"$(dirname {tar})\" && docker save {} | gzip > {tar}",
-                    shipped_tags.join(" ")
-                ),
             ));
-            steps.push(PlannedStep::command(
-                format!("ship image → {}", ctx.dest_label()),
-                ctx.copy(&tar, &root),
-            ));
-            let remote_tar = format!("{root}/{}-image.tar.gz", ctx.app);
-            steps.push(mark_rollback());
-            steps.push(PlannedStep::ssh(
-                "load image on the target".to_string(),
-                format!("{sudo}docker load -i {remote_tar}"),
-            ));
-            steps.push(
-                PlannedStep::ssh(
-                    "remove the shipped image tarball".to_string(),
-                    format!("{sudo}rm -f {remote_tar}"),
-                )
-                .into_cleanup(),
-            );
-            steps.push(
-                PlannedStep::command(format!("remove local {tar}"), format!("rm -f {tar}"))
-                    .into_cleanup(),
-            );
+            extra_image_tags.push(spec_tag);
         }
-        "registry" => {
-            let registry = image
-                .and_then(|i| i.get("registry"))
-                .and_then(|v| v.as_str())
-                .context("docker-compose: image.registry is required for transport: registry")?;
-            for t in &shipped_tags {
-                let name = t.rsplit('/').next().unwrap_or(t);
-                let remote = format!("{}/{name}", registry.trim_end_matches('/'));
+        let shipped_tags: Vec<String> = all_tags
+            .iter()
+            .cloned()
+            .chain(extra_image_tags.iter().cloned())
+            .collect();
+
+        // --- ship the image ------------------------------------------------------
+        match transport.as_str() {
+            "tarball" => {
+                let tar = format!("{}/{}-image.tar.gz", ctx.work_dir(), ctx.app);
                 steps.push(PlannedStep::command(
-                    format!("push {remote}"),
-                    format!("docker tag {t} {remote} && docker push {remote}"),
+                    format!("save {tag} → tarball"),
+                    format!(
+                        "mkdir -p \"$(dirname {tar})\" && docker save {} | gzip > {tar}",
+                        shipped_tags.join(" ")
+                    ),
+                ));
+                steps.push(PlannedStep::command(
+                    format!("ship image → {}", ctx.dest_label()),
+                    ctx.copy(&tar, &root),
+                ));
+                let remote_tar = format!("{root}/{}-image.tar.gz", ctx.app);
+                steps.push(mark_rollback());
+                steps.push(PlannedStep::ssh(
+                    "load image on the target".to_string(),
+                    format!("{sudo}docker load -i {remote_tar}"),
+                ));
+                steps.push(
+                    PlannedStep::ssh(
+                        "remove the shipped image tarball".to_string(),
+                        format!("{sudo}rm -f {remote_tar}"),
+                    )
+                    .into_cleanup(),
+                );
+                steps.push(
+                    PlannedStep::command(format!("remove local {tar}"), format!("rm -f {tar}"))
+                        .into_cleanup(),
+                );
+            }
+            "registry" => {
+                let registry = image
+                    .and_then(|i| i.get("registry"))
+                    .and_then(|v| v.as_str())
+                    .context(
+                        "docker-compose: image.registry is required for transport: registry",
+                    )?;
+                for t in &shipped_tags {
+                    let name = t.rsplit('/').next().unwrap_or(t);
+                    let remote = format!("{}/{name}", registry.trim_end_matches('/'));
+                    steps.push(PlannedStep::command(
+                        format!("push {remote}"),
+                        format!("docker tag {t} {remote} && docker push {remote}"),
+                    ));
+                }
+                let primary = format!(
+                    "{}/{}",
+                    registry.trim_end_matches('/'),
+                    tag.rsplit('/').next().unwrap_or(&tag)
+                );
+                steps.push(mark_rollback());
+                steps.push(PlannedStep::ssh(
+                    format!("pull {primary} on the target"),
+                    format!("{sudo}docker pull {primary} && {sudo}docker tag {primary} {tag}"),
                 ));
             }
-            let primary = format!(
-                "{}/{}",
-                registry.trim_end_matches('/'),
-                tag.rsplit('/').next().unwrap_or(&tag)
-            );
-            steps.push(mark_rollback());
-            steps.push(PlannedStep::ssh(
-                format!("pull {primary} on the target"),
-                format!("{sudo}docker pull {primary} && {sudo}docker tag {primary} {tag}"),
-            ));
+            other => bail!("docker-compose: unknown image.transport '{other}' (tarball|registry)"),
         }
-        other => bail!("docker-compose: unknown image.transport '{other}' (tarball|registry)"),
     }
 
     // --- config + env --------------------------------------------------------
@@ -490,20 +548,29 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         Some(custom) => custom,
         None => format!("{sudo}{compose} up -d --remove-orphans"),
     };
-    steps.push(
-        PlannedStep::ssh(
-            "start services".to_string(),
-            format!("set -e; cd {root}; {up}"),
-        )
-        .with_rollback(format!(
+    let start = PlannedStep::ssh(
+        "start services".to_string(),
+        format!("set -e; cd {root}; {up}"),
+    );
+    // The undo this deployer owns is the image swap. With nothing shipped there
+    // is none, and saying so is better than an undo that silently does nothing:
+    // the project is running whatever its Compose file pins.
+    steps.push(if builds {
+        start.with_rollback(format!(
             "set -e; cd {root}; \
                  if {sudo}docker image inspect {0}:rollback >/dev/null 2>&1; then \
                    {sudo}docker tag {0}:rollback {tag}; {sudo}{compose} up -d --remove-orphans; \
                    echo 'rolled back to the previous image'; \
                  else echo 'no rollback image recorded' >&2; exit 1; fi",
             image_name
-        )),
-    );
+        ))
+    } else {
+        start.with_rollback(
+            "echo 'no image was shipped — this project pulls its images, so there is no \
+             previous image to restore' >&2; exit 1"
+                .to_string(),
+        )
+    });
 
     // --- health --------------------------------------------------------------
     if let Some(health) = cfg.get("health") {

@@ -4880,19 +4880,149 @@ fn the_scaffolded_compose_config_is_a_config_the_cli_can_actually_run() {
 #[test]
 fn init_says_what_the_compose_scaffold_could_not_work_out() {
     let dir = tmpdir("init-compose-notes");
-    // No Dockerfile and no `build:` — the deployer always builds, so this would
-    // fail at `docker build` and the operator should hear it now.
+    // No Dockerfile and no `build:` — nothing here is built, so the scaffold
+    // says so instead of writing an `image:` block that would make the deployer
+    // run a `docker build` this project never asked for.
     std::fs::write(
         dir.join("docker-compose.yml"),
         "services:\n  app:\n    image: demo:latest\n    env_file: [.env, .env.prod]\n",
     )
     .unwrap();
     let text = init_output(&dir, &["--host", "demo.example.com"]);
-    assert!(text.contains("no Dockerfile found"), "{text}");
+    assert!(text.contains("no Dockerfile and no `build:`"), "{text}");
+    // The note mentions `image:` as advice; what must not be there is the
+    // scaffolded block itself.
+    assert!(!text.contains("      image:"), "{text}");
     assert!(text.contains(".env, .env.prod"), "{text}");
     assert!(text.contains("env_file:"), "{text}");
     // The note is advice, not a scaffolded block that would ship an empty .env.
     assert!(!text.contains("      env_file:"), "{text}");
+}
+
+/// A Compose repo whose services only pull published images: no Dockerfile, no
+/// `build:`, and nothing tagged with the name this deploy would produce.
+fn pull_only_repo(name: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  db:\n    image: postgres:16\n  cache:\n    image: redis:7\n  \
+         app:\n    image: ghcr.io/example/app:1.4.2\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: demo
+defaults: {target: production}
+targets:
+  production: {host: box.example.md, user: root, dir: /srv/demo}
+services:
+  app:
+    deployer: docker-compose
+    config:
+      files: [docker-compose.yml]
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn a_pull_only_compose_project_is_deployed_without_building_an_image() {
+    // The deployer builds locally and ships the result, so it used to push a
+    // `docker build --platform linux/amd64 -t demo:latest .` unconditionally —
+    // which fails when there is no Dockerfile and ships a meaningless image
+    // when one happens to be lying around.
+    let dir = pull_only_repo("compose-pull-only");
+    let out = run_in(&dir, &["plan"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{text}");
+
+    for absent in [
+        "docker build",
+        "save demo:latest",
+        "ship image",
+        "load image on the target",
+        "mark the current image as rollback",
+    ] {
+        assert!(
+            !text.contains(absent),
+            "expected no {absent:?} step:\n{text}"
+        );
+    }
+    // What is left is the whole deploy for a project like this.
+    for expected in ["ship docker-compose.yml", "start services", "record deploy"] {
+        assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+    }
+}
+
+#[test]
+fn a_compose_service_that_builds_still_gets_its_image_built() {
+    let dir = pull_only_repo("compose-builds");
+    let body = std::fs::read_to_string(dir.join("docker-compose.yml"))
+        .unwrap()
+        .replace("    image: ghcr.io/example/app:1.4.2", "    build: .");
+    std::fs::write(dir.join("docker-compose.yml"), body).unwrap();
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(text.contains("docker build"), "{text}");
+    assert!(text.contains("load image on the target"), "{text}");
+}
+
+#[test]
+fn a_compose_file_waiting_for_this_deploys_image_still_builds_it() {
+    // The shape the deployer was written for: the build happens *here*, not in
+    // Compose, so the Compose file has no `build:` — it just names the tag this
+    // deploy produces. Skipping the build on that evidence would break it.
+    let dir = pull_only_repo("compose-waits-for-image");
+    let body = std::fs::read_to_string(dir.join("docker-compose.yml"))
+        .unwrap()
+        .replace("image: ghcr.io/example/app:1.4.2", "image: demo:latest");
+    std::fs::write(dir.join("docker-compose.yml"), body).unwrap();
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(text.contains("docker build"), "{text}");
+    assert!(text.contains("load image on the target"), "{text}");
+}
+
+#[test]
+fn an_unreadable_compose_file_still_builds() {
+    // We only skip the build when every file parsed and none of them wanted
+    // one. Not knowing is not evidence of a pull-only project.
+    let dir = pull_only_repo("compose-unparseable");
+    std::fs::write(dir.join("docker-compose.yml"), "services: [this: is: not").unwrap();
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(text.contains("docker build"), "{text}");
+}
+
+#[test]
+fn compose_build_can_be_forced_or_refused_explicitly() {
+    // `build: false` on a project that does build.
+    let dir = pull_only_repo("compose-build-off");
+    let body = std::fs::read_to_string(dir.join("docker-compose.yml"))
+        .unwrap()
+        .replace("    image: ghcr.io/example/app:1.4.2", "    build: .");
+    std::fs::write(dir.join("docker-compose.yml"), body).unwrap();
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml"))
+        .unwrap()
+        .replace(
+            "      files: [docker-compose.yml]",
+            "      files: [docker-compose.yml]\n      build: false",
+        );
+    std::fs::write(dir.join(".deliver.yml"), cfg).unwrap();
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(!text.contains("docker build"), "{text}");
+
+    // `build: true` on a project that does not.
+    let dir = pull_only_repo("compose-build-on");
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml"))
+        .unwrap()
+        .replace(
+            "      files: [docker-compose.yml]",
+            "      files: [docker-compose.yml]\n      build: true",
+        );
+    std::fs::write(dir.join(".deliver.yml"), cfg).unwrap();
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(text.contains("docker build"), "{text}");
 }
 
 #[test]

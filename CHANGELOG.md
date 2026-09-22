@@ -74,6 +74,25 @@
 
 ### Fixed
 
+- The `docker-compose` deployer always built an image, so a pull-only Compose
+  project could not be deployed. The `docker build` step was pushed
+  unconditionally while `image.tag` and `image.context` defaulted to
+  `{app}:latest` and `.`, so a project whose services only pull published
+  images — Postgres plus Redis plus a prebuilt app image, an ordinary shape on
+  a shared box — got a `docker build --platform linux/amd64 -t <app>:latest .`
+  it never asked for: it failed when there was no Dockerfile, and shipped a
+  meaningless image when one happened to be lying around. The build, save, ship
+  and load steps are now skipped for a project with nothing to build, leaving
+  the file ship, backup, `up -d`, health and record steps — the whole deploy
+  for a project like that. The evidence is deliberately conservative, and a
+  build is skipped only when every Compose file parsed and none of them wanted
+  one: an `image:`/`images:` block, a Compose service with a `build:`, or a
+  Compose service naming the tag this deploy produces all mean build, and so
+  does a file that cannot be read. `build: true` / `build: false` in the
+  service config overrides all of it. `deliver init` now leaves the `image:`
+  block out when it can see nothing to build, instead of scaffolding one and
+  warning about it.
+
 - `deliver preflight` stopped at plan compile, so its one-pass report was cut
   short. The command's whole promise is that it "reports every problem it can
   find in one pass", and `preflight::run` is built that way — it collects

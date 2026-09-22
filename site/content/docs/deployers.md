@@ -18,6 +18,10 @@ Ship a file, directory, or prepared archive. Use it for static output and other 
 
 Build an image locally, ship it as a tarball or through a registry, preserve the Compose files byte-for-byte, start infrastructure, run release commands, and check the live service.
 
+A project whose services only pull published images is deployed without building anything: the config is shipped, the backup taken, the project brought up, checked and recorded. Delivery Boy builds when the service declares an `image:` block, when a Compose service has a `build:`, or when a Compose service names the tag this deploy would produce; `build: true` or `build: false` in the service config settles it either way. A Compose file that cannot be read or parsed is treated as building, since not knowing is not evidence of a pull-only project.
+
+The image swap is the undo this deployer owns, so a pull-only project has no image to roll back to — an unwind says so rather than appearing to succeed.
+
 ## `nginx-vhost`
 
 Install nginx configuration safely. The managed mode can prepare Certbot, issue or expand certificates, stage the vhost, run `nginx -t`, reload, and restore the prior configuration if validation fails.

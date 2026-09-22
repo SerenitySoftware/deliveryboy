@@ -466,26 +466,31 @@ pub fn detect(root: &Path) -> Vec<Finding> {
         // are deliberately absent: the deployer already defaults them to the
         // app name, and a scaffolded copy of a default is one more line to
         // drift.
-        let mut config = vec![
-            ("files".into(), ConfigValue::List(files.clone())),
-            (
+        let builds = has_dockerfile(root, &project);
+        let mut config = vec![("files".into(), ConfigValue::List(files.clone()))];
+        // An `image:` block is a statement that something gets built, and the
+        // deployer reads it that way. Scaffolding one for a project with
+        // nothing to build is how a pull-only stack ends up with a
+        // `docker build .` it never asked for.
+        if builds {
+            config.push((
                 "image".into(),
                 ConfigValue::Block(vec![
                     ("context".into(), ConfigValue::scalar(".")),
                     ("platform".into(), ConfigValue::scalar("linux/amd64")),
                 ]),
-            ),
-        ];
+            ));
+        }
         if let Some(backup) = project.backup() {
             config.push(("backup".into(), backup));
         }
         let mut notes = Vec::new();
-        // The deployer always builds the image locally, so a project with
-        // nothing to build fails at `docker build` rather than at compile time.
-        if !has_dockerfile(root, &project) {
+        if !builds {
             notes.push(
-                "no Dockerfile found — this deployer always builds the image locally, so point \
-                 image.context (and image.dockerfile) at whatever builds this app"
+                "no Dockerfile and no `build:` in the Compose file — deploying this project \
+                 ships its config and brings it up on the images it pulls, with no image built \
+                 or shipped; add an `image:` block (context, dockerfile) if something here \
+                 should be built after all"
                     .to_string(),
             );
         }
