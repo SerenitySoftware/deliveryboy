@@ -14,6 +14,8 @@ Build a Hugo site, package its output, and pass the release to the file deployer
 
 Ship a file, directory, or prepared archive. Use it for static output and other complete artifacts that do not need a container.
 
+A directory is packaged and released atomically. With `build:`, `src` is the build's output and is treated as a directory even before the first build has made it — so a fresh clone deploys the same way as a working copy — unless it names an archive (`.tar.gz`, `.tgz`).
+
 ## `docker-compose`
 
 Build an image locally, ship it as a tarball or through a registry, preserve the Compose files byte-for-byte, start infrastructure, run release commands, and check the live service.

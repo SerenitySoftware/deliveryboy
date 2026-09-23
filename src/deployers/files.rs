@@ -70,7 +70,16 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
 
     // A directory can't travel over scp as one atomic unit, and it's the release
     // archive that makes the swap atomic — so package it, exactly as `hugo` does.
-    if ctx.repo_root.join(&src).is_dir() {
+    //
+    // `build:` is what *creates* `src`, and it runs long after the plan is
+    // compiled — so on a clean checkout `src` is not there to test. A build
+    // output is a directory (`dist/`, `build/`) unless it is already an
+    // archive; deciding from disk instead compiled a plain `scp` of a path
+    // that did not exist yet.
+    let built_later = cfg.get("build").is_some()
+        && !ctx.repo_root.join(&src).exists()
+        && !(src.ends_with(".tar.gz") || src.ends_with(".tgz"));
+    if ctx.repo_root.join(&src).is_dir() || built_later {
         let label = cfg_str(cfg, "remote_subdir")
             .filter(|s| s != "." && !s.is_empty())
             .or_else(|| src.rsplit('/').next().map(str::to_string))

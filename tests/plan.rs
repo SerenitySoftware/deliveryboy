@@ -3609,6 +3609,73 @@ services:
     assert!(text.contains("atomic symlink swap"), "{text}");
 }
 
+/// A front-end as `deliver init` scaffolds it, on a clean checkout: `build:`
+/// creates `src`, so `src` is not on disk when the plan is compiled.
+fn unbuilt_front_end(name: &str, target: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::create_dir_all(dir.join("apps/panel")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: production}}
+targets:
+  production: {target}
+services:
+  panel:
+    deployer: files
+    config:
+      build: mkdir -p dist && echo hi > dist/index.html
+      build_dir: apps/panel
+      src: apps/panel/dist
+      remote_subdir: panel
+"#
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn a_build_output_that_does_not_exist_yet_is_still_released_atomically() {
+    let dir = unbuilt_front_end("files-unbuilt", "{host: box.example.md, dir: /srv/demo}");
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    // Not a plain `scp` of a path the build has not made yet.
+    assert!(text.contains("package apps/panel/dist"), "{text}");
+    assert!(text.contains("atomic symlink swap"), "{text}");
+    let build = text.find("build (apps/panel)").unwrap();
+    assert!(
+        build < text.find("package apps/panel/dist").unwrap(),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_archive_built_by_the_deploy_is_still_shipped_as_a_file() {
+    let dir = unbuilt_front_end(
+        "files-unbuilt-archive",
+        "{host: box.example.md, dir: /srv/demo}",
+    );
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("src: apps/panel/dist", "src: apps/panel/site.tar.gz");
+    std::fs::write(&cfg, body).unwrap();
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(!text.contains("package apps/panel"), "{text}");
+}
+
+#[test]
+fn preflight_does_not_demand_a_build_output_before_the_build() {
+    let dir = unbuilt_front_end("preflight-unbuilt", "{method: local, dir: /srv/demo}");
+    let out = run_in(&dir, &["preflight"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!err.contains("apps/panel/dist"), "{err}");
+    assert!(out.status.success(), "{err}");
+}
+
 #[test]
 fn included_paths_ship_next_to_the_compose_files() {
     let dir = tmpdir("compose-include");

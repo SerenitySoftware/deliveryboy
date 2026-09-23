@@ -88,6 +88,16 @@
 
 ### Fixed
 
+- A `files` service whose `src:` is its `build:` output failed its first deploy
+  from a clean checkout — the shape `deliver init` scaffolds for every
+  front-end. Packaging was decided by testing `src` on disk when the plan was
+  compiled, before the build that creates it had run, so the plan was a plain
+  `scp` of a path that did not exist instead of the package/stage/activate
+  release; and preflight reported the missing output as a missing input file.
+  With `build:` configured, `src` is now treated as the directory the build
+  will produce (unless it names an archive), and preflight no longer demands it
+  up front.
+
 - The `docker-compose` deployer always built an image, so a pull-only Compose
   project could not be deployed. The `docker build` step was pushed
   unconditionally while `image.tag` and `image.context` defaulted to

@@ -83,6 +83,11 @@ fn input_files(config: &Config, repo_root: &Path) -> Vec<(String, bool)> {
                 if path.ends_with(".tar.gz") {
                     continue;
                 }
+                // Nor does a `files` build's output on a clean checkout: the
+                // `build:` step that creates `src` runs after preflight.
+                if key == "src" && service.config.get("build").is_some() {
+                    continue;
+                }
                 let full = repo_root.join(path);
                 checks.push((path.to_string(), full.exists()));
             }
