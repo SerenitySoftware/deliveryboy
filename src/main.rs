@@ -17,6 +17,7 @@ mod readback;
 mod remote;
 mod rollback;
 mod secrets;
+mod shipping;
 mod ui;
 mod verify;
 mod version;
@@ -495,8 +496,8 @@ fn choose_version(previous: Option<&str>) -> Result<Option<String>> {
 
 /// Resolve which release is being deployed.
 ///
-/// A deploy ships a tagged commit: find the tag on HEAD and confirm it, or offer
-/// to create one. Non-interactive runs never block — an existing tag is accepted,
+/// A deploy ships a tagged commit: find the tag on HEAD (confirmed later, in
+/// `shipping_approved`), or offer to create one. Non-interactive runs never block — an existing tag is accepted,
 /// and a missing one is an error rather than a silent untagged deploy.
 fn resolve_release(
     root: &Path,
@@ -528,19 +529,10 @@ fn resolve_release(
         return Ok(Some(v));
     }
 
-    if let Some(tag) = v.release.clone() {
-        if assume_yes {
-            return Ok(Some(v));
-        }
-        return match prompt_yes_no(&format!("Deploy release {tag} ({})?", v.git.short_sha))? {
-            Some(true) => Ok(Some(v)),
-            Some(false) => {
-                ui::note("canceled.");
-                Ok(None)
-            }
-            // No stdin: the tag exists and was chosen deliberately by tagging it.
-            None => Ok(Some(v)),
-        };
+    // A tag on HEAD is confirmed later, by `shipping_approved`, once the
+    // target has been read and the prompt can say what the release ships.
+    if v.release.is_some() {
+        return Ok(Some(v));
     }
 
     // No tag on HEAD — offer the next versions based on the previous release.
@@ -975,6 +967,64 @@ fn live_config_approved(
     }
 }
 
+/// Show what the release ships — the commits between what each target has live
+/// and HEAD — and, for a release found tagged on HEAD, ask before going on.
+///
+/// The range reads the same record `deliver status` does, so it covers the
+/// services that keep one (files/hugo and docker-compose). Every failure mode
+/// (an unreachable host, nothing recorded, a live commit this clone lacks)
+/// prints a line and continues: this informs the confirmation, it is not a new
+/// gate. Returns false only when a human said no.
+fn shipping_approved(
+    config: &config::Config,
+    plan: &[plan::ServicePlan],
+    root: &Path,
+    v: &version::DeployVersion,
+    assume_yes: bool,
+    dry_run: bool,
+) -> Result<bool> {
+    let mut requests = readback::collect(plan);
+    // A dry run does not reach remote targets, for the same reason preflight
+    // skips remote reachability there; a local target costs nothing to read.
+    let before = requests.len();
+    if dry_run {
+        requests.retain(|r| config.targets.get(&r.target).is_some_and(|t| t.is_local()));
+    }
+    let skipped = before - requests.len();
+    if before > 0 {
+        ui::phase("Shipping");
+    }
+    if skipped > 0 {
+        ui::detail("(dry run — not reading remote targets; `deliver status` reads them)");
+    }
+    let shipments = if requests.is_empty() {
+        Vec::new()
+    } else {
+        let statuses = readback::read(requests, &config.targets);
+        shipping::collect(root, &statuses, &v.git.sha)
+    };
+    for line in shipping::render(&shipments, v.git.dirty) {
+        ui::detail(line);
+    }
+
+    // Only a tag found on HEAD is confirmed: a version picked at the prompt or
+    // passed with --version is already the operator's answer, and --yes and a
+    // dry run never block (see `resolve_release`).
+    let tagged = v.release_source == "tag";
+    let Some(tag) = v.release.as_deref().filter(|_| tagged) else {
+        return Ok(true);
+    };
+    if assume_yes || dry_run {
+        return Ok(true);
+    }
+    let question = match shipping::summary(&shipments) {
+        Some(what) => format!("Deploy release {tag} ({}), {what}?", v.git.short_sha),
+        None => format!("Deploy release {tag} ({})?", v.git.short_sha),
+    };
+    // No stdin: the tag exists and was chosen deliberately by tagging it.
+    Ok(prompt_yes_no(&question)?.unwrap_or(true))
+}
+
 fn cmd_deploy(
     explicit: Option<&Path>,
     only: &[String],
@@ -1035,6 +1085,13 @@ fn cmd_deploy(
         ui::phase("Aborted");
         ui::note("preflight failed — nothing was built, shipped, or changed.");
         return Ok(2);
+    }
+
+    // What this release ships: the commits between what is live and HEAD.
+    if !verify_only && !shipping_approved(&config, &plan, &root, &v, assume_yes, dry_run)? {
+        ui::phase("Aborted");
+        ui::note("canceled — nothing was built, shipped, or changed.");
+        return Ok(0);
     }
 
     // What this release changes in the config already running on the target.

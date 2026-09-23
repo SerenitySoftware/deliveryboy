@@ -4751,6 +4751,183 @@ fn a_live_path_that_is_a_plain_directory_is_not_reported_as_a_release() {
     assert!(text.contains("not a release symlink"), "{text}");
 }
 
+// --- the commit range at the deploy confirmation ------------------------------
+// The range is read off the same record `deliver status` reads, so these use a
+// `method: local` target too: a repo with real commits, and a target whose
+// history says an older one of them is live.
+
+#[cfg(unix)]
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A repo tagged `v0.3.0` two commits past the commit its target has live as
+/// `v0.1.0`. Returns (repo, live sha).
+#[cfg(unix)]
+fn shipped_range_repo(name: &str) -> (std::path::PathBuf, String) {
+    let dir = tmpdir(name);
+    // Outside the repo, so the target's files never make the tree dirty.
+    let root = tmpdir(&format!("{name}-target"));
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi\n").unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: shipping
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+"#,
+            root.display()
+        ),
+    )
+    .unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "T"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "first cut"],
+    ] {
+        git_in(&dir, &args);
+    }
+    let live = git_in(&dir, &["rev-parse", "HEAD"]);
+    for (file, subject) in [
+        ("about.html", "add an about page"),
+        ("index.html", "fix a typo"),
+    ] {
+        std::fs::write(dir.join("site").join(file), subject).unwrap();
+        git_in(&dir, &["add", "-A"]);
+        git_in(&dir, &["commit", "-qm", subject]);
+    }
+    git_in(&dir, &["tag", "v0.3.0"]);
+
+    let release = format!("20260101T090000Z-{}", &live[..7]);
+    std::fs::create_dir_all(root.join("releases").join(&release)).unwrap();
+    std::fs::create_dir_all(root.join(".deliver")).unwrap();
+    std::fs::write(
+        root.join(".deliver/history.tsv"),
+        format!("1\t{release}\tv0.1.0\t{live}\t2026-01-01T09:00:00Z\n"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(root.join("releases").join(&release), root.join("web")).unwrap();
+    (dir, live)
+}
+
+#[cfg(unix)]
+#[test]
+fn deploy_confirmation_names_the_commits_since_what_is_live() {
+    use std::io::Write;
+    let (dir, live) = shipped_range_repo("ship-confirm");
+    let mut child = deliver()
+        .current_dir(&dir)
+        .args(["deploy"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"n\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "declining is not an error: {text}");
+    let since = format!("shipping 2 commit(s) since live v0.1.0 ({})", &live[..7]);
+    assert!(text.contains(&format!("web: {since}")), "{text}");
+    assert!(text.contains("add an about page"), "{text}");
+    assert!(text.contains("fix a typo"), "{text}");
+    // The live commit itself is not part of what ships.
+    assert!(!text.contains("first cut"), "{text}");
+    // The question carries the answer, so it can be read on its own.
+    assert!(
+        text.contains("Deploy release v0.3.0 (") && text.contains(&format!("), {since}?")),
+        "{text}"
+    );
+    assert!(text.contains("canceled"), "{text}");
+    // Declining touched nothing on the target.
+    let releases = std::fs::read_dir(
+        std::fs::read_link(
+            dir.parent()
+                .unwrap()
+                .join("deliver-test-ship-confirm-target/web"),
+        )
+        .unwrap()
+        .parent()
+        .unwrap(),
+    )
+    .unwrap()
+    .count();
+    assert_eq!(releases, 1, "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dry_run_shows_the_range_for_a_local_target() {
+    let (dir, _) = shipped_range_repo("ship-dry-run");
+    let out = run_in(&dir, &["deploy", "--dry-run"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("▸ Shipping"), "{err}");
+    assert!(
+        err.contains("shipping 2 commit(s) since live v0.1.0"),
+        "{err}"
+    );
+    // In phase order: after preflight, before anything runs.
+    let shipping = err.find("▸ Shipping").unwrap();
+    assert!(err.find("▸ Preflight").unwrap() < shipping, "{err}");
+    assert!(shipping < err.find("▸ Dry run").unwrap(), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_redeploy_of_the_live_commit_says_nothing_new_ships() {
+    let (dir, live) = shipped_range_repo("ship-same");
+    git_in(&dir, &["checkout", "-q", &live]);
+    let out = run_in(&dir, &["deploy", "--dry-run"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("is this commit — nothing new ships"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_first_deploy_says_so_instead_of_listing_history() {
+    let (dir, _) = shipped_range_repo("ship-first");
+    let target = dir.parent().unwrap().join("deliver-test-ship-first-target");
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    let out = run_in(&dir, &["deploy", "--dry-run"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("this is its first deploy"), "{err}");
+}
+
+#[test]
+fn a_dry_run_does_not_reach_a_remote_target_for_the_range() {
+    let dir = hugo_site_repo("ship-remote-dry");
+    let out = run_in(&dir, &["deploy", "--dry-run"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("not reading remote targets"), "{err}");
+    assert!(!err.contains("could not read the target"), "{err}");
+}
+
 // --- `deliver init` scaffolding for compose and macOS ------------------------
 // Before this, both shapes were detected but emitted no deployer, so
 // `scaffold()` dropped them: a Compose-only repo — the commonest shape in the

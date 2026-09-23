@@ -61,6 +61,8 @@ deliver deploy --version 1.2.3
 
 `--service NAME` can be repeated. `--version` supplies the release version without a prompt. `--yes` accepts a tag already present on `HEAD`; it does not invent an untagged release.
 
+After preflight, `deploy` reads what each target has live and lists the commits it is about to ship — `git log <live>..HEAD`, from the sha the last deploy recorded — and a tag found on `HEAD` is confirmed with that range in the question: `Deploy release v1.2.3 (abc1234), shipping 7 commit(s) since live v1.2.2 (def4567)?`. It also says when a deploy re-ships the live commit or moves the target backwards. The range covers the services that keep a deploy record (`files`, `hugo`, `docker-compose`); a dry run reads only `method: local` targets, as it skips remote reachability in preflight. An unreadable target or a live commit this clone does not have is reported, never fatal.
+
 Before the first step that changes anything, `deploy` takes an advisory lock on each target and refuses if another run holds it (exit code `2`, nothing built or shipped). `--force` takes the lock anyway. A dry run takes no lock. See [Safety](../safety/).
 
 ## `deliver status`

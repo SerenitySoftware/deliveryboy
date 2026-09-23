@@ -4,6 +4,20 @@
 
 ### Added
 
+- `deliver deploy` shows the commit range it is about to ship. After preflight
+  it reads the sha each target recorded for its live release — the same
+  `.deliver/history.tsv` record `deliver status` reads — and lists
+  `git log <live>..HEAD`, so the confirmation for a tag found on `HEAD` reads
+  `Deploy release v1.2.3 (abc1234), shipping 7 commit(s) since live v1.2.2
+  (def4567)?` instead of asking blind. A re-deploy of the live commit, a deploy
+  that moves the target backwards and one that drops live commits from another
+  branch are each named as such. The confirmation moved from before compiling
+  to after preflight so it can carry the range; compile and preflight change
+  nothing, so declining still leaves the target untouched. A dry run reads only
+  `method: local` targets, matching preflight skipping remote reachability, and
+  an unreadable target or a live commit the clone lacks prints a line rather
+  than failing the deploy.
+
 - `deliver deploy` and `deliver rollback` hold an advisory lock on each target
   for the length of the release. The model is an atomic symlink swap into
   `releases/<stamp>` on a single shared host, and nothing serialized two runs
