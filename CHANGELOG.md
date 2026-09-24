@@ -4,6 +4,20 @@
 
 ### Added
 
+- `deliver preflight` (and the preflight every `deploy` runs) checks the tools
+  the target itself has to run, not only the local ones. A fresh or
+  post-upgrade host used to pass preflight, build, ship, and then die at
+  `docker compose up` or `nginx -t` with artifacts left behind. Each deployer
+  now declares the remote binaries its steps call — `docker` and `docker
+  compose` (probed as `docker compose version`, since the plugin can be
+  missing where `docker` is not), `nginx` and `systemctl`, `tar`, `curl` for an
+  on-target health check — and preflight asks for all of them in one ssh call
+  per host, with the sbin directories on `PATH` so a deploy user finds what
+  `sudo` would. Declared rather than parsed out of the shell: the certbot step
+  installs certbot when it is absent, so reading its text would report a
+  missing tool on exactly the host it is written to fix. Commands the operator
+  wrote themselves are not inspected.
+
 - `deliver deploy` shows the commit range it is about to ship. After preflight
   it reads the sha each target recorded for its live release — the same
   `.deliver/history.tsv` record `deliver status` reads — and lists

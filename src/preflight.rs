@@ -8,7 +8,7 @@
 use crate::config::{Config, Target};
 use crate::deployers::StepKind;
 use crate::plan::ServicePlan;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -66,6 +66,91 @@ fn tools_needed(plan: &[ServicePlan]) -> BTreeSet<String> {
         tools.remove(skip);
     }
     tools
+}
+
+/// Binaries the plan's steps run on each (target, host), as the deployers
+/// declared them. Declared rather than parsed: an ssh step is a compound shell
+/// script, and some of them install their own tool when it is absent.
+fn remote_tools_needed(plan: &[ServicePlan]) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut needed: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for sp in plan {
+        for step in &sp.steps {
+            if step.remote_tools.is_empty() {
+                continue;
+            }
+            needed
+                .entry((sp.target.clone(), sp.host.clone()))
+                .or_default()
+                .extend(step.remote_tools.iter().cloned());
+        }
+    }
+    needed
+}
+
+/// One shell script that prints the name of every tool the target lacks, one
+/// per line, and nothing else. A name with a space is a subcommand
+/// (`docker compose` is a plugin, so `docker` alone proves nothing about it).
+///
+/// The sbin directories are appended because a deploy user's non-interactive
+/// `PATH` usually omits them while the `sudo` the steps run under does not —
+/// `nginx` lives in `/usr/sbin` on Debian. Probing through sudo instead would
+/// fail on a host whose sudoers allows only the commands the deploy runs.
+fn probe_script(tools: &BTreeSet<String>) -> String {
+    let mut script = String::from("PATH=\"$PATH:/usr/local/sbin:/usr/sbin:/sbin\"");
+    for tool in tools {
+        let quoted = crate::remote::shell_quote(tool);
+        let probe = if tool.contains(' ') {
+            format!("{tool} version")
+        } else {
+            format!("command -v {quoted}")
+        };
+        script.push_str(&format!(
+            "; {probe} >/dev/null 2>&1 || printf '%s\\n' {quoted}"
+        ));
+    }
+    script.push_str("; true");
+    script
+}
+
+/// The tools in `tools` that the target does not have, in one round trip.
+fn missing_remote_tools(
+    target: &Target,
+    host: &str,
+    tools: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let script = probe_script(tools);
+    let output = if target.is_local() {
+        Command::new("sh").arg("-c").arg(&script).output()
+    } else {
+        Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+            .args(target.ssh_args())
+            .arg(format!("{}@{host}", target.ssh.user))
+            .arg(&script)
+            .stderr(Stdio::null())
+            .output()
+    };
+    match output {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| tools.contains(*line))
+            .map(str::to_string)
+            .collect()),
+        _ => Err(format!(
+            "could not check the tools on {}",
+            where_on(target, host)
+        )),
+    }
+}
+
+/// How a report line names the machine a remote check ran on.
+fn where_on(target: &Target, host: &str) -> String {
+    if target.is_local() {
+        "the local target".to_string()
+    } else {
+        format!("{}@{host}", target.ssh.user)
+    }
 }
 
 /// Local files the config points at must exist before we build or ship.
@@ -177,6 +262,7 @@ pub fn run(
 
     // 3. remote reachability (skipped for --dry-run / plan)
     if check_remote {
+        let remote_tools = remote_tools_needed(plan);
         let mut seen = BTreeSet::new();
         let pairs = plan
             .iter()
@@ -195,6 +281,37 @@ pub fn run(
                     } else {
                         format!("{} reachable", target.describe(&host))
                     }),
+                    Err(problem) => {
+                        problems.push(problem);
+                        continue;
+                    }
+                }
+                // 4. the target's own tooling — only once we know we can ask.
+                let Some(tools) = remote_tools.get(&(target_name.clone(), host.clone())) else {
+                    continue;
+                };
+                match missing_remote_tools(target, &host, tools) {
+                    Ok(missing) => {
+                        let present: Vec<&str> = tools
+                            .iter()
+                            .filter(|tool| !missing.contains(tool))
+                            .map(|tool| tool.as_str())
+                            .collect();
+                        if !present.is_empty() {
+                            checked.push(format!(
+                                "{} tool(s) present on {}: {}",
+                                present.len(),
+                                where_on(target, &host),
+                                present.join(", ")
+                            ));
+                        }
+                        for tool in missing {
+                            problems.push(format!(
+                                "required tool not installed on {}: {tool}",
+                                where_on(target, &host)
+                            ));
+                        }
+                    }
                     Err(problem) => problems.push(problem),
                 }
             }
@@ -202,4 +319,51 @@ pub fn run(
     }
 
     Report { problems, checked }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local() -> Target {
+        serde_yaml::from_str("{method: local, dir: .}").unwrap()
+    }
+
+    fn tools(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn the_probe_names_exactly_the_tools_the_target_lacks() {
+        let missing = missing_remote_tools(
+            &local(),
+            "localhost",
+            &tools(&["sh", "deliver-no-such-tool-a", "deliver-no-such-tool-b"]),
+        )
+        .unwrap();
+        assert_eq!(
+            missing,
+            vec!["deliver-no-such-tool-a", "deliver-no-such-tool-b"]
+        );
+    }
+
+    #[test]
+    fn a_subcommand_is_probed_as_itself_not_as_its_binary() {
+        // `sh` exists, but `sh version` does not run a script called
+        // "version" successfully — the probe must see through to that.
+        let missing =
+            missing_remote_tools(&local(), "localhost", &tools(&["sh deliver-no-such"])).unwrap();
+        assert_eq!(missing, vec!["sh deliver-no-such"]);
+        let script = probe_script(&tools(&["docker compose"]));
+        assert!(script.contains("docker compose version"), "{script}");
+        assert!(!script.contains("command -v 'docker compose'"), "{script}");
+    }
+
+    #[test]
+    fn the_probe_looks_where_sudo_would() {
+        // nginx is in /usr/sbin on Debian, which a deploy user's PATH omits.
+        let script = probe_script(&tools(&["nginx"]));
+        assert!(script.starts_with("PATH=\"$PATH:/usr/local/sbin:/usr/sbin:/sbin\""));
+        assert!(script.contains("command -v 'nginx'"), "{script}");
+    }
 }

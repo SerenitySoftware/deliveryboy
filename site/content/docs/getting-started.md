@@ -58,9 +58,9 @@ deliver deploy --dry-run
 deliver preflight
 ```
 
-Preflight checks the required local tools, input files, secrets, and SSH access. When it fails, the release has not built, uploaded, or changed anything.
+Preflight checks the required local tools, input files, secrets, SSH access, and the tools the release will run on the server — Docker and `docker compose`, nginx and `systemctl` — in one ssh call per host. When it fails, the release has not built, uploaded, or changed anything.
 
-Preflight confirms that it can reach the server. It does not yet check every tool used by later remote commands. Review the plan and confirm the target has tools such as Docker, nginx, or Certbot when your release uses them.
+Commands you write yourself (`ssh:` steps, a vhost `script:`) are not inspected, so confirm the target has whatever those call. Certbot is not checked: the nginx deployer installs it when it is missing.
 
 ## Deploy
 

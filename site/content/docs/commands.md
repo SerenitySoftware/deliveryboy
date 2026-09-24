@@ -45,7 +45,9 @@ deliver plan --version 1.2.3
 
 ## `deliver preflight`
 
-Check local tools, input files, secrets, and SSH access. It reports every problem it can find in one pass.
+Check local tools, input files, secrets, SSH access, and the tools each target must have. It reports every problem it can find in one pass.
+
+The target check is one ssh call per host, asking for the binaries the deployers declared for their steps — `docker` and `docker compose`, `nginx` and `systemctl`, `tar` for a release unpack, `curl` for an on-target health check — with the sbin directories on `PATH`, where `sudo` would find them. It runs only once the host is reachable, and `--dry-run` skips it with the rest of the remote checks. Commands you wrote (`ssh:` steps, `script:`, a Compose `remote_command`) are not inspected, and neither is `certbot`, which the nginx deployer installs when it is absent.
 
 That includes a service whose plan will not compile: unlike every other command, `preflight` reports it as one more finding and keeps checking, so a broken config and a missing `hugo` show up in the same run. Exit code `2` when anything is wrong.
 

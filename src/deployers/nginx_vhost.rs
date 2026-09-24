@@ -573,7 +573,8 @@ fn install_step(spec: &VhostSpec, ctx: &PlanContext, content: Option<&str>) -> P
     let step = PlannedStep::ssh(
         format!("install vhost {site} (validate + rollback on failure)"),
         script,
-    );
+    )
+    .needs_remote(&["nginx", "systemctl"]);
     match content {
         Some(text) => step.with_live_config(&available, text),
         None => step,
@@ -771,10 +772,13 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // no need to write `verify: [remote_command: nginx -t]` in every config.
     // The reload is a no-op when the installs above already reloaded.
     if cfg_bool(cfg, "verify", true) {
-        steps.push(PlannedStep::ssh(
-            "verify: nginx -t, then reload".to_string(),
-            format!("set -e; {sudo}nginx -t; {sudo}systemctl reload nginx; echo 'nginx config valid and reloaded'"),
-        ));
+        steps.push(
+            PlannedStep::ssh(
+                "verify: nginx -t, then reload".to_string(),
+                format!("set -e; {sudo}nginx -t; {sudo}systemctl reload nginx; echo 'nginx config valid and reloaded'"),
+            )
+            .needs_remote(&["nginx", "systemctl"]),
+        );
     }
 
     Ok(steps)

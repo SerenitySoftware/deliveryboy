@@ -319,10 +319,13 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                 ));
                 let remote_tar = format!("{root}/{}-image.tar.gz", ctx.app);
                 steps.push(mark_rollback());
-                steps.push(PlannedStep::ssh(
-                    "load image on the target".to_string(),
-                    format!("{sudo}docker load -i {remote_tar}"),
-                ));
+                steps.push(
+                    PlannedStep::ssh(
+                        "load image on the target".to_string(),
+                        format!("{sudo}docker load -i {remote_tar}"),
+                    )
+                    .needs_remote(&["docker"]),
+                );
                 steps.push(
                     PlannedStep::ssh(
                         "remove the shipped image tarball".to_string(),
@@ -356,10 +359,13 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                     tag.rsplit('/').next().unwrap_or(&tag)
                 );
                 steps.push(mark_rollback());
-                steps.push(PlannedStep::ssh(
-                    format!("pull {primary} on the target"),
-                    format!("{sudo}docker pull {primary} && {sudo}docker tag {primary} {tag}"),
-                ));
+                steps.push(
+                    PlannedStep::ssh(
+                        format!("pull {primary} on the target"),
+                        format!("{sudo}docker pull {primary} && {sudo}docker tag {primary} {tag}"),
+                    )
+                    .needs_remote(&["docker"]),
+                );
             }
             other => bail!("docker-compose: unknown image.transport '{other}' (tarball|registry)"),
         }
@@ -544,14 +550,20 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     }
 
     // --- bring it up ---------------------------------------------------------
-    let up = match cfg_str(cfg, "remote_command") {
-        Some(custom) => custom,
+    let custom_up = cfg_str(cfg, "remote_command");
+    let up = match &custom_up {
+        Some(custom) => custom.clone(),
         None => format!("{sudo}{compose} up -d --remove-orphans"),
     };
     let start = PlannedStep::ssh(
         "start services".to_string(),
         format!("set -e; cd {root}; {up}"),
     );
+    // A custom command is the operator's own; what it runs is theirs to know.
+    let start = match custom_up {
+        Some(_) => start,
+        None => start.needs_remote(&["docker", "docker compose"]),
+    };
     // The undo this deployer owns is the image swap. With nothing shipped there
     // is none, and saying so is better than an undo that silently does nothing:
     // the project is running whatever its Compose file pins.
@@ -607,18 +619,23 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                 }
                 None => String::new(),
             };
-            steps.push(PlannedStep::ssh(
-                format!("health check {url} (on the target)"),
-                format!(
-                    "for i in $(seq 1 {retries}); do \
-                       STATUS=$(curl -s{host_header} {url} -o /dev/null -w '%{{http_code}}' 2>/dev/null) || STATUS=000; \
-                       case \"$STATUS\" in 2*) if true{body_check}; then \
-                         echo \"healthy (HTTP $STATUS)\"; exit 0; fi;; esac; \
-                       echo \"attempt $i/{retries}: HTTP $STATUS\"; sleep {interval}; \
-                     done; \
-                     echo 'health check failed' >&2; exit 1"
-                ),
-            ));
+            steps.push(
+                PlannedStep::ssh(
+                    format!("health check {url} (on the target)"),
+                    format!(
+                        "for i in $(seq 1 {retries}); do \
+                           STATUS=$(curl -s{host_header} {url} -o /dev/null -w '%{{http_code}}' 2>/dev/null) || STATUS=000; \
+                           case \"$STATUS\" in 2*) if true{body_check}; then \
+                             echo \"healthy (HTTP $STATUS)\"; exit 0; fi;; esac; \
+                           echo \"attempt $i/{retries}: HTTP $STATUS\"; sleep {interval}; \
+                         done; \
+                         echo 'health check failed' >&2; exit 1"
+                    ),
+                )
+                // A failed curl reads as HTTP 000, so a missing one would
+                // fail every attempt and look like an unhealthy release.
+                .needs_remote(&["curl"]),
+            );
         }
         if let Some(command) = health.get("command").and_then(|v| v.as_str()) {
             let service = health

@@ -85,7 +85,7 @@ Database migrations, remote scripts, external API calls, and arbitrary commands 
 
 ## Current limits
 
-- Preflight checks SSH access but does not yet prove that every remote tool exists.
+- Preflight checks the remote tools Delivery Boy's own deployers run (Docker and `docker compose`, nginx and `systemctl`, `tar`, `curl` for an on-target health check). Commands you write yourself — `ssh:` steps, `script:`, a Compose `remote_command` — are not inspected.
 - The live config diff covers nginx vhosts and Compose files; other deployers do not yet declare the long-lived files they replace.
 - Rollback selects the previous retained release; choosing any older release is planned.
 - Delivery Boy does not isolate commands from the local user or remote account that runs them.

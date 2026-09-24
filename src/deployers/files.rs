@@ -173,10 +173,13 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         format!("stage release {stamp}"),
         format!("{sudo}install -d -m {dir_mode} {owner_flags}{rel}"),
     ));
-    steps.push(PlannedStep::ssh(
-        format!("unpack {name} → releases/{stamp}"),
-        format!("{sudo}tar -xzf {landing}/{name} -C {rel}"),
-    ));
+    steps.push(
+        PlannedStep::ssh(
+            format!("unpack {name} → releases/{stamp}"),
+            format!("{sudo}tar -xzf {landing}/{name} -C {rel}"),
+        )
+        .needs_remote(&["tar"]),
+    );
     if let Some(owner) = &owner {
         steps.push(PlannedStep::ssh(
             format!("chown {owner} releases/{stamp}"),

@@ -1176,6 +1176,64 @@ services:
     assert!(err.contains("nginx/missing.conf"), "{err}");
 }
 
+#[test]
+fn preflight_checks_the_tools_the_target_itself_must_run() {
+    // A fresh or post-upgrade host used to sail through preflight and die at
+    // `docker compose up` or `nginx -t`, after the build and the ship. Against
+    // a local target the "remote" is this machine, so whether each tool is
+    // installed depends on the host running the test — what must hold is that
+    // every declared tool is checked, one way or the other.
+    let dir = tmpdir("preflight-remote-tools");
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/demo.conf"),
+        "server { listen 80; server_name demo.example.com; }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("docker-compose.yml"), "services: {}\n").unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: demo
+defaults: {target: local}
+targets:
+  local: {method: local, dir: .}
+services:
+  app:
+    deployer: docker-compose
+  nginx:
+    deployer: nginx-vhost
+    needs: [app]
+    config: {ssl: false, conf: nginx/demo.conf}
+"#,
+    )
+    .unwrap();
+    let out = run_in(&dir, &["preflight"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let checked = |tool: &str| {
+        text.lines().any(|line| {
+            (line.contains("tool(s) present on the local target:")
+                && line
+                    .split_once(": ")
+                    .is_some_and(|(_, list)| list.split(", ").any(|t| t.trim() == tool)))
+                || line.trim_end().ends_with(&format!(
+                    "required tool not installed on the local target: {tool}"
+                ))
+        })
+    };
+    for tool in ["docker", "docker compose", "nginx", "systemctl"] {
+        assert!(
+            checked(tool),
+            "{tool} was not checked on the target:\n{text}"
+        );
+    }
+}
+
 /// A config whose `nginx` service cannot compile (a `render:` placeholder wants
 /// a secret no provider has) while its `web` service compiles fine, plus an
 /// input file that is missing. One run should name all of it.

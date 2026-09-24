@@ -181,6 +181,14 @@ pub struct PlannedStep {
     /// compile-time metadata for a local read, not part of the step.
     #[serde(skip_serializing)]
     pub log_source: Option<LogSource>,
+    /// Binaries this step invokes on the target, so preflight can check they
+    /// exist there before anything is built or shipped. Declared by the
+    /// deployer that wrote the command rather than parsed out of it: a step
+    /// that installs its own tool (certbot) must not be reported as missing
+    /// it. A name with a space is a subcommand (`docker compose`), probed with
+    /// `<name> version`.
+    #[serde(skip_serializing)]
+    pub remote_tools: Vec<String>,
 }
 
 impl PlannedStep {
@@ -197,6 +205,7 @@ impl PlannedStep {
             live_config: None,
             release_state: None,
             log_source: None,
+            remote_tools: Vec::new(),
         }
     }
     pub fn command_in(
@@ -216,6 +225,7 @@ impl PlannedStep {
             live_config: None,
             release_state: None,
             log_source: None,
+            remote_tools: Vec::new(),
         }
     }
     pub fn ssh(label: impl Into<String>, command: impl Into<String>) -> Self {
@@ -230,6 +240,7 @@ impl PlannedStep {
             live_config: None,
             release_state: None,
             log_source: None,
+            remote_tools: Vec::new(),
         }
     }
 
@@ -253,6 +264,7 @@ impl PlannedStep {
             live_config: None,
             release_state: None,
             log_source: None,
+            remote_tools: Vec::new(),
         }
     }
 
@@ -284,6 +296,7 @@ impl PlannedStep {
             live_config: None,
             release_state: None,
             log_source: None,
+            remote_tools: Vec::new(),
         }
     }
 
@@ -317,6 +330,14 @@ impl PlannedStep {
     /// `deliver logs` can tail exactly what this deploy started.
     pub fn with_log_source(mut self, source: LogSource) -> Self {
         self.log_source = Some(source);
+        self
+    }
+
+    /// Declare the binaries this step runs on the target, so preflight can
+    /// fail before the deploy reaches it.
+    pub fn needs_remote(mut self, tools: &[&str]) -> Self {
+        self.remote_tools
+            .extend(tools.iter().map(|tool| tool.to_string()));
         self
     }
 
