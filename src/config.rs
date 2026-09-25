@@ -10,6 +10,22 @@ pub const SUPPORTED_VERSION: u32 = 1;
 /// The canonical per-repo config file, and what `deliver init` writes.
 pub const CONFIG_FILENAME: &str = ".deliver.yml";
 
+/// JSON Schema for `.deliver.yml`, for editors: completion, inline docs and
+/// validation while the file is being written, before `deliver validate` can
+/// run. Strict exactly where [`load`] is (the `deny_unknown_fields` structs),
+/// descriptive where a deployer reads its `config:` block by hand.
+pub const SCHEMA: &str = include_str!("config.schema.json");
+
+/// Where [`SCHEMA`] is published — its `$id`, and what `deliver init` points
+/// the editor at. Versioned with `version:`, so a v2 config gets its own URL.
+pub const SCHEMA_URL: &str = "https://deliveryboy.app/schema/v1.json";
+
+/// The first line of a scaffolded config: the yaml-language-server modeline
+/// that VS Code, Zed, Helix and Neovim's yamlls read.
+pub fn schema_modeline() -> String {
+    format!("# yaml-language-server: $schema={SCHEMA_URL}")
+}
+
 /// Config locations searched (in order) at each directory level, when `--config`
 /// isn't given. Both a single file and a `.deliveryboy/` directory are supported.
 pub const CANDIDATES: &[&str] = &[
@@ -571,4 +587,385 @@ pub fn load(path: &Path) -> Result<Config> {
         }
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod schema_tests {
+    //! The schema is a second description of what [`load`] accepts, so these
+    //! tests hold the two together: every config the CLI accepts must satisfy
+    //! the schema, every field `config.rs` gains must reach it, and a typo the
+    //! loader refuses must be one an editor underlines.
+
+    use super::*;
+    use serde_json::Value as Json;
+    use std::collections::BTreeSet;
+
+    fn validator() -> jsonschema::Validator {
+        let schema: Json = serde_json::from_str(SCHEMA).expect("SCHEMA is JSON");
+        jsonschema::draft7::new(&schema).expect("SCHEMA is a valid draft-07 schema")
+    }
+
+    fn yaml_to_json(text: &str) -> Json {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(text).expect("YAML");
+        serde_json::to_value(yaml).expect("YAML with string keys")
+    }
+
+    fn schema_errors(instance: &Json) -> Vec<String> {
+        let validator = validator();
+        validator
+            .iter_errors(instance)
+            .map(|e| format!("{} at {}", e, e.instance_path()))
+            .collect()
+    }
+
+    fn load_text(name: &str, text: &str) -> Result<Config> {
+        let dir = std::env::temp_dir().join(format!("deliver-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.yml"));
+        std::fs::write(&path, text).unwrap();
+        load(&path)
+    }
+
+    fn manifest(rel: &str) -> Option<String> {
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)).ok()
+    }
+
+    /// Every config this repository writes down anywhere: the raw strings the
+    /// integration tests feed the CLI, the YAML in the README and the docs, and
+    /// the repo's own release config. Files missing from a packaged crate are
+    /// skipped, not failed.
+    fn corpus() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(src) = manifest("tests/plan.rs") {
+            for (i, chunk) in src.split("r#\"").skip(1).enumerate() {
+                let body = chunk.split("\"#").next().unwrap_or_default();
+                if body.contains("version: 1") && body.contains("services:") {
+                    out.push((format!("tests/plan.rs raw string #{i}"), body.to_string()));
+                }
+            }
+        }
+        let mut docs = vec!["README.md".to_string()];
+        if let Ok(entries) =
+            std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("site/content/docs"))
+        {
+            for entry in entries.flatten() {
+                docs.push(format!(
+                    "site/content/docs/{}",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+        for doc in docs {
+            let Some(text) = manifest(&doc) else { continue };
+            for (i, chunk) in text.split("```yaml\n").skip(1).enumerate() {
+                let body = chunk.split("```").next().unwrap_or_default();
+                if body.contains("version: 1") && body.contains("services:") {
+                    out.push((format!("{doc} yaml block #{i}"), body.to_string()));
+                }
+            }
+        }
+        if let Some(own) = manifest(".deliver.yml") {
+            out.push((".deliver.yml".into(), own));
+        }
+        out
+    }
+
+    #[test]
+    fn the_schema_is_valid_and_published_where_init_points() {
+        let schema: Json = serde_json::from_str(SCHEMA).unwrap();
+        assert!(jsonschema::meta::is_valid(&schema));
+        assert_eq!(schema["$id"], SCHEMA_URL);
+        assert!(schema_modeline().ends_with(SCHEMA_URL));
+    }
+
+    /// The site serves a copy at [`SCHEMA_URL`]. A copy that drifts from the
+    /// one the binary prints is a schema an editor enforces and the CLI does not.
+    #[test]
+    fn the_site_copy_is_the_same_schema() {
+        let Some(site) = manifest("site/static/schema/v1.json") else {
+            assert!(
+                manifest("site/hugo.toml").is_none(),
+                "the site exists but has no site/static/schema/v1.json"
+            );
+            return;
+        };
+        assert_eq!(
+            site, SCHEMA,
+            "run: deliver schema > site/static/schema/v1.json"
+        );
+    }
+
+    #[test]
+    fn every_config_the_loader_accepts_satisfies_the_schema() {
+        let corpus = corpus();
+        assert!(corpus.len() >= 20, "corpus shrank to {}", corpus.len());
+        let mut checked = 0;
+        let mut failures = Vec::new();
+        for (name, text) in &corpus {
+            if load_text("corpus", text).is_err() {
+                continue; // a deliberately bad config, or a template
+            }
+            // Loads, but exists to prove `plan` refuses it: a `commands`
+            // service with no steps. The schema refusing it earlier is the point.
+            if text.contains("deployer: commands\n    config: {}") {
+                assert!(!schema_errors(&yaml_to_json(text)).is_empty(), "{name}");
+                continue;
+            }
+            checked += 1;
+            let errors = schema_errors(&yaml_to_json(text));
+            if !errors.is_empty() {
+                failures.push(format!("{name}:\n  {}\n{text}", errors.join("\n  ")));
+            }
+        }
+        assert!(checked >= 20, "only {checked} corpus configs load");
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    /// Uses every field `config.rs` defines, so the drift check below has a
+    /// value for each of them.
+    const KITCHEN_SINK: &str = r#"
+version: 1
+app: sink
+defaults: {target: production}
+targets:
+  production:
+    host: app.example.com
+    dir: /srv/sink
+    method: ssh
+    sudo: true
+    lock: {stale_after: 600}
+    ssh:
+      user: deploy
+      port: 2222
+      key: ~/.ssh/deploy.pem
+      agent: false
+      strict_host_key_checking: accept-new
+      jump: bastion.example.com
+      options: [-o, ServerAliveInterval=30]
+  edge:
+    hosts: [a.example.com, b.example.com]
+    dir: /srv/sink
+secrets:
+  providers: [env]
+  define: [WEBHOOK]
+versioning:
+  version_from: commit-count
+  require_clean: true
+  require_pushed: true
+  branch: main
+  tag: {enabled: true, name: "v{version}", push: true, remote: origin, annotate: false}
+  after_tag: [{command: "echo {version}"}]
+notifications:
+  - channel: slack
+    webhook_secret: WEBHOOK
+    events: [started, succeeded, failed]
+    success_payload_command: ./payload.sh
+services:
+  web:
+    deployer: files
+    target: production
+    enabled: true
+    pre: [{command: make}]
+    post: [{ssh: "true"}]
+    config: {src: dist}
+    verify: [{http: {url: "https://app.example.com/"}}]
+    logs: {unit: web.service}
+  worker:
+    deployer: commands
+    needs: [web]
+    config: {steps: [{ssh: "true"}]}
+    logs: {command: "tail {follow} -n {tail} /var/log/worker.log"}
+  cron:
+    deployer: commands
+    config: {steps: [{ssh: "true"}]}
+    logs: {files: [/var/log/cron.log]}
+"#;
+
+    /// Collect every field path the loaded config serializes, marking whether
+    /// any instance of it carried a value. Map keys (target and service names)
+    /// become `*`; user-authored blocks (`config`, steps, checks, secrets) stop
+    /// the walk, since their keys are the deployer's to define, not `config.rs`'s.
+    fn walk(value: &Json, path: String, seen: &mut BTreeSet<String>, set: &mut BTreeSet<String>) {
+        const OPAQUE: &[&str] = &[
+            "config",
+            "pre",
+            "post",
+            "verify",
+            "after_tag",
+            "providers",
+            "define",
+        ];
+        if let Json::Object(map) = value {
+            for (key, child) in map {
+                let dynamic = path == "targets" || path == "services";
+                let next = match (path.is_empty(), dynamic) {
+                    (true, _) => key.clone(),
+                    (false, true) => format!("{path}.*"),
+                    (false, false) => format!("{path}.{key}"),
+                };
+                if !dynamic {
+                    seen.insert(next.clone());
+                    if !child.is_null() {
+                        set.insert(next.clone());
+                    }
+                }
+                if !OPAQUE.contains(&key.as_str()) || dynamic {
+                    walk(child, next, seen, set);
+                }
+            }
+        } else if let Json::Array(items) = value {
+            for item in items {
+                walk(item, format!("{path}[]"), seen, set);
+            }
+        }
+    }
+
+    fn strip_nulls(value: &mut Json) {
+        match value {
+            Json::Object(map) => {
+                map.retain(|_, v| !v.is_null());
+                map.values_mut().for_each(strip_nulls);
+            }
+            Json::Array(items) => items.iter_mut().for_each(strip_nulls),
+            _ => {}
+        }
+    }
+
+    /// The loaded config, serialized back out, names every field `config.rs`
+    /// has — defaults included — under its canonical spelling. So a field
+    /// added to the structs without the schema learning it fails here twice
+    /// over: the schema's `additionalProperties: false` rejects it, and if it
+    /// is an `Option` the kitchen sink above never set, the walk reports it.
+    #[test]
+    fn a_field_added_to_config_rs_must_reach_the_schema() {
+        let config = load_text("sink", KITCHEN_SINK).expect("the kitchen sink loads");
+        let mut json = serde_json::to_value(&config).unwrap();
+
+        let (mut seen, mut set) = (BTreeSet::new(), BTreeSet::new());
+        walk(&json, String::new(), &mut seen, &mut set);
+        // Folded into `ssh:` on load, by design.
+        let folded = ["targets.*.user", "targets.*.port"];
+        let unset: Vec<&String> = seen
+            .difference(&set)
+            .filter(|p| !folded.contains(&p.as_str()))
+            .collect();
+        assert!(
+            unset.is_empty(),
+            "KITCHEN_SINK never sets {unset:?}: give it a value there and describe it in config.schema.json"
+        );
+
+        strip_nulls(&mut json);
+        let errors = schema_errors(&json);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    /// Older spellings `load` still accepts are ones the schema accepts too.
+    #[test]
+    fn aliases_and_deprecated_keys_validate() {
+        let text = r#"
+version: 1
+app: old
+defaults: {target: prod}
+targets:
+  prod: {host: old.example.com, user: root, port: 22, dir: /srv/old}
+release: {from: tag}
+services:
+  web:
+    deployer: nginx_vhost
+    before: [{command: make}]
+    after: [{ssh: "true"}]
+    config: {conf: nginx/site.conf}
+"#;
+        load_text("aliases", text).expect("load accepts the old spellings");
+        assert_eq!(schema_errors(&yaml_to_json(text)), Vec::<String>::new());
+    }
+
+    const MINIMAL: &str = r#"
+version: 1
+app: typo
+defaults: {target: prod}
+targets:
+  prod: {host: typo.example.com, dir: /srv/typo}
+services:
+  web: {deployer: files, config: {src: dist}}
+"#;
+
+    /// A mistake the loader refuses is one the editor underlines — the point of
+    /// the schema is to move `deliver validate`'s error to the keystroke.
+    #[test]
+    fn typos_the_loader_refuses_are_schema_errors_too() {
+        load_text("minimal", MINIMAL).expect("the baseline loads");
+        assert!(schema_errors(&yaml_to_json(MINIMAL)).is_empty());
+
+        let cases = [
+            (
+                "unknown top-level key",
+                MINIMAL.replace("defaults:", "default:"),
+            ),
+            ("unknown target key", MINIMAL.replace("{host:", "{hots:")),
+            (
+                "bad method",
+                MINIMAL.replace("dir: /srv/typo}", "dir: /srv/typo, method: rsync}"),
+            ),
+            (
+                "port is not a number",
+                MINIMAL.replace("dir: /srv/typo}", "dir: /srv/typo, ssh: {port: twenty}}"),
+            ),
+            (
+                "unknown service key",
+                MINIMAL.replace("{deployer: files,", "{deployer: files, verfy: [],"),
+            ),
+            (
+                "unsupported version",
+                MINIMAL.replace("version: 1", "version: 2"),
+            ),
+            (
+                "unsupported notification channel",
+                format!("{MINIMAL}notifications: [{{channel: email, webhook_secret: X}}]\n"),
+            ),
+            (
+                "no services",
+                MINIMAL.replace("  web: {deployer: files, config: {src: dist}}\n", "  {}\n"),
+            ),
+        ];
+        for (what, text) in cases {
+            assert!(
+                load_text("typo", &text).is_err(),
+                "{what}: load accepted\n{text}"
+            );
+            assert!(
+                !schema_errors(&yaml_to_json(&text)).is_empty(),
+                "{what}: the schema accepted what load refuses\n{text}"
+            );
+        }
+    }
+
+    /// Deployer settings the plan refuses, caught before `plan` runs.
+    #[test]
+    fn a_deployer_config_missing_what_it_requires_is_a_schema_error() {
+        let cases = [
+            ("unknown deployer", "{deployer: ftp}"),
+            ("files without src", "{deployer: files, config: {}}"),
+            ("commands without steps", "{deployer: commands, config: {}}"),
+            (
+                "macos-app without appcast.url",
+                "{deployer: macos-app, config: {appcast: {}}}",
+            ),
+            (
+                "a raw step that is neither",
+                "{deployer: commands, config: {steps: [{run: ls}]}}",
+            ),
+            (
+                "an unknown verify check",
+                "{deployer: files, config: {src: d}, verify: [{ping: x}]}",
+            ),
+        ];
+        for (what, service) in cases {
+            let text = MINIMAL.replace("{deployer: files, config: {src: dist}}", service);
+            assert!(
+                !schema_errors(&yaml_to_json(&text)).is_empty(),
+                "{what}: the schema accepted\n{text}"
+            );
+        }
+    }
 }

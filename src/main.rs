@@ -209,6 +209,8 @@ enum Commands {
     Clean,
     /// Schema-check .deliver.yml
     Validate,
+    /// Print the JSON Schema for .deliver.yml (for editors)
+    Schema,
 }
 
 fn main() {
@@ -294,6 +296,10 @@ fn run(cli: &Cli) -> Result<i32> {
         Commands::Secrets { action } => cmd_secrets(cli.config.as_deref(), action),
         Commands::Clean => cmd_clean(cli.config.as_deref()),
         Commands::Validate => cmd_validate(cli.config.as_deref()),
+        Commands::Schema => {
+            print!("{}", config::SCHEMA);
+            Ok(0)
+        }
     }
 }
 

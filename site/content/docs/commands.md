@@ -27,6 +27,8 @@ It scaffolds every shape it can map to a deployer: a Hugo site, a built front-en
 
 A front-end is anything with a `package.json` that declares a `build` script — Vite, Next.js, Astro, SvelteKit, Nuxt, Angular, Create React App, Vue CLI or Parcel — at the repo root or in `apps/web`, `web`, `frontend`, `client` or `ui`. It becomes a `files` service with a `build:` step: the install command follows whichever lockfile is actually present (`pnpm-lock.yaml` → `pnpm install --frozen-lockfile`, no lockfile at all → `npm install`, since `npm ci` needs one), and `src` is the framework's output directory — or, if the project has been built once already, whatever directory is really on disk.
 
+The file starts with a `# yaml-language-server: $schema=…` line, so an editor with a YAML language server completes and checks it as you edit.
+
 Every service it writes also gets a `verify:` block — the only thing that can roll a bad release back on its own — derived from what `init` was told rather than from a placeholder: the site root on `--host`, the appcast URL it just wrote, `nginx -t`, or a container-up probe using the same compose files and project the deploy will use.
 
 Anything it cannot work out is printed as a `!` note under the finding rather than guessed at. In particular no `env_file:` block is scaffolded: that block makes Delivery Boy *render* the env file from literals and resolved secrets, so an empty one would ship an empty `.env` over a working one. Add it yourself with `from_secrets:` once the secret names are declared. A front-end always gets the note that matters most for it: the build runs locally and bakes its variables into the bundle, so every `VITE_*` (or `NEXT_PUBLIC_*`, `REACT_APP_*` …) the build reads has to be declared in an `env:` block — a missing one does not fail the build, it silently ships the development default.
@@ -34,6 +36,10 @@ Anything it cannot work out is printed as a `!` note under the finding rather th
 ## `deliver validate`
 
 Check the config schema, service references, deployer names, and target names.
+
+## `deliver schema`
+
+Print the JSON Schema for `.deliver.yml`. It needs no config and runs anywhere; point an editor at the output (`deliver schema > .deliver.schema.json`) when it cannot reach the published copy. See [Editor support](../configuration/#editor-support).
 
 ## `deliver plan`
 

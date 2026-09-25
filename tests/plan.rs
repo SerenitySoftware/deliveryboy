@@ -6372,6 +6372,35 @@ fn a_fleet_file_from_a_later_version_is_refused() {
 // deployer gets a default, and every default is derived from something `init`
 // was actually told.
 
+/// Schema errors for a YAML config, against what `deliver schema` prints.
+fn schema_errors(yaml: &str) -> Vec<String> {
+    let out = deliver().arg("schema").output().unwrap();
+    assert!(out.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let validator = jsonschema::draft7::new(&schema).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    let instance = serde_json::to_value(yaml).unwrap();
+    let errors: Vec<String> = validator
+        .iter_errors(&instance)
+        .map(|e| format!("{e} at {}", e.instance_path()))
+        .collect();
+    errors
+}
+
+#[test]
+fn schema_prints_the_json_schema_without_a_config() {
+    let dir = tmpdir("schema-anywhere");
+    let out = run_in(&dir, &["schema"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let schema: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(schema["$id"], "https://deliveryboy.app/schema/v1.json");
+    assert_eq!(schema["title"], ".deliver.yml");
+}
+
 /// Write the scaffold `init` proposes, then prove the config it wrote is one
 /// the CLI accepts: a verify block that does not round-trip is a trap.
 fn scaffold_and_validate(dir: &std::path::Path, extra: &[&str]) -> String {
@@ -6387,6 +6416,20 @@ fn scaffold_and_validate(dir: &std::path::Path, extra: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     let written = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+
+    // The editor sees the same file the CLI does: the modeline points it at the
+    // schema, and the scaffold satisfies that schema.
+    assert!(
+        written.starts_with(
+            "# yaml-language-server: $schema=https://deliveryboy.app/schema/v1.json\n"
+        ),
+        "{written}"
+    );
+    let errors = schema_errors(&written);
+    assert!(
+        errors.is_empty(),
+        "the scaffold fails the schema: {errors:#?}\n{written}"
+    );
 
     let check = run_in(dir, &["validate"]);
     assert!(

@@ -4,6 +4,21 @@
 
 ### Added
 
+- A JSON Schema for `.deliver.yml`, so an editor catches a mistyped key while
+  the file is being written instead of `deliver validate` catching it
+  afterwards. `deliver schema` prints it; the docs site publishes it at
+  `https://deliveryboy.app/schema/v1.json`; and `deliver init` starts the file
+  it writes with the `# yaml-language-server: $schema=…` line that VS Code,
+  Zed, Helix and Neovim's YAML servers read. The schema is exactly as strict as
+  the loader on the file's own structure (targets, `ssh:`, services,
+  `versioning:`, notifications, `logs:`), requires what each deployer's plan
+  requires (`src` for `files`, `steps` for `commands`, `appcast.url` for
+  `macos-app`), and describes the rest of each deployer's `config:` without
+  refusing keys it does not list. Tests hold the schema to the loader in both
+  directions: every config in the test suite, the README and the docs that
+  loads must satisfy it, and a field added to the config types without the
+  schema learning it fails.
+
 - `deliver preflight` (and the preflight every `deploy` runs) checks the tools
   the target itself has to run, not only the local ones. A fresh or
   post-upgrade host used to pass preflight, build, ship, and then die at

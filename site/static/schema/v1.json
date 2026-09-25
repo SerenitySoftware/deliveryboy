@@ -1,0 +1,438 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://deliveryboy.app/schema/v1.json",
+  "title": ".deliver.yml",
+  "description": "Delivery Boy release config, version 1. `deliver validate` remains the authority: this schema is strict where it is strict and describes the rest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "app", "targets", "services"],
+  "properties": {
+    "version": {
+      "description": "Config schema version. Only 1 exists.",
+      "const": 1
+    },
+    "app": {
+      "description": "The app's name, used for artifact names, notices and history.",
+      "type": "string"
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "description": "Target a service uses when it names none.",
+          "type": "string"
+        }
+      }
+    },
+    "targets": {
+      "description": "Where services deploy, by name.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/definitions/target" }
+    },
+    "secrets": { "$ref": "#/definitions/secrets" },
+    "versioning": { "$ref": "#/definitions/versioning" },
+    "release": {
+      "$ref": "#/definitions/versioning",
+      "description": "Older spelling of `versioning:`."
+    },
+    "notifications": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/notification" }
+    },
+    "services": {
+      "description": "What ships, by name. Each service is compiled by its deployer.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/definitions/service" }
+    }
+  },
+  "definitions": {
+    "stringList": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dir"],
+      "properties": {
+        "host": {
+          "description": "A single host — shorthand for `hosts: [x]`.",
+          "type": "string"
+        },
+        "hosts": {
+          "description": "Several hosts. Every service is planned and run once per host.",
+          "$ref": "#/definitions/stringList"
+        },
+        "dir": {
+          "description": "The app's directory on the target.",
+          "type": "string"
+        },
+        "method": {
+          "description": "`ssh` (default) or `local` (this machine — no remote hop).",
+          "enum": ["ssh", "local"]
+        },
+        "ssh": { "$ref": "#/definitions/sshAuth" },
+        "sudo": {
+          "description": "Run privileged steps with sudo. Defaults to true for remote targets and false for `method: local`.",
+          "type": "boolean"
+        },
+        "lock": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stale_after": {
+              "description": "Seconds before an abandoned deploy lock may be taken over (default 3600). `0` never takes one over.",
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "user": {
+          "description": "Deprecated: use `ssh.user`.",
+          "type": "string"
+        },
+        "port": {
+          "description": "Deprecated: use `ssh.port`.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      }
+    },
+    "sshAuth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "user": { "description": "Login user (default root).", "type": "string" },
+        "port": { "description": "Default 22.", "type": "integer", "minimum": 0, "maximum": 65535 },
+        "key": { "description": "Identity file, e.g. ~/.ssh/deploy.pem (`-i`).", "type": "string" },
+        "agent": { "description": "Let the agent supply keys too. Default true.", "type": "boolean" },
+        "strict_host_key_checking": {
+          "description": "`StrictHostKeyChecking` value, e.g. yes, no or accept-new.",
+          "type": "string"
+        },
+        "jump": { "description": "ProxyJump host (`-J`), for a bastion.", "type": "string" },
+        "options": {
+          "description": "Escape hatch: extra raw ssh arguments.",
+          "$ref": "#/definitions/stringList"
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "providers": {
+          "description": "Ordered fallback chain — the first provider that has a name wins.",
+          "type": "array"
+        },
+        "define": {
+          "description": "The secrets this app needs: a list of names, or a mapping when a secret comes from somewhere other than the default chain.",
+          "type": ["array", "object"]
+        }
+      }
+    },
+    "versioning": {
+      "description": "How the app's release number is derived, and whether a successful deploy tags the commit.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version_from": { "$ref": "#/definitions/versionFrom" },
+        "from": { "$ref": "#/definitions/versionFrom" },
+        "require_clean": { "description": "Refuse a release from a dirty working tree.", "type": "boolean" },
+        "require_pushed": {
+          "description": "Refuse a release unless HEAD exactly matches its configured upstream.",
+          "type": "boolean"
+        },
+        "branch": { "description": "Branch a release must be made from, e.g. main.", "type": "string" },
+        "tag": { "$ref": "#/definitions/tag" },
+        "after_tag": {
+          "description": "Local steps that run only after the release tag exists (requires `tag.enabled: true`).",
+          "type": "array",
+          "items": { "$ref": "#/definitions/rawStep" }
+        }
+      }
+    },
+    "versionFrom": {
+      "description": "Where the release number comes from (default tag).",
+      "enum": ["tag", "commit", "commit-count"]
+    },
+    "tag": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "name": { "description": "Tag name template. `{version}` `{deploy}` `{sha}` are substituted.", "type": "string" },
+        "push": { "description": "Push the tag after creating it.", "type": "boolean" },
+        "remote": { "type": "string" },
+        "annotate": { "description": "Annotated (default) vs lightweight.", "type": "boolean" }
+      }
+    },
+    "notification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "webhook_secret"],
+      "properties": {
+        "channel": { "enum": ["slack"] },
+        "webhook_secret": {
+          "description": "Name of a declared secret containing the webhook URL.",
+          "type": "string"
+        },
+        "events": {
+          "description": "Default: succeeded and failed.",
+          "type": "array",
+          "items": { "enum": ["started", "succeeded", "failed"] }
+        },
+        "success_payload_command": {
+          "description": "Command that prints a complete JSON payload for a successful release. Runs in the repository root.",
+          "type": "string"
+        }
+      }
+    },
+    "rawStep": {
+      "description": "`{command: ...}` runs locally; `{ssh: ...}` runs on the target. `{version}` `{release}` `{deploy}` `{sha}` `{work}` are substituted.",
+      "type": "object",
+      "properties": {
+        "command": { "type": "string" },
+        "ssh": { "type": "string" }
+      },
+      "anyOf": [{ "required": ["command"] }, { "required": ["ssh"] }]
+    },
+    "verifyCheck": {
+      "description": "A check run after the deploy. A failed check fails the deploy and rolls it back.",
+      "type": "object",
+      "properties": {
+        "http": {
+          "type": "object",
+          "required": ["url"],
+          "properties": {
+            "url": { "type": "string" },
+            "expect_status": { "description": "Default 200.", "type": "integer" },
+            "retries": { "description": "Default 1.", "type": "integer", "minimum": 0 },
+            "interval": { "description": "Seconds between tries (default 5).", "type": "integer", "minimum": 0 }
+          }
+        },
+        "remote_command": { "description": "Runs on the target; must exit 0.", "type": "string" },
+        "remote_file": { "description": "Path under the target dir that must exist and be non-empty.", "type": "string" },
+        "contains": {
+          "type": "object",
+          "required": ["remote_file", "text"],
+          "properties": {
+            "remote_file": { "type": "string" },
+            "text": { "type": "string" }
+          }
+        }
+      },
+      "anyOf": [
+        { "required": ["http"] },
+        { "required": ["remote_command"] },
+        { "required": ["remote_file"] },
+        { "required": ["contains"] }
+      ]
+    },
+    "logs": {
+      "description": "Where this service's runtime logs are, for `deliver logs`. Set exactly one of unit, files or command.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "unit": { "description": "A systemd unit, read with journalctl -u.", "type": "string" },
+        "files": { "description": "Log files on the target, read with tail.", "$ref": "#/definitions/stringList" },
+        "command": {
+          "description": "Run this exact command on the target. `{tail}` and `{follow}` are substituted.",
+          "type": "string"
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deployer"],
+      "properties": {
+        "deployer": {
+          "description": "The deployer that compiles this service into steps.",
+          "enum": [
+            "commands",
+            "docker-compose",
+            "docker_compose",
+            "compose",
+            "files",
+            "hugo",
+            "macos-app",
+            "macos_app",
+            "nginx-vhost",
+            "nginx_vhost"
+          ]
+        },
+        "target": { "description": "Target name (default `defaults.target`).", "type": "string" },
+        "needs": { "description": "Services that must deploy first.", "$ref": "#/definitions/stringList" },
+        "enabled": { "description": "Default true.", "type": "boolean" },
+        "pre": { "description": "Steps run before the deployer's own.", "type": "array", "items": { "$ref": "#/definitions/rawStep" } },
+        "before": { "description": "Alias of `pre`.", "type": "array", "items": { "$ref": "#/definitions/rawStep" } },
+        "post": { "description": "Steps run after the deployer's own.", "type": "array", "items": { "$ref": "#/definitions/rawStep" } },
+        "after": { "description": "Alias of `post`.", "type": "array", "items": { "$ref": "#/definitions/rawStep" } },
+        "config": { "description": "Deployer-specific settings.", "type": "object" },
+        "verify": { "type": "array", "items": { "$ref": "#/definitions/verifyCheck" } },
+        "logs": { "$ref": "#/definitions/logs" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "deployer": { "const": "commands" } }, "required": ["deployer"] },
+          "then": { "properties": { "config": { "$ref": "#/definitions/commandsConfig" } } }
+        },
+        {
+          "if": { "properties": { "deployer": { "enum": ["docker-compose", "docker_compose", "compose"] } }, "required": ["deployer"] },
+          "then": { "properties": { "config": { "$ref": "#/definitions/dockerComposeConfig" } } }
+        },
+        {
+          "if": { "properties": { "deployer": { "const": "files" } }, "required": ["deployer"] },
+          "then": { "properties": { "config": { "$ref": "#/definitions/filesConfig" } } }
+        },
+        {
+          "if": { "properties": { "deployer": { "const": "hugo" } }, "required": ["deployer"] },
+          "then": { "properties": { "config": { "$ref": "#/definitions/hugoConfig" } } }
+        },
+        {
+          "if": { "properties": { "deployer": { "enum": ["macos-app", "macos_app"] } }, "required": ["deployer"] },
+          "then": { "properties": { "config": { "$ref": "#/definitions/macosAppConfig" } } }
+        },
+        {
+          "if": { "properties": { "deployer": { "enum": ["nginx-vhost", "nginx_vhost"] } }, "required": ["deployer"] },
+          "then": { "properties": { "config": { "$ref": "#/definitions/nginxVhostConfig" } } }
+        }
+      ]
+    },
+    "commandsConfig": {
+      "type": "object",
+      "required": ["steps"],
+      "properties": {
+        "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/rawStep" } }
+      }
+    },
+    "filesConfig": {
+      "type": "object",
+      "required": ["src"],
+      "properties": {
+        "src": { "description": "File, directory or archive to ship (a build's output when `build:` is set).", "type": "string" },
+        "build": { "description": "Local command that produces `src`.", "type": "string" },
+        "build_dir": { "description": "Where `build` runs (default the repo root).", "type": "string" },
+        "env": { "description": "Environment for `build`.", "type": "object" },
+        "unpack": { "description": "Unpack an archive on the target.", "type": "boolean" },
+        "remote_subdir": { "description": "Live path under the target dir (default `current`).", "type": "string" },
+        "releases_dir": { "type": "string" },
+        "keep_releases": { "description": "Releases retained for rollback (default 5).", "type": "integer", "minimum": 0 },
+        "dir_mode": { "description": "Default 755.", "type": "string" },
+        "file_mode": { "description": "Default 644.", "type": "string" },
+        "owner": { "description": "user:group applied to the release.", "type": "string" }
+      }
+    },
+    "hugoConfig": {
+      "type": "object",
+      "properties": {
+        "source": { "description": "Hugo site directory (default `.`).", "type": "string" },
+        "tarball": { "type": "string" },
+        "minify": { "description": "Default true.", "type": "boolean" },
+        "remote_subdir": { "description": "Live path under the target dir (default `web`).", "type": "string" },
+        "owner": { "description": "Default www-data:www-data.", "type": "string" },
+        "releases_dir": { "type": "string" },
+        "dir_mode": { "type": "string" },
+        "file_mode": { "type": "string" }
+      }
+    },
+    "dockerComposeConfig": {
+      "type": "object",
+      "properties": {
+        "files": { "description": "Compose files, shipped byte-for-byte.", "$ref": "#/definitions/stringList" },
+        "project": { "description": "Compose project name (default the app name).", "type": "string" },
+        "build": { "description": "Force (true) or skip (false) the local image build.", "type": "boolean" },
+        "image": { "description": "The image to build and ship.", "type": "object" },
+        "images": { "description": "Several images to build and ship.", "type": "array", "items": { "type": "object" } },
+        "include": { "description": "Extra files shipped with the Compose files.", "$ref": "#/definitions/stringList" },
+        "env_file": { "description": "The `.env` rendered for the containers (path, literals, from_secrets).", "type": "object" },
+        "backup": { "description": "Database dump and volume archives taken before the deploy.", "type": "object" },
+        "infra": { "description": "Infrastructure services started (and waited on) first.", "type": "object" },
+        "release": { "description": "One-off release commands (migrations) run before the swap.", "type": "object" },
+        "remote_command": { "description": "Replace the default `up` command.", "type": "string" },
+        "health": { "description": "Checks that the live service answers.", "type": "object" },
+        "prune": { "description": "Prune old images after a deploy (default true).", "type": "boolean" }
+      }
+    },
+    "macosAppConfig": {
+      "type": "object",
+      "required": ["appcast"],
+      "properties": {
+        "strategy": { "description": "Build strategy (default: whichever block is present, else fastlane).", "enum": ["fastlane", "xcodebuild", "command"] },
+        "fastlane": { "type": "object" },
+        "lane": { "description": "fastlane lane (default release).", "type": "string" },
+        "xcodebuild": { "type": "object" },
+        "command": { "description": "Build command for strategy `command`.", "type": "string" },
+        "build_command": { "description": "Alias of `command`.", "type": "string" },
+        "dmg": { "description": "The DMG the build produces.", "type": "string" },
+        "allow_dirty": { "description": "Skip the clean-tree guard.", "type": "boolean" },
+        "appcast": {
+          "description": "The Sparkle feed (url, download_url_prefix, notes, ed_key_keychain …).",
+          "type": "object",
+          "required": ["url"],
+          "properties": { "url": { "type": "string" } }
+        },
+        "publish": { "description": "Where the DMG and its extras land on the target.", "type": "object" }
+      }
+    },
+    "nginxVhostConfig": {
+      "type": "object",
+      "properties": {
+        "conf": { "description": "One vhost file (or use `vhosts:`).", "type": "string" },
+        "vhosts": {
+          "description": "Several vhosts, each with its own domains.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["conf"],
+            "properties": {
+              "conf": { "type": "string" },
+              "site_name": { "type": "string" },
+              "ssl": { "type": "boolean" },
+              "domains": { "$ref": "#/definitions/stringList" },
+              "cert_name": { "type": "string" }
+            }
+          }
+        },
+        "site_name": { "type": "string" },
+        "ssl": { "description": "Provision certificates (default true).", "type": "boolean" },
+        "domains": { "description": "Override the domains the conf declares.", "$ref": "#/definitions/stringList" },
+        "cert_name": { "type": "string" },
+        "strategy": { "description": "Default managed.", "enum": ["managed", "script"] },
+        "script": { "description": "For strategy `script`: run this file on the target.", "type": "string" },
+        "provider": { "description": "Certificate provider (default certbot).", "enum": ["certbot", "none"] },
+        "certbot": {
+          "type": "object",
+          "properties": {
+            "webroot": { "type": "string" },
+            "email": { "type": "string" },
+            "renew_before_days": { "description": "Default 30.", "type": "integer", "minimum": 0 }
+          }
+        },
+        "render": {
+          "description": "Placeholders substituted into the vhost at install time; values may use `{secret:NAME}`.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "snippets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+              "path": { "description": "Absolute path on the target.", "type": "string" },
+              "content": { "type": "string" },
+              "mode": { "type": "string" },
+              "owner": { "type": "string" }
+            }
+          }
+        },
+        "verify": { "description": "Check the live vhost after install (default true).", "type": "boolean" }
+      }
+    }
+  }
+}

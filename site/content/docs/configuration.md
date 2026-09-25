@@ -8,6 +8,16 @@ Delivery Boy keeps the release contract in `.deliver.yml` at the root of your re
 
 Treat this file as executable release code. Review changes to it with the same care as a shell script: deployers can run local commands, upload files, and run commands on remote hosts.
 
+## Editor support
+
+A JSON Schema for the file is published at `https://deliveryboy.app/schema/v1.json`, and `deliver schema` prints the same schema offline. `deliver init` starts the file it writes with the modeline that YAML language servers read (the VS Code YAML extension, Zed, Helix, Neovim with `yamlls`):
+
+```yaml
+# yaml-language-server: $schema=https://deliveryboy.app/schema/v1.json
+```
+
+That gives completion, inline descriptions and an underline on a mistyped key while you write the file. Add the line to an existing config to get the same. The schema is as strict as `deliver validate` on the file's own structure — an unknown key under a target, service or `versioning:` is an error in both — and describes each deployer's `config:` keys without refusing ones it does not list. `deliver validate` is still the final check.
+
 ## A small Hugo site
 
 ```yaml

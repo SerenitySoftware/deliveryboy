@@ -47,7 +47,8 @@ deliver deploy
 ```
 
 `deliver init` prints the config it would create. Review it before passing
-`--write`. Treat `.deliver.yml` as release code: it can run local commands,
+`--write`. The file it writes points YAML-aware editors at the config's JSON
+Schema (`deliver schema` prints it), so they complete and check it as you edit. Treat `.deliver.yml` as release code: it can run local commands,
 upload files, and run commands on remote hosts.
 
 ## What is live right now
