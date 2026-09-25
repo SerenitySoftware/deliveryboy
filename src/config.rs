@@ -626,8 +626,11 @@ mod schema_tests {
         load(&path)
     }
 
+    /// A file from the source tree, with a Windows checkout's CRLF folded to LF.
     fn manifest(rel: &str) -> Option<String> {
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)).ok()
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
+            .ok()
+            .map(|text| text.replace("\r\n", "\n"))
     }
 
     /// Every config this repository writes down anywhere: the raw strings the
@@ -690,7 +693,8 @@ mod schema_tests {
             return;
         };
         assert_eq!(
-            site, SCHEMA,
+            site,
+            SCHEMA.replace("\r\n", "\n"),
             "run: deliver schema > site/static/schema/v1.json"
         );
     }
