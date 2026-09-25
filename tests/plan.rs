@@ -2623,6 +2623,57 @@ fn untagged_head_with_no_input_explains_instead_of_hanging() {
     );
 }
 
+/// With `--yes` nobody was asked, so nobody declined: an untagged HEAD is a
+/// failed release guard. Exiting 0 let a CI job go green having shipped nothing.
+#[test]
+fn deploy_yes_on_an_untagged_head_fails_instead_of_passing() {
+    let dir = local_deploy_repo("rel-yes-untagged");
+    git_init_tagged(&dir, "tmp");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["tag", "-d", "tmp"])
+        .output()
+        .unwrap();
+
+    let out = run_in(&dir, &["deploy", "-y"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("no release to deploy"), "{text}");
+    assert!(text.contains("--version"), "{text}");
+    assert!(
+        !dir.join("dest/.deliver").exists(),
+        "nothing may ship: {text}"
+    );
+}
+
+/// `verify` takes the same path, so on an untagged commit it ran no checks and
+/// still exited 0 — reporting a live release as good without looking at it.
+#[test]
+fn verify_on_an_untagged_head_does_not_report_success() {
+    let dir = local_deploy_repo("verify-untagged");
+    git_init_tagged(&dir, "tmp");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["tag", "-d", "tmp"])
+        .output()
+        .unwrap();
+
+    let out = run_in(&dir, &["verify"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(!text.contains("Verifying"), "{text}");
+}
+
 #[test]
 fn version_flag_creates_the_tag_without_prompting() {
     let dir = local_deploy_repo("rel-version-flag");

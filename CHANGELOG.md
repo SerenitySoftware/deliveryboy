@@ -117,6 +117,14 @@
 
 ### Fixed
 
+- `deliver deploy --yes` and `deliver verify` on an untagged `HEAD` exit `2`
+  instead of `0`. Both printed "no release to deploy" and stopped, but a CI
+  job running `deploy -y` on an untagged commit went green having shipped
+  nothing, and `verify` reported a live release as good without running a
+  single check — although the docs already said `--yes` does not invent an
+  untagged release and listed `2` for a release guard. An interactive deploy
+  whose version prompt is declined is still a cancel, and still exits `0`.
+
 - A `files` service whose `src:` is its `build:` output failed its first deploy
   from a clean checkout — the shape `deliver init` scaffolds for every
   front-end. Packaging was decided by testing `src` on disk when the plan was

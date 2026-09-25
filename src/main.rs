@@ -1071,6 +1071,14 @@ fn cmd_deploy(
         dry_run,
     )?
     else {
+        // Without a prompt there is nobody to have declined: `--yes` and
+        // `verify` stopping here is a failed release guard, not a cancel, and
+        // a CI job must not go green having shipped or checked nothing.
+        if assume_yes || verify_only {
+            ui::phase("Aborted");
+            ui::note("nothing was built, shipped, checked, or changed.");
+            return Ok(2);
+        }
         return Ok(0);
     };
     let mut plan = compile_announced(&config, only, &root, &v)?;

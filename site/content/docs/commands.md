@@ -126,6 +126,8 @@ The command it runs is printed before it runs, and the read is read-only.
 
 Run only the checks from the selected services.
 
+It resolves the release the way `deploy --yes` does, so with `versioning.from: tag` (the default) it needs a tag on `HEAD` or `--version`. Without one it runs no checks and exits `2`, as does `deploy --yes`, rather than reporting success for work it did not do.
+
 ## `deliver rollback`
 
 Restore the previous release for services that support rollback.
