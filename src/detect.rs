@@ -662,7 +662,7 @@ pub fn detect(root: &Path) -> Vec<Finding> {
 /// (`www-data:www-data`) and with a URL; what it cannot carry unquoted is a
 /// leading indicator character, a `key: value` pair inside the value, or a
 /// trailing comment.
-fn quote_scalar(value: &str) -> String {
+pub fn quote_scalar(value: &str) -> String {
     let needs_quotes = value.is_empty()
         || value.contains(": ")
         || value.contains(" #")
@@ -803,7 +803,6 @@ pub fn verify_note(finding: &Finding, app: &str, dir: &str) -> Option<String> {
 
 /// Render a `.deliver.yml` from findings that map to a real deployer.
 pub fn scaffold(app: &str, host: &str, dir: &str, findings: &[Finding]) -> String {
-    let fill = |value: &str| value.replace("{app}", app).replace("{host}", host);
     let mut out = String::new();
     out.push_str(&crate::config::schema_modeline());
     out.push('\n');
@@ -819,23 +818,40 @@ pub fn scaffold(app: &str, host: &str, dir: &str, findings: &[Finding]) -> Strin
 
     let mut previous: Option<String> = None;
     for f in usable {
-        let deployer = f.deployer.unwrap();
-        out.push_str(&format!("  {}:\n    deployer: {deployer}\n", f.service));
-        if let Some(prev) = &previous {
-            out.push_str(&format!("    needs: [{prev}]\n"));
-        }
-        if !f.config.is_empty() {
-            out.push_str("    config:\n");
-            for (k, v) in &f.config {
-                render_value(&mut out, 6, k, v, &fill);
-            }
-        }
-        if let Some((block, _)) = default_verify(f, app, dir) {
-            out.push_str(&fill(&block));
-        }
+        render_service(&mut out, app, host, dir, f, previous.as_deref());
         previous = Some(f.service.clone());
     }
     out
+}
+
+/// Append one finding's service entry — deployer, `needs:`, `config:` and the
+/// default `verify:` — under a `services:` block. `init --from-workflow` uses
+/// it too, so a Compose service it adds reads exactly as plain `init` writes it.
+pub fn render_service(
+    out: &mut String,
+    app: &str,
+    host: &str,
+    dir: &str,
+    f: &Finding,
+    needs: Option<&str>,
+) {
+    let Some(deployer) = f.deployer else {
+        return;
+    };
+    let fill = |value: &str| value.replace("{app}", app).replace("{host}", host);
+    out.push_str(&format!("  {}:\n    deployer: {deployer}\n", f.service));
+    if let Some(prev) = needs {
+        out.push_str(&format!("    needs: [{prev}]\n"));
+    }
+    if !f.config.is_empty() {
+        out.push_str("    config:\n");
+        for (k, v) in &f.config {
+            render_value(out, 6, k, v, &fill);
+        }
+    }
+    if let Some((block, _)) = default_verify(f, app, dir) {
+        out.push_str(&fill(&block));
+    }
 }
 
 #[cfg(test)]

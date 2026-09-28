@@ -21,6 +21,7 @@ mod shipping;
 mod ui;
 mod verify;
 mod version;
+mod workflow;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -108,6 +109,9 @@ enum Commands {
         /// Overwrite an existing .deliver.yml
         #[arg(long)]
         force: bool,
+        /// Scaffold from a GitHub Actions workflow (e.g. .github/workflows/deploy.yml)
+        #[arg(long, value_name = "PATH")]
+        from_workflow: Option<PathBuf>,
     },
     /// Compile and print the plan — executes nothing
     Plan {
@@ -235,6 +239,22 @@ fn run(cli: &Cli) -> Result<i32> {
             dir,
             write,
             force,
+            from_workflow: Some(workflow),
+        } => cmd_init_from_workflow(
+            path,
+            workflow,
+            host.as_deref(),
+            dir.as_deref(),
+            *write,
+            *force,
+        ),
+        Commands::Init {
+            path,
+            host,
+            dir,
+            write,
+            force,
+            from_workflow: None,
         } => cmd_init(path, host.as_deref(), dir.as_deref(), *write, *force),
         Commands::Plan {
             service,
@@ -355,6 +375,12 @@ fn cmd_init(
         }
     }
     let yaml = detect::scaffold(&app, host, &dir, &findings);
+    offer_write(&root, &yaml, write, force)
+}
+
+/// Print the proposed config and write it — on `--write`, or on a yes at the
+/// prompt. Never overwrites without `--force`.
+fn offer_write(root: &Path, yaml: &str, write: bool, force: bool) -> Result<i32> {
     let dest = root.join(config::CONFIG_FILENAME);
 
     println!("\n--- {} (proposed) ---\n{yaml}", config::CONFIG_FILENAME);
@@ -395,10 +421,159 @@ fn cmd_init(
         return Ok(0);
     }
 
-    std::fs::write(&dest, &yaml)?;
+    std::fs::write(&dest, yaml)?;
     println!("\nWrote {}", dest.display());
     println!("Review it, then run: deliver plan");
     Ok(0)
+}
+
+fn cmd_init_from_workflow(
+    path: &Path,
+    workflow_path: &Path,
+    host: Option<&str>,
+    dir: Option<&str>,
+    write: bool,
+    force: bool,
+) -> Result<i32> {
+    ui::banner();
+    let root = path.canonicalize()?;
+    let app = root
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "app".into());
+    // As given (relative to where `deliver` runs), else relative to --path.
+    let file = if workflow_path.exists() || workflow_path.is_absolute() {
+        workflow_path.to_path_buf()
+    } else {
+        root.join(workflow_path)
+    };
+    ui::phase("Reading workflow");
+    ui::detail(file.display().to_string());
+    let text = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("cannot read workflow {}: {e}", file.display()))?;
+    let import =
+        workflow::import(&text).map_err(|e| anyhow::anyhow!("{}: {e:#}", file.display()))?;
+
+    // An image build is the docker-compose deployer's job, and plain `init`
+    // already knows how to scaffold that from the compose file.
+    let compose = import.image_build.as_ref().and_then(|_| {
+        detect::detect(&root)
+            .into_iter()
+            .find(|f| f.deployer == Some("docker-compose"))
+    });
+
+    let host_given = host.is_some();
+    let host = host
+        .map(str::to_string)
+        .or_else(|| import.host.clone())
+        .unwrap_or_else(|| "CHANGEME.example.com".into());
+    let user = import.user.clone().unwrap_or_else(|| "root".into());
+    let port = import.port.unwrap_or(22);
+    let dir = dir
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("/var/universal/{app}"));
+
+    ui::phase("Mapped");
+    if import.mapped.is_empty() && compose.is_none() {
+        println!("  (nothing)");
+    }
+    for step in &import.mapped {
+        println!("  • {step}");
+    }
+    if let (Some(step), Some(f)) = (&import.image_build, &compose) {
+        println!("  • {step}  → docker-compose service `{}`", f.service);
+    }
+    if !import.skipped.is_empty() {
+        ui::phase("Skipped (CI runner setup — your machine already has it)");
+        for step in &import.skipped {
+            println!("  • {step}");
+        }
+    }
+
+    let mut unmapped = import.unmapped.clone();
+    if let (Some(step), None) = (&import.image_build, &compose) {
+        unmapped.push(workflow::Unmapped {
+            step: step.clone(),
+            reason: "builds an image, and the repo has no compose file for the docker-compose \
+                     deployer to build it from"
+                .into(),
+        });
+    }
+    let count = unmapped.len();
+    ui::phase(&format!(
+        "{count} step{} I could not map",
+        if count == 1 { "" } else { "s" }
+    ));
+    for u in &unmapped {
+        println!("  • {}\n      ! {}", u.step, u.reason);
+    }
+
+    let mut notes = import.notes.clone();
+    if !host_given && import.host.is_none() {
+        notes.push(
+            "the workflow's ssh host was not a literal — pass --host, or edit targets.production.host"
+                .into(),
+        );
+    }
+    if let Some(f) = &compose {
+        let restarts: Vec<&str> = import
+            .jobs
+            .iter()
+            .filter(|j| {
+                j.steps.iter().any(|s| {
+                    matches!(s, workflow::Step::Ssh(cmd)
+                        if cmd.contains("docker compose") || cmd.contains("docker-compose"))
+                })
+            })
+            .map(|j| j.name.as_str())
+            .collect();
+        if !restarts.is_empty() {
+            notes.push(format!(
+                "`{}` still runs the workflow's own compose commands over ssh, and the `{}` \
+                 service now does that job — keep one",
+                restarts.join("`, `"),
+                f.service
+            ));
+        }
+    }
+    if !import.connection_secrets.is_empty() {
+        notes.push(format!(
+            "not declared: {} — the workflow used them to reach the box or a registry; `deliver` \
+             uses your own ssh config and docker login",
+            import
+                .connection_secrets
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !import.secrets.is_empty() {
+        notes.push(
+            "declared secrets are read from the environment — run `deliver secrets` to see which \
+             are missing"
+                .into(),
+        );
+    }
+    if !notes.is_empty() {
+        ui::phase("Notes");
+        for note in &notes {
+            println!("  ! {note}");
+        }
+    }
+
+    let source = workflow_path.display().to_string();
+    let yaml = workflow::scaffold(
+        &source,
+        &app,
+        &host,
+        &user,
+        port,
+        &dir,
+        &import,
+        compose.as_ref(),
+    );
+    offer_write(&root, &yaml, write, force)
 }
 
 /// The repo root is the directory holding the config (a `.deliveryboy/` config

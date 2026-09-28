@@ -33,6 +33,18 @@ Every service it writes also gets a `verify:` block — the only thing that can 
 
 Anything it cannot work out is printed as a `!` note under the finding rather than guessed at. In particular no `env_file:` block is scaffolded: that block makes Delivery Boy *render* the env file from literals and resolved secrets, so an empty one would ship an empty `.env` over a working one. Add it yourself with `from_secrets:` once the secret names are declared. A front-end always gets the note that matters most for it: the build runs locally and bakes its variables into the bundle, so every `VITE_*` (or `NEXT_PUBLIC_*`, `REACT_APP_*` …) the build reads has to be declared in an `env:` block — a missing one does not fail the build, it silently ships the development default.
 
+### From a GitHub Actions workflow
+
+```bash
+deliver init --from-workflow .github/workflows/deploy.yml --host example.com
+```
+
+Reads the workflow an app already deploys with and scaffolds from what it declares, not from the shape of the tree. Each job becomes a `commands` service, and its `needs:` carry over. `run:` steps become `command:` steps, run with `set -e` when they span several lines (the runner used `bash -e`). The workflow's `env:` literals are exported into each step, and `working-directory` becomes a `cd`. An `appleboy/ssh-action` script becomes one `ssh:` step, and its literal host, user and port become the target (`--host` overrides the host). `appleboy/scp-action` becomes an `scp` command to that target. `docker/build-push-action` becomes the `docker-compose` service plain `init` would write, when the repo has a compose file. `on: push: tags:` or `on: release:` becomes a tag release. A push to one branch becomes `versioning: {from: commit, branch: …}`.
+
+Every `secrets.*` a step reads is declared under `secrets:` with the `env` provider. The ones the workflow only used to reach the box or a registry (the ssh key, the registry login) are named and left out, because `deliver` uses your own ssh config and `docker login`. Runner setup (`actions/checkout`, `actions/setup-*`, caches, buildx) is listed as skipped.
+
+The rest is reported as **N steps I could not map**, each with its reason, instead of being dropped. That covers any other action, a `run:` that uses a `${{ … }}` expression, a step whose `env:` sets a variable from a secret (a `command:` step has no secret substitution), a matrix job and a call to a reusable workflow. A step or job `if:` is dropped with a note, because `deliver` runs every step. The output is a starting point: review it before passing `--write`.
+
 ## `deliver validate`
 
 Check the config schema, service references, deployer names, and target names.

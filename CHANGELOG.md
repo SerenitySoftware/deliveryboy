@@ -4,6 +4,15 @@
 
 ### Added
 
+- `deliver init --from-workflow <path>` scaffolds `.deliver.yml` from a GitHub
+  Actions workflow: jobs become `commands` services, `run:` steps become
+  `command:` steps, an `appleboy/ssh-action` script becomes an `ssh:` step and
+  its host, user and port the target, `appleboy/scp-action` an `scp` command,
+  `docker/build-push-action` the `docker-compose` service, `secrets.*` the
+  `secrets:` block, and `on: push: tags:` a tag release. Every step it could
+  not carry over is listed with its reason rather than dropped, and runner
+  setup is listed as skipped.
+
 - A JSON Schema for `.deliver.yml`, so an editor catches a mistyped key while
   the file is being written instead of `deliver validate` catching it
   afterwards. `deliver schema` prints it; the docs site publishes it at

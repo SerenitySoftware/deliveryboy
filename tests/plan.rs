@@ -6907,3 +6907,193 @@ services:
     );
     assert!(held.join("owner").is_file(), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// `deliver init --from-workflow`: scaffold from the GitHub Actions workflow an
+// app already deploys with. The scaffold has to be a config the CLI accepts
+// unedited, and every step it could not carry over has to be named.
+
+const DEPLOY_WORKFLOW: &str = r#"name: Deploy
+on:
+  push:
+    tags: ['v*']
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+      - run: npm ci
+      - name: Publish sourcemaps
+        run: ./scripts/sentry.sh ${{ github.sha }}
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: app.example.com
+          username: deploy
+          port: 2222
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd /srv/demo
+            echo "$API_TOKEN" > /dev/null
+            docker compose up -d
+          envs: ${{ secrets.API_TOKEN }}
+      - uses: slackapi/slack-github-action@v1
+"#;
+
+fn workflow_repo(name: &str, workflow: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/deploy.yml"), workflow).unwrap();
+    dir
+}
+
+#[test]
+fn init_from_workflow_scaffolds_a_config_the_cli_accepts() {
+    let dir = workflow_repo("init-workflow", DEPLOY_WORKFLOW);
+    let written = scaffold_and_validate(&dir, &["--from-workflow", ".github/workflows/deploy.yml"]);
+
+    // The target comes from the ssh action's literal connection details.
+    assert!(written.contains("host: app.example.com"), "{written}");
+    assert!(written.contains("user: deploy"), "{written}");
+    assert!(written.contains("port: 2222"), "{written}");
+    // run: → command, the ssh script → one ssh step, job needs → service needs.
+    assert!(written.contains("- command: npm ci"), "{written}");
+    assert!(
+        written.contains("- ssh: |\n            cd /srv/demo\n"),
+        "{written}"
+    );
+    assert!(written.contains("needs: [build]"), "{written}");
+    // on.push.tags → a tag release.
+    assert!(written.contains("versioning:\n  from: tag"), "{written}");
+    // The app secret is declared; the ssh key the runner used is not — deliver
+    // connects with the operator's own ssh config.
+    assert!(written.contains("- API_TOKEN"), "{written}");
+    assert!(!written.contains("SSH_KEY"), "{written}");
+    // Nothing from a runner-only expression leaks into a step.
+    assert!(!written.contains("${{"), "{written}");
+
+    let planned = run_in(&dir, &["plan", "--version", "1.0.0"]);
+    let text = String::from_utf8_lossy(&planned.stdout);
+    assert!(
+        planned.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    assert!(text.contains("[ssh] ssh: cd /srv/demo"), "{text}");
+}
+
+#[test]
+fn init_from_workflow_names_every_step_it_could_not_map() {
+    let dir = workflow_repo("init-workflow-report", DEPLOY_WORKFLOW);
+    let out = deliver()
+        .args(["init", "--path"])
+        .arg(&dir)
+        .args(["--from-workflow", ".github/workflows/deploy.yml"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    // Headings go to stderr like every `ui::phase`; the report lines to stdout.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("2 steps I could not map"), "{text}");
+    assert!(text.contains("build · Publish sourcemaps"), "{text}");
+    assert!(text.contains("`github.sha`"), "{text}");
+    assert!(
+        text.contains("`slackapi/slack-github-action` has no `deliver` equivalent"),
+        "{text}"
+    );
+    // Runner setup is listed as skipped, not silently dropped.
+    assert!(text.contains("build · actions/setup-node@v4"), "{text}");
+    assert!(text.contains("not declared: SSH_KEY"), "{text}");
+    // No --write and no input: nothing is written.
+    assert!(!dir.join(".deliver.yml").exists());
+}
+
+#[test]
+fn init_from_workflow_with_a_secret_host_asks_for_one() {
+    let workflow = DEPLOY_WORKFLOW.replace("host: app.example.com", "host: ${{ secrets.HOST }}");
+    let dir = workflow_repo("init-workflow-secret-host", &workflow);
+    let out = deliver()
+        .args(["init", "--path"])
+        .arg(&dir)
+        .args(["--from-workflow", ".github/workflows/deploy.yml"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("host: CHANGEME.example.com"), "{text}");
+    assert!(text.contains("pass --host"), "{text}");
+
+    let written = scaffold_and_validate(
+        &dir,
+        &[
+            "--from-workflow",
+            ".github/workflows/deploy.yml",
+            "--host",
+            "demo.example.com",
+        ],
+    );
+    assert!(written.contains("host: demo.example.com"), "{written}");
+    assert!(!written.contains("HOST"), "{written}");
+}
+
+#[test]
+fn init_from_a_missing_workflow_is_an_error_not_an_empty_config() {
+    let dir = tmpdir("init-workflow-missing");
+    let out = deliver()
+        .args(["init", "--write", "--path"])
+        .arg(&dir)
+        .args(["--from-workflow", ".github/workflows/nope.yml"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot read workflow"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join(".deliver.yml").exists());
+}
+
+#[test]
+fn init_from_workflow_turns_an_image_build_into_the_compose_service() {
+    let workflow = DEPLOY_WORKFLOW.replace(
+        "      - run: npm ci\n",
+        "      - run: npm ci\n      - uses: docker/build-push-action@v5\n        with: {push: true}\n",
+    );
+    let dir = workflow_repo("init-workflow-compose", &workflow);
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  api:\n    build: .\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+    let written = scaffold_and_validate(&dir, &["--from-workflow", ".github/workflows/deploy.yml"]);
+    assert!(written.contains("deployer: docker-compose"), "{written}");
+    assert!(written.contains("needs: [deploy]"), "{written}");
+
+    // Without a compose file there is nothing to build it from: reported.
+    let bare = workflow_repo("init-workflow-no-compose", &workflow);
+    let out = deliver()
+        .args(["init", "--path"])
+        .arg(&bare)
+        .args(["--from-workflow", ".github/workflows/deploy.yml"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(text.contains("3 steps I could not map"), "{text}");
+    assert!(text.contains("no compose file"), "{text}");
+}

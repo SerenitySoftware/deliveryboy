@@ -51,6 +51,10 @@ deliver deploy
 Schema (`deliver schema` prints it), so they complete and check it as you edit. Treat `.deliver.yml` as release code: it can run local commands,
 upload files, and run commands on remote hosts.
 
+Moving off GitHub Actions? `deliver init --from-workflow .github/workflows/deploy.yml`
+scaffolds the config from the workflow you already deploy with, and lists every
+step it could not map.
+
 ## What is live right now
 
 Every release-based deploy writes its own record on the target — the live path
