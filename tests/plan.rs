@@ -4932,7 +4932,6 @@ fn a_live_path_that_is_a_plain_directory_is_not_reported_as_a_release() {
 // `method: local` target too: a repo with real commits, and a target whose
 // history says an older one of them is live.
 
-#[cfg(unix)]
 fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .arg("-C")
