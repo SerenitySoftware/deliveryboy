@@ -89,7 +89,7 @@ Before the first step that changes anything, `deploy` takes an advisory lock on 
 
 ## `deliver status`
 
-Read back what is live on the target right now: the release the live symlink points at, when it was deployed and from which commit, how many releases are retained, and how many deploys are on record. Nothing is modified — it is one read per target.
+Read back what is live on the target right now: the release the live symlink points at, when it was deployed and from which commit, how many releases are retained, the newest Compose backup and how many there are, and how many deploys are on record. Nothing is modified — it is one read per target.
 
 ```bash
 deliver status

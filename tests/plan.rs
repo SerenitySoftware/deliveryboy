@@ -7309,3 +7309,208 @@ fn a_soak_the_loader_cannot_honour_is_a_config_error() {
         assert!(text.contains(expect), "{what}: {text}");
     }
 }
+
+// --- compose backup retention -----------------------------------------------
+
+const BACKUP_BLOCK: &str =
+    "      backup:\n        database: {service: db, user: demo, name: demo}\n        volumes: [media, media-thumbs]\n";
+
+/// The compiled prune step's command, from `plan --json`.
+fn prune_backups_command(dir: &std::path::Path) -> Option<String> {
+    let out = run_in(dir, &["plan", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json.as_array().unwrap()[0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["label"]
+                .as_str()
+                .unwrap()
+                .starts_with("prune old backups")
+        })
+        .map(|s| {
+            assert_eq!(s["cleanup"], true, "pruning must never fail a deploy: {s}");
+            s["kind"]["Ssh"]["command"].as_str().unwrap().to_string()
+        })
+}
+
+#[test]
+fn compose_backups_are_pruned_to_ten_of_each_kind_by_default() {
+    let dir = compose_repo("compose-backup-keep-default", BACKUP_BLOCK);
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(
+        text.contains("prune old backups (keep 10 of each)"),
+        "{text}"
+    );
+    // After the deploy's own work, as a cleanup step.
+    assert!(
+        text.find("record deploy").unwrap() < text.find("prune old backups").unwrap(),
+        "{text}"
+    );
+}
+
+#[test]
+fn backup_keep_sets_how_many_of_each_kind_survive() {
+    let extra = BACKUP_BLOCK.to_string() + "        keep: 3\n";
+    let dir = compose_repo("compose-backup-keep-3", &extra);
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(
+        text.contains("prune old backups (keep 3 of each)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_compose_service_without_a_backup_block_prunes_nothing() {
+    let dir = compose_repo("compose-backup-none", "");
+    assert_eq!(prune_backups_command(&dir), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_prune_keeps_the_newest_of_each_kind_and_touches_nothing_else() {
+    let extra = BACKUP_BLOCK.to_string() + "        keep: 2\n";
+    let dir = compose_repo("compose-backup-prune-run", &extra);
+    let command = prune_backups_command(&dir).expect("no prune step");
+
+    // Stand in for the target's backups directory.
+    let backups = std::path::PathBuf::from("/var/universal/demo/backups");
+    let fake = dir.join("fake-backups");
+    std::fs::create_dir_all(&fake).unwrap();
+    let stamps = ["20260101T000000Z", "20260201T000000Z", "20260301T000000Z"];
+    for stamp in stamps {
+        for name in [
+            format!("predeploy-{stamp}.dump"),
+            format!("media-{stamp}.tar.gz"),
+            format!("media-thumbs-{stamp}.tar.gz"),
+        ] {
+            std::fs::write(fake.join(name), "x").unwrap();
+        }
+    }
+    std::fs::write(fake.join("hand-made-notes.txt"), "keep me").unwrap();
+    // The fixture target deploys under sudo; this stand-in is ours to delete from.
+    let command = command
+        .replace(&backups.display().to_string(), &fake.display().to_string())
+        .replace("sudo ", "");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}\n{command}");
+
+    let mut left: Vec<String> = std::fs::read_dir(&fake)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            "hand-made-notes.txt",
+            "media-20260201T000000Z.tar.gz",
+            "media-20260301T000000Z.tar.gz",
+            "media-thumbs-20260201T000000Z.tar.gz",
+            "media-thumbs-20260301T000000Z.tar.gz",
+            "predeploy-20260201T000000Z.dump",
+            "predeploy-20260301T000000Z.dump",
+        ],
+        "{command}"
+    );
+}
+
+#[cfg(unix)]
+fn compose_status(name: &str, backup: &str, files: &[&str]) -> String {
+    let dir = tmpdir(name);
+    let root = dir.join("live");
+    std::fs::create_dir_all(root.join(".deliver")).unwrap();
+    std::fs::write(
+        root.join(".deliver/history.tsv"),
+        "7\t20260404-1100-ddd4444\tv1.0.0\tddd4444deadbeef00\t2026-04-04T11:00:00Z\n",
+    )
+    .unwrap();
+    if !files.is_empty() {
+        std::fs::create_dir_all(root.join("backups")).unwrap();
+        for file in files {
+            std::fs::write(root.join("backups").join(file), "x").unwrap();
+        }
+    }
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  web:\n    image: demo:latest\n",
+    )
+    .unwrap();
+    let cfg = write_config(
+        &dir,
+        &format!(
+            r#"
+version: 1
+app: readbackcompose
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  stack:
+    deployer: docker-compose
+    config:
+      files: [docker-compose.yml]
+{backup}
+"#,
+            root.display()
+        ),
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    text
+}
+
+#[cfg(unix)]
+#[test]
+fn status_names_the_newest_backup_and_the_count() {
+    let text = compose_status(
+        "readback-backups",
+        "      backup: {database: {service: db}, volumes: [media]}",
+        &[
+            "predeploy-20260301T000000Z.dump",
+            "media-20260401T000000Z.tar.gz",
+            "predeploy-20260401T000000Z.dump",
+        ],
+    );
+    assert!(text.contains("backups       3 file(s) in"), "{text}");
+    // Newest by stamp, not by name — and one deploy's backups share a stamp,
+    // so the tie goes to the name.
+    assert!(
+        text.contains("newest media-20260401T000000Z.tar.gz"),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn status_says_when_no_backup_has_been_taken_yet() {
+    let text = compose_status(
+        "readback-backups-none",
+        "      backup: {database: {service: db}}",
+        &[],
+    );
+    assert!(text.contains("backups       none yet in"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn status_says_nothing_about_backups_for_a_service_that_takes_none() {
+    let text = compose_status("readback-backups-off", "", &[]);
+    assert!(!text.contains("backups "), "{text}");
+}

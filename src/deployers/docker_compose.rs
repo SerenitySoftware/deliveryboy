@@ -443,11 +443,35 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     }
 
     // --- backup, before anything is replaced ---------------------------------
+    // Every backup is stamped, so each kind is pruned by name to the newest
+    // `keep` once the deploy has succeeded — the same shape as `keep_releases`.
+    // (absolute dir, keep, one glob per kind)
+    let mut backups: Option<(String, u64, Vec<String>)> = None;
     if let Some(backup) = cfg.get("backup") {
         let dir = backup
             .get("dir")
             .and_then(|v| v.as_str())
             .unwrap_or("backups");
+        let keep = backup
+            .get("keep")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .max(1);
+        let mut kinds = Vec::new();
+        if backup.get("database").is_some() {
+            kinds.push("predeploy-[0-9]*Z.dump".to_string());
+        }
+        for volume in string_list(backup.get("volumes")) {
+            // The stamp starts with a digit, so volume `app` never matches
+            // `app-media`'s archives.
+            kinds.push(format!("{volume}-[0-9]*Z.tar.gz"));
+        }
+        let absolute = if dir.starts_with('/') {
+            dir.to_string()
+        } else {
+            format!("{root}/{dir}")
+        };
+        backups = Some((absolute, keep, kinds));
         if let Some(db) = backup.get("database") {
             let service = db.get("service").and_then(|v| v.as_str()).unwrap_or("db");
             let user = db
@@ -685,6 +709,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             live_path: None,
             releases_dir: None,
             previous_marker: None,
+            backups_dir: backups.as_ref().map(|(dir, _, _)| dir.clone()),
         })
         // The same invocation that brought the project up, so `deliver logs`
         // cannot tail a different project than the one that was deployed.
@@ -703,6 +728,28 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             )
             .into_cleanup(),
         );
+    }
+    if let Some((dir, keep, kinds)) = &backups {
+        if !kinds.is_empty() {
+            steps.push(
+                PlannedStep::ssh(
+                    format!("prune old backups (keep {keep} of each)"),
+                    format!(
+                        "cd {dir} 2>/dev/null || exit 0; for kind in {kinds}; do \
+                           ls -1d -- $kind 2>/dev/null | sort -r | tail -n +{next} | xargs -r {sudo}rm -f; \
+                         done; echo \"kept newest {keep} of each\"",
+                        dir = crate::remote::shell_quote(dir),
+                        kinds = kinds
+                            .iter()
+                            .map(|k| format!("'{k}'"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        next = keep + 1,
+                    ),
+                )
+                .into_cleanup(),
+            );
+        }
     }
 
     Ok(steps)

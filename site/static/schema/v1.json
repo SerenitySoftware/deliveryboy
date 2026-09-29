@@ -368,7 +368,16 @@
         "images": { "description": "Several images to build and ship.", "type": "array", "items": { "type": "object" } },
         "include": { "description": "Extra files shipped with the Compose files.", "$ref": "#/definitions/stringList" },
         "env_file": { "description": "The `.env` rendered for the containers (path, literals, from_secrets).", "type": "object" },
-        "backup": { "description": "Database dump and volume archives taken before the deploy.", "type": "object" },
+        "backup": {
+          "description": "Database dump and volume archives taken before the deploy.",
+          "type": "object",
+          "properties": {
+            "database": { "description": "Dump this Compose service's Postgres database (service, user, name).", "type": "object" },
+            "volumes": { "description": "Named volumes archived before the deploy.", "$ref": "#/definitions/stringList" },
+            "dir": { "description": "Where backups land, relative to the target dir (default backups).", "type": "string" },
+            "keep": { "description": "How many of each kind of backup to keep after a successful deploy (default 10).", "type": "integer", "minimum": 1 }
+          }
+        },
         "infra": { "description": "Infrastructure services started (and waited on) first.", "type": "object" },
         "release": { "description": "One-off release commands (migrations) run before the swap.", "type": "object" },
         "remote_command": { "description": "Replace the default `up` command.", "type": "string" },

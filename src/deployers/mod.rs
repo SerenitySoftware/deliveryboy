@@ -79,6 +79,9 @@ pub struct ReleaseState {
     /// after swapping the live symlink somewhere else, the marker must name
     /// what *was* live, not what was live two rollbacks ago.
     pub previous_marker: Option<String>,
+    /// Where pre-deploy backups land, for a deployer that takes them, so
+    /// `deliver status` can say what there is to restore from.
+    pub backups_dir: Option<String>,
 }
 
 /// Where a service's runtime logs can be read on the target, carried alongside

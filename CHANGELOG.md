@@ -4,6 +4,13 @@
 
 ### Added
 
+- Compose backups are pruned. A `docker-compose` service with a `backup:` block
+  used to keep every pre-deploy database dump and volume archive forever; now
+  `backup.keep` (default 10) keeps the newest of each kind — the dump and each
+  volume counted separately — as a cleanup step after a successful deploy, so
+  it can never fail one and a failed deploy prunes nothing. `deliver status`
+  (and `status --json`) name the newest backup and the count.
+
 - A soak window on `verify:`. `soak: {for: 5m, every: 30s}` on a service keeps
   `deliver deploy` attached once every service has shipped and re-runs that
   service's checks on the schedule, printing a line per round. A check that

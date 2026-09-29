@@ -78,6 +78,11 @@ pub struct Status {
     /// Where the activate step records the outgoing release, carried through
     /// so `deliver rollback --to` can keep it honest after a targeted swap.
     pub previous_marker: Option<String>,
+    /// Pre-deploy backups on the target, newest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backups: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backups_dir: Option<String>,
 }
 
 impl Status {
@@ -230,7 +235,33 @@ fn probes_for(index: usize, state: &ReleaseState, sudo: &str) -> Vec<Probe> {
             ),
         });
     }
+    if let Some(backups) = &state.backups_dir {
+        probes.push(Probe {
+            key: format!("{index}:backups"),
+            snippet: format!(
+                "if [ -d {b} ]; then cd {b} && {sudo}ls -1 -- *.dump *.tar.gz; fi",
+                b = shell_quote(backups)
+            ),
+        });
+    }
     probes
+}
+
+/// Backup file names, newest first by the UTC stamp every backup carries
+/// (`predeploy-20260918T220521Z.dump`, `media-20260918T220521Z.tar.gz`) —
+/// not by name, since the kinds would otherwise sort by their prefix.
+pub fn sort_backups(text: &str) -> Vec<String> {
+    let stamp = |name: &str| -> String {
+        let stem = name.split('.').next().unwrap_or(name);
+        stem.rsplit('-').next().unwrap_or(stem).to_string()
+    };
+    let mut names: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    names.sort_by(|a, b| stamp(b).cmp(&stamp(a)).then_with(|| a.cmp(b)));
+    names
 }
 
 /// Parse `.deliver/history.tsv`, newest first.
@@ -351,6 +382,13 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                 live_path: request.state.live_path,
                 releases_dir: request.state.releases_dir,
                 previous_marker: request.state.previous_marker,
+                backups: request.state.backups_dir.as_ref().map(|_| {
+                    answer
+                        .get(&format!("{i}:backups"))
+                        .map(|text| sort_backups(text))
+                        .unwrap_or_default()
+                }),
+                backups_dir: request.state.backups_dir,
             }
         })
         .collect()
@@ -417,6 +455,19 @@ pub fn render_status(statuses: &[Status]) -> String {
                 "    retained      {} release(s)\n",
                 status.releases.len()
             ));
+        }
+        if let Some(backups) = &status.backups {
+            match backups.first() {
+                Some(newest) => out.push_str(&format!(
+                    "    backups       {} file(s) in {} · newest {newest}\n",
+                    backups.len(),
+                    status.backups_dir.as_deref().unwrap_or_default()
+                )),
+                None => out.push_str(&format!(
+                    "    backups       none yet in {}\n",
+                    status.backups_dir.as_deref().unwrap_or_default()
+                )),
+            }
         }
         out.push_str(&format!(
             "    history       {} deploy(s) recorded\n\n",
@@ -497,7 +548,25 @@ mod tests {
             live_path: Some("/var/app/web".into()),
             releases_dir: Some("/var/app/releases".into()),
             previous_marker: Some("/var/app/releases/.deliver-previous".into()),
+            backups_dir: None,
         }
+    }
+
+    #[test]
+    fn backups_sort_newest_first_by_stamp_not_by_name() {
+        let listed = "media-20260401T000000Z.tar.gz\n\
+                      media-thumbs-20260101T000000Z.tar.gz\n\
+                      predeploy-20260301T000000Z.dump\n\
+                      predeploy-20260501T000000Z.dump\n";
+        assert_eq!(
+            sort_backups(listed),
+            vec![
+                "predeploy-20260501T000000Z.dump",
+                "media-20260401T000000Z.tar.gz",
+                "predeploy-20260301T000000Z.dump",
+                "media-thumbs-20260101T000000Z.tar.gz",
+            ]
+        );
     }
 
     #[test]
@@ -573,6 +642,8 @@ mod tests {
             live_path: state().live_path,
             releases_dir: state().releases_dir,
             previous_marker: state().previous_marker,
+            backups: None,
+            backups_dir: None,
         };
         assert_eq!(status.live_deploy_id().as_deref(), Some("20260202-b"));
         assert_eq!(status.live_deploy().unwrap().release, "v0.2.0");
@@ -601,6 +672,8 @@ mod tests {
             live_path: state().live_path,
             releases_dir: state().releases_dir,
             previous_marker: state().previous_marker,
+            backups: None,
+            backups_dir: None,
         };
         let text = render_status(&[status]);
         assert!(text.contains("unknown release · 20260303-c"), "{text}");
@@ -621,6 +694,8 @@ mod tests {
             live_path: state().live_path,
             releases_dir: state().releases_dir,
             previous_marker: state().previous_marker,
+            backups: None,
+            backups_dir: None,
         };
         let text = render_status(&[status]);
         assert!(text.contains("could not read the target"), "{text}");
@@ -641,6 +716,8 @@ mod tests {
             live_path: None,
             releases_dir: None,
             previous_marker: None,
+            backups: None,
+            backups_dir: None,
         };
         assert!(!status.live_is_recorded());
         let text = render_status(&[status]);

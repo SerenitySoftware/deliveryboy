@@ -270,6 +270,8 @@ mod tests {
             live_path: Some("/var/app/web".into()),
             releases_dir: Some("/var/app/releases".into()),
             previous_marker: Some("/var/app/releases/.deliver-previous".into()),
+            backups: None,
+            backups_dir: None,
         }
     }
 

@@ -265,6 +265,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             live_path: Some(live.clone()),
             releases_dir: Some(releases.clone()),
             previous_marker: Some(prev_marker.clone()),
+            backups_dir: None,
         }),
     );
 
