@@ -139,6 +139,31 @@ verify:
       interval: 5
 ```
 
+### Soak
+
+A check that passes the moment a release goes live proves it started, not that
+it stays up. A container that answers one probe and dies ninety seconds later
+on a missing env var, a failed migration or an out-of-memory kill has already
+been reported as a good deploy. `soak:` keeps `deliver deploy` attached after
+every service has shipped and re-runs the service's checks on a schedule:
+
+```yaml
+services:
+  api:
+    deployer: docker-compose
+    verify:
+      - http: {url: https://api.example.com/health}
+    soak: {for: 5m, every: 30s}
+```
+
+Each round prints a pass line. A check that fails inside the window fails the
+release and rolls back reversible steps, exactly as a check that failed on
+arrival does, and the release is not tagged. Durations are seconds or a number
+followed by `s`, `m` or `h`. `soak:` needs at least one `verify:` check, and
+`every` cannot be longer than `for`. There is no soak unless a service asks for
+one; `deliver deploy --no-soak` skips every window for a scripted run, and
+`deliver verify` never soaks.
+
 A check is the only thing that can roll a bad release back on its own, so
 `deliver init` scaffolds one for every deployer it writes, built from what it
 was actually told: the site root on the `--host` it was given for `hugo` and

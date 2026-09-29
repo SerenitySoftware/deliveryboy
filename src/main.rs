@@ -140,6 +140,9 @@ enum Commands {
         /// Take the target's deploy lock even if another run holds it
         #[arg(long)]
         force: bool,
+        /// Skip every service's `soak:` window (the checks still run once)
+        #[arg(long)]
+        no_soak: bool,
     },
     /// Run only the verify checks
     Verify {
@@ -267,6 +270,7 @@ fn run(cli: &Cli) -> Result<i32> {
             yes,
             version,
             force,
+            no_soak,
         } => cmd_deploy(
             cli.config.as_deref(),
             service,
@@ -275,6 +279,7 @@ fn run(cli: &Cli) -> Result<i32> {
             *yes,
             version.as_deref(),
             *force,
+            *no_soak,
         ),
         Commands::Verify { service } => cmd_deploy(
             cli.config.as_deref(),
@@ -284,6 +289,7 @@ fn run(cli: &Cli) -> Result<i32> {
             true,
             None,
             false,
+            true,
         ),
         Commands::Status { service, json } => {
             cmd_readback(cli.config.as_deref(), service, Readback::Status, *json)
@@ -1206,6 +1212,7 @@ fn shipping_approved(
     Ok(prompt_yes_no(&question)?.unwrap_or(true))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_deploy(
     explicit: Option<&Path>,
     only: &[String],
@@ -1214,6 +1221,7 @@ fn cmd_deploy(
     assume_yes: bool,
     version_arg: Option<&str>,
     force_lock: bool,
+    no_soak: bool,
 ) -> Result<i32> {
     ui::banner();
     let timer = ui::Timer::start();
@@ -1257,6 +1265,13 @@ fn cmd_deploy(
         return Ok(0);
     };
     let mut plan = compile_announced(&config, only, &root, &v)?;
+    // `--no-soak` for a scripted run; and `verify` always, since it checks
+    // what is live once rather than watching a release it just shipped.
+    if no_soak {
+        for sp in plan.iter_mut() {
+            sp.soak = None;
+        }
+    }
 
     if verify_only {
         for sp in plan.iter_mut() {
@@ -1842,7 +1857,7 @@ fn cmd_fleet(
                 yes,
                 force,
                 ..
-            } => cmd_deploy(None, service, *dry_run, false, *yes, None, *force),
+            } => cmd_deploy(None, service, *dry_run, false, *yes, None, *force, false),
             FleetAction::Status { service } => cmd_readback(None, service, Readback::Status, false),
         });
         if !outcome.ok() && stop_on_failure {

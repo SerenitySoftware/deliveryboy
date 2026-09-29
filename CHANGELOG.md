@@ -4,6 +4,17 @@
 
 ### Added
 
+- A soak window on `verify:`. `soak: {for: 5m, every: 30s}` on a service keeps
+  `deliver deploy` attached once every service has shipped and re-runs that
+  service's checks on the schedule, printing a line per round. A check that
+  fails inside the window fails the release and unwinds through the same
+  rollback as a check that failed on arrival, and the release is not tagged —
+  so the container that answers one probe and dies ninety seconds later is a
+  failed deploy rather than a green one. `deploy --no-soak` skips every window;
+  `deliver verify` never soaks; `deliver plan` and `plan --json` show the
+  window, and a dry run describes it without waiting. Off unless a service asks
+  for it.
+
 - `deliver init --from-workflow <path>` scaffolds `.deliver.yml` from a GitHub
   Actions workflow: jobs become `commands` services, `run:` steps become
   `command:` steps, an `appleboy/ssh-action` script becomes an `ssh:` step and

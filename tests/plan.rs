@@ -7097,3 +7097,215 @@ fn init_from_workflow_turns_an_image_build_into_the_compose_service() {
     assert!(text.contains("3 steps I could not map"), "{text}");
     assert!(text.contains("no compose file"), "{text}");
 }
+
+// --- soak window ------------------------------------------------------------
+//
+// A `commands` service on a `method: local` target, whose one verify check
+// passes the first `passes` times it runs and fails after that — the release
+// that answers its first probe and dies a minute later.
+
+fn soak_repo(name: &str, passes: u32, soak: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = tmpdir(name);
+    let dest = dir.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let counter = std::env::temp_dir().join(format!("deliver-test-{name}-probes"));
+    let _ = std::fs::remove_file(&counter);
+    let check = format!(
+        "n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; [ $n -le {passes} ]",
+        c = counter.display()
+    );
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+versioning:
+  tag: {{enabled: true}}
+defaults: {{target: local}}
+targets:
+  local: {{method: local, dir: {dest}}}
+services:
+  api:
+    deployer: commands
+    config: {{steps: [{{ssh: "true"}}]}}
+    verify: [{{remote_command: {check:?}}}]
+    {soak}
+"#,
+            dest = dest.display(),
+        ),
+    )
+    .unwrap();
+    // Untagged HEAD, so `--version` names the release and a success tags it.
+    git_init_tagged(&dir, "scratch");
+    git_in(&dir, &["tag", "-d", "scratch"]);
+    (dir, counter)
+}
+
+fn probes(counter: &std::path::Path) -> u32 {
+    std::fs::read_to_string(counter)
+        .map(|s| s.trim().parse().unwrap())
+        .unwrap_or(0)
+}
+
+fn output_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn soak_fails_a_release_that_stops_passing_after_it_went_live() {
+    // Passes on arrival, fails on the second soak round.
+    let (dir, counter) = soak_repo("soak-dies", 2, "soak: {for: 3s, every: 1s}");
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("round 1/3: ✓ 1 check(s)"), "{text}");
+    assert!(text.contains("✗ soak failed at"), "{text}");
+    assert!(text.contains("round 2/3"), "{text}");
+    assert!(
+        text.contains("api passed its checks when it went live, then stopped passing"),
+        "{text}"
+    );
+    // The unwind ran, and nothing downstream of a failed release did.
+    assert!(text.contains("nothing to roll back"), "{text}");
+    assert!(
+        !tag_exists(&dir, "v2.0.0"),
+        "a failed soak must not tag:\n{text}"
+    );
+    assert_eq!(probes(&counter), 3, "{text}");
+}
+
+#[test]
+fn soak_passes_when_every_round_holds() {
+    let (dir, counter) = soak_repo("soak-holds", 99, "soak: {for: 2s, every: 1s}");
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("round 2/2: ✓ 1 check(s)"), "{text}");
+    assert!(text.contains("✓ soak: every check held for 2s"), "{text}");
+    assert!(tag_exists(&dir, "v2.0.0"), "{text}");
+    // Once on arrival, then once per round.
+    assert_eq!(probes(&counter), 3, "{text}");
+}
+
+#[test]
+fn no_soak_runs_the_checks_once_and_skips_the_window() {
+    let (dir, counter) = soak_repo("soak-skipped", 1, "soak: {for: 1h, every: 30s}");
+    let started = std::time::Instant::now();
+    let out = run_in(&dir, &["deploy", "--version", "2.0.0", "--no-soak"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("re-running verify checks"), "{text}");
+    assert!(
+        started.elapsed().as_secs() < 60,
+        "--no-soak waited:\n{text}"
+    );
+    assert!(tag_exists(&dir, "v2.0.0"), "{text}");
+    assert_eq!(probes(&counter), 1, "{text}");
+}
+
+#[test]
+fn dry_run_describes_the_soak_without_waiting_for_it() {
+    let (dir, counter) = soak_repo("soak-dry", 1, "soak: {for: 1h, every: 30s}");
+    let started = std::time::Instant::now();
+    let out = run_in(&dir, &["deploy", "--dry-run", "--version", "2.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("soak: re-running verify checks for 1h"),
+        "{text}"
+    );
+    assert!(text.contains("1 check(s) every 30s for 1h"), "{text}");
+    assert!(
+        started.elapsed().as_secs() < 60,
+        "the dry run waited:\n{text}"
+    );
+    assert_eq!(probes(&counter), 0, "{text}");
+}
+
+#[test]
+fn plan_shows_the_soak_window_and_json_carries_it() {
+    let (dir, _) = soak_repo("soak-plan", 1, "soak: {for: 5m, every: 90}");
+    let out = run_in(&dir, &["plan", "--version", "2.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("soak: re-run 1 verify check(s) every 1m30s for 5m once live"),
+        "{text}"
+    );
+    let out = run_in(&dir, &["plan", "--version", "2.0.0", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let soak = &json.as_array().unwrap()[0]["soak"];
+    assert_eq!(soak["for"], 300, "{json}");
+    assert_eq!(soak["every"], 90, "{json}");
+    assert_eq!(soak["checks"].as_array().unwrap().len(), 1, "{json}");
+}
+
+#[test]
+fn verify_never_soaks() {
+    let (dir, counter) = soak_repo("soak-verify", 1, "soak: {for: 1h, every: 30s}");
+    git_in(&dir, &["tag", "v1.0.0"]);
+    let out = run_in(&dir, &["verify"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("re-running verify checks"), "{text}");
+    assert_eq!(probes(&counter), 1, "{text}");
+}
+
+#[test]
+fn a_soak_the_loader_cannot_honour_is_a_config_error() {
+    let cases = [
+        (
+            "no verify checks",
+            "soak: {for: 5m, every: 30s}",
+            true,
+            "there are none",
+        ),
+        (
+            "every longer than for",
+            "soak: {for: 30s, every: 5m}",
+            false,
+            "longer than `soak.for`",
+        ),
+        (
+            "a zero window",
+            "soak: {for: 0s, every: 0s}",
+            false,
+            "above zero",
+        ),
+        (
+            "an unknown unit",
+            "soak: {for: 5x, every: 30s}",
+            false,
+            "invalid duration",
+        ),
+        ("a missing interval", "soak: {for: 5m}", false, "every"),
+        (
+            "an unknown key",
+            "soak: {for: 5m, every: 30s, grace: 1m}",
+            false,
+            "grace",
+        ),
+    ];
+    for (what, soak, strip_verify, expect) in cases {
+        let (dir, _) = soak_repo("soak-invalid", 1, soak);
+        if strip_verify {
+            let cfg = dir.join(".deliver.yml");
+            let body = std::fs::read_to_string(&cfg).unwrap();
+            let body: String = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("verify:"))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            std::fs::write(&cfg, body).unwrap();
+        }
+        let out = run_in(&dir, &["validate"]);
+        let text = output_text(&out);
+        assert_eq!(out.status.code(), Some(2), "{what}: {text}");
+        assert!(text.contains(expect), "{what}: {text}");
+    }
+}

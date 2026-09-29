@@ -523,6 +523,7 @@ mod tests {
             host: host.into(),
             steps: Vec::new(),
             after_tag: false,
+            soak: None,
         };
         let plan = vec![
             sp("web", "box", "a"),

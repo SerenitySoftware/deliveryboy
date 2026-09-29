@@ -232,6 +232,23 @@
         { "required": ["contains"] }
       ]
     },
+    "span": {
+      "description": "A length of time: whole seconds, or a number followed by s, m or h (90, 90s, 5m, 1h).",
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "string", "pattern": "^\\s*[0-9]+(s|m|h)?\\s*$" }
+      ]
+    },
+    "soak": {
+      "description": "After the release is live, keep re-running this service's verify checks every so often for so long; a failure inside the window rolls the release back. `deliver deploy --no-soak` skips it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["for", "every"],
+      "properties": {
+        "for": { "description": "How long the window lasts (e.g. 5m).", "$ref": "#/definitions/span" },
+        "every": { "description": "How often the checks re-run inside it (e.g. 30s).", "$ref": "#/definitions/span" }
+      }
+    },
     "logs": {
       "description": "Where this service's runtime logs are, for `deliver logs`. Set exactly one of unit, files or command.",
       "type": "object",
@@ -274,6 +291,7 @@
         "after": { "description": "Alias of `post`.", "type": "array", "items": { "$ref": "#/definitions/rawStep" } },
         "config": { "description": "Deployer-specific settings.", "type": "object" },
         "verify": { "type": "array", "items": { "$ref": "#/definitions/verifyCheck" } },
+        "soak": { "$ref": "#/definitions/soak" },
         "logs": { "$ref": "#/definitions/logs" }
       },
       "allOf": [

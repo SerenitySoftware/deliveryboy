@@ -5,9 +5,9 @@
 //! so a failed deploy doesn't leave a half-changed target. Later services never
 //! start after a failure.
 
-use crate::config::Target;
+use crate::config::{Span, Target};
 use crate::deployers::{PlannedStep, StepKind};
-use crate::plan::ServicePlan;
+use crate::plan::{ServicePlan, Soak};
 use crate::secrets::redact::scrub;
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -213,11 +213,113 @@ pub fn execute(
         }
         println!();
     }
+
+    // Every service is live; the undo stack is still whole, so a check that
+    // stops passing inside the window unwinds exactly as one that never passed.
+    if let Some(failed) = soak(plan, targets, dry_run)? {
+        let rolled_back = if dry_run { 0 } else { unwind(undoable) };
+        return Ok(Outcome {
+            ok: false,
+            rolled_back,
+            failed_step: Some(failed),
+        });
+    }
     Ok(Outcome {
         ok: true,
         rolled_back: 0,
         failed_step: None,
     })
+}
+
+/// When each soaking service's checks re-run, as seconds after the window
+/// opens: `every`, `2 × every`, … up to `for`. Services interleave by time.
+fn soak_schedule(soaking: &[(&ServicePlan, &Soak)]) -> Vec<(u64, usize, u64, u64)> {
+    // (at, which service, round, of rounds)
+    let mut events = Vec::new();
+    for (i, (_, soak)) in soaking.iter().enumerate() {
+        let rounds = soak.duration.0 / soak.every.0;
+        for round in 1..=rounds {
+            events.push((round * soak.every.0, i, round, rounds));
+        }
+    }
+    events.sort();
+    events
+}
+
+/// Re-run the verify checks of every service that has a soak window, on each
+/// one's own schedule, once the whole release has shipped. Returns the check
+/// that failed — scrubbed, since it travels on into the failure notice.
+fn soak(
+    plan: &[ServicePlan],
+    targets: &BTreeMap<String, Target>,
+    dry_run: bool,
+) -> Result<Option<String>> {
+    let soaking: Vec<(&ServicePlan, &Soak)> = plan
+        .iter()
+        .filter_map(|sp| sp.soak.as_ref().map(|soak| (sp, soak)))
+        .collect();
+    let Some(window) = soaking.iter().map(|(_, soak)| soak.duration.0).max() else {
+        return Ok(None);
+    };
+    println!(
+        "  • soak: re-running verify checks for {} before the release counts as done",
+        Span(window)
+    );
+    if dry_run {
+        for (sp, soak) in &soaking {
+            println!(
+                "    {} [{}]: {} check(s) every {} for {}",
+                sp.service,
+                sp.host,
+                soak.checks.len(),
+                soak.every,
+                soak.duration
+            );
+        }
+        println!("        (dry-run, not executed)\n");
+        return Ok(None);
+    }
+
+    let start = std::time::Instant::now();
+    for (at, i, round, rounds) in soak_schedule(&soaking) {
+        let due = std::time::Duration::from_secs(at);
+        if let Some(wait) = due.checked_sub(start.elapsed()) {
+            std::thread::sleep(wait);
+        }
+        let (sp, soak) = soaking[i];
+        let target = &targets[&sp.target];
+        for check in &soak.checks {
+            if !run_step(check, target, &sp.host, false)? {
+                // A `remote_command` check's label already is its command.
+                let detail = check.detail();
+                let detail = if check.label.ends_with(&detail) {
+                    String::new()
+                } else {
+                    format!(" ({})", scrub(&detail))
+                };
+                eprintln!(
+                    "\n✗ soak failed at {} of {}, round {round}/{rounds}: {}{detail}",
+                    Span(start.elapsed().as_secs()),
+                    Span(window),
+                    scrub(&check.label),
+                );
+                eprintln!(
+                    "  {} passed its checks when it went live, then stopped passing.",
+                    sp.service
+                );
+                return Ok(Some(scrub(&format!("soak: {}", check.label))));
+            }
+        }
+        println!(
+            "    {:>6} {} [{}] round {round}/{rounds}: ✓ {} check(s)",
+            Span(at).to_string(),
+            sp.service,
+            sp.host,
+            soak.checks.len()
+        );
+    }
+    println!("  ✓ soak: every check held for {}\n", Span(window));
+    Ok(None)
 }
 
 /// `deliver rollback` — repoint each service's live symlink at its previous

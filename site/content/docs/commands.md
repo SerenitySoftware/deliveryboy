@@ -83,6 +83,8 @@ deliver deploy --version 1.2.3
 
 After preflight, `deploy` reads what each target has live and lists the commits it is about to ship — `git log <live>..HEAD`, from the sha the last deploy recorded — and a tag found on `HEAD` is confirmed with that range in the question: `Deploy release v1.2.3 (abc1234), shipping 7 commit(s) since live v1.2.2 (def4567)?`. It also says when a deploy re-ships the live commit or moves the target backwards. The range covers the services that keep a deploy record (`files`, `hugo`, `docker-compose`); a dry run reads only `method: local` targets, as it skips remote reachability in preflight. An unreadable target or a live commit this clone does not have is reported, never fatal.
 
+A service with a [`soak:`](../configuration/#soak) window keeps `deploy` attached after the release is live, re-running its checks until the window closes; a failure inside it rolls back like any failed check. `--no-soak` skips the windows (the checks still run once).
+
 Before the first step that changes anything, `deploy` takes an advisory lock on each target and refuses if another run holds it (exit code `2`, nothing built or shipped). `--force` takes the lock anyway. A dry run takes no lock. See [Safety](../safety/).
 
 ## `deliver status`

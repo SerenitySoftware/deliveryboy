@@ -405,6 +405,9 @@ pub struct Service {
     pub config: serde_yaml::Value,
     #[serde(default)]
     pub verify: Vec<serde_yaml::Value>,
+    /// Keep re-running `verify` for a while after the release is live.
+    #[serde(default)]
+    pub soak: Option<SoakConfig>,
     /// Where this service's runtime logs are, when the deployer cannot say.
     #[serde(default)]
     pub logs: Option<LogsConfig>,
@@ -412,6 +415,106 @@ pub struct Service {
 
 fn default_true() -> bool {
     true
+}
+
+/// A soak window: after the release is live, `deliver deploy` stays attached
+/// and re-runs the service's `verify` checks `every` so often `for` so long.
+/// A release that answers one probe and dies ninety seconds later — a missing
+/// env var, a failed migration, an OOM — fails inside the window and unwinds
+/// like any other failed check, instead of after `deliver` has exited zero.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoakConfig {
+    /// How long the window lasts.
+    #[serde(rename = "for")]
+    pub duration: Span,
+    /// How often the checks re-run inside it.
+    pub every: Span,
+}
+
+impl SoakConfig {
+    fn validate(&self, service: &str, checks: usize) -> Result<()> {
+        if checks == 0 {
+            bail!("service '{service}': `soak:` re-runs the `verify:` checks, and there are none");
+        }
+        if self.duration.0 == 0 || self.every.0 == 0 {
+            bail!("service '{service}': `soak:` needs a `for:` and an `every:` above zero");
+        }
+        if self.every.0 > self.duration.0 {
+            bail!(
+                "service '{service}': `soak.every` ({}) is longer than `soak.for` ({}), so the checks would never re-run",
+                self.every,
+                self.duration
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A length of time in whole seconds, written as `90`, `90s`, `5m` or `1h`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span(pub u64);
+
+impl Span {
+    pub fn parse(text: &str) -> Result<Span> {
+        let text = text.trim();
+        let (digits, unit) = text.split_at(
+            text.find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(text.len()),
+        );
+        let scale = match unit {
+            "" | "s" => 1,
+            "m" => 60,
+            "h" => 3600,
+            _ => {
+                bail!("invalid duration {text:?} (use seconds, or a number followed by s, m or h)")
+            }
+        };
+        let n: u64 = digits.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid duration {text:?} (use seconds, or a number followed by s, m or h)"
+            )
+        })?;
+        Ok(Span(n * scale))
+    }
+}
+
+impl std::fmt::Display for Span {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (h, m, s) = (self.0 / 3600, self.0 % 3600 / 60, self.0 % 60);
+        let mut out = String::new();
+        if h > 0 {
+            out.push_str(&format!("{h}h"));
+        }
+        if m > 0 {
+            out.push_str(&format!("{m}m"));
+        }
+        if s > 0 || out.is_empty() {
+            out.push_str(&format!("{s}s"));
+        }
+        f.write_str(&out)
+    }
+}
+
+impl<'de> Deserialize<'de> for Span {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Seconds(u64),
+            Text(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Seconds(n) => Ok(Span(n)),
+            Raw::Text(text) => Span::parse(&text).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl Serialize for Span {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_u64(self.0)
+    }
 }
 
 /// Tag the commit that shipped, so "what's live?" is answerable from git alone.
@@ -558,6 +661,9 @@ pub fn load(path: &Path) -> Result<Config> {
         }
         if let Some(logs) = &service.logs {
             logs.validate(name)?;
+        }
+        if let Some(soak) = &service.soak {
+            soak.validate(name, service.verify.len())?;
         }
     }
     if let Some(versioning) = &config.versioning {
@@ -773,6 +879,7 @@ services:
     post: [{ssh: "true"}]
     config: {src: dist}
     verify: [{http: {url: "https://app.example.com/"}}]
+    soak: {for: 5m, every: 30s}
     logs: {unit: web.service}
   worker:
     deployer: commands

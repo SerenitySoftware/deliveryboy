@@ -1,6 +1,6 @@
 //! Compile a config into an ordered plan (topological by `needs`) and render it.
 
-use crate::config::{Config, Service};
+use crate::config::{Config, Service, Span};
 use crate::deployers::{compile_service, PlanContext, PlannedStep};
 use anyhow::{bail, Result};
 use serde::Serialize;
@@ -16,6 +16,19 @@ pub struct ServicePlan {
     /// These steps run after Delivery Boy creates and pushes the release tag.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub after_tag: bool,
+    /// Re-run the service's verify checks for a while once the release is live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soak: Option<Soak>,
+}
+
+/// A service's soak window, compiled: its verify checks, and the schedule the
+/// executor re-runs them on after every service has shipped.
+#[derive(Debug, Serialize)]
+pub struct Soak {
+    #[serde(rename = "for")]
+    pub duration: Span,
+    pub every: Span,
+    pub checks: Vec<PlannedStep>,
 }
 
 /// Kahn's algorithm over `needs`; errors on cycles.
@@ -159,13 +172,28 @@ pub fn compile(
                 repo_root: repo_root.to_path_buf(),
                 version: version.clone(),
             };
-            match compile_service(config, service, &ctx) {
-                Ok(steps) => compiled_hosts.push(ServicePlan {
+            match compile_service(config, service, &ctx).and_then(|steps| {
+                let soak = match &service.soak {
+                    Some(window) => Some(Soak {
+                        duration: window.duration,
+                        every: window.every,
+                        checks: service
+                            .verify
+                            .iter()
+                            .map(|check| crate::verify::compile(check, &ctx))
+                            .collect::<Result<_>>()?,
+                    }),
+                    None => None,
+                };
+                Ok((steps, soak))
+            }) {
+                Ok((steps, soak)) => compiled_hosts.push(ServicePlan {
                     service: name.clone(),
                     target: target_name.clone(),
                     host,
                     steps,
                     after_tag: false,
+                    soak,
                 }),
                 Err(e) => {
                     failed = Some(format!("service '{name}': {e}"));
@@ -224,6 +252,7 @@ pub fn compile(
                     host,
                     steps,
                     after_tag: true,
+                    soak: None,
                 });
             }
         }
@@ -252,6 +281,14 @@ pub fn render(plan: &[ServicePlan]) -> String {
                 "  {:>2}. [{}] {label}{suffix}\n",
                 i + 1,
                 step.type_name()
+            ));
+        }
+        if let Some(soak) = &sp.soak {
+            out.push_str(&format!(
+                "  soak: re-run {} verify check(s) every {} for {} once live\n",
+                soak.checks.len(),
+                soak.every,
+                soak.duration
             ));
         }
         out.push('\n');
