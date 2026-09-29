@@ -7108,11 +7108,12 @@ fn soak_repo(name: &str, passes: u32, soak: &str) -> (std::path::PathBuf, std::p
     let dir = tmpdir(name);
     let dest = dir.join("dest");
     std::fs::create_dir_all(&dest).unwrap();
-    let counter = std::env::temp_dir().join(format!("deliver-test-{name}-probes"));
-    let _ = std::fs::remove_file(&counter);
+    // Relative, so the command is the same on every platform: a local
+    // "remote" step runs in the directory `deliver` was started from.
+    let counter = dir.join("probes");
+    std::fs::write(dir.join(".gitignore"), "probes\n").unwrap();
     let check = format!(
-        "n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; [ $n -le {passes} ]",
-        c = counter.display()
+        "n=$(cat probes 2>/dev/null || echo 0); n=$((n+1)); echo $n > probes; [ $n -le {passes} ]"
     );
     std::fs::write(
         dir.join(".deliver.yml"),
