@@ -7606,6 +7606,32 @@ fn unknown_target_is_a_config_error_naming_the_real_ones() {
 }
 
 #[test]
+fn dry_run_with_target_walks_the_selected_target() {
+    let dir = two_target_repo("target-dry-run");
+    git_init_tagged(&dir, "v1.0.0");
+    let out = run_in(
+        &dir,
+        &[
+            "deploy",
+            "--dry-run",
+            "--yes",
+            "--service",
+            "ship",
+            "--target",
+            "staging",
+        ],
+    );
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("ship → staging [localhost]"), "{text}");
+    assert!(!text.contains("production/"), "{text}");
+}
+
+/// A real local deploy, so the files land where the test can look; like the
+/// other real `method: local` deploys here, it runs where `sh` takes the
+/// target path verbatim.
+#[cfg(unix)]
+#[test]
 fn deploy_with_target_ships_there_and_leaves_the_default_alone() {
     let dir = two_target_repo("target-deploy");
     git_init_tagged(&dir, "v1.0.0");
