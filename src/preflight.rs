@@ -177,6 +177,15 @@ fn input_files(config: &Config, repo_root: &Path) -> Vec<(String, bool)> {
                 checks.push((path.to_string(), full.exists()));
             }
         }
+        // The Compose files are the one input that deployer hangs on, and
+        // without this a misspelled one is found only at `scp`, after the
+        // image build.
+        if service.deployer == "docker-compose" {
+            for rel in crate::deployers::docker_compose::input_files(&service.config) {
+                let exists = repo_root.join(&rel).exists();
+                checks.push((rel, exists));
+            }
+        }
         if let Some(vhosts) = service.config.get("vhosts").and_then(|v| v.as_sequence()) {
             for vh in vhosts {
                 if let Some(rel) = vh.get("conf").and_then(|v| v.as_str()) {

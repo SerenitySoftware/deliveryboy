@@ -178,13 +178,26 @@ fn builds_image(cfg: &Value, ctx: &PlanContext, files: &[String], tag: &str) -> 
     false
 }
 
-pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
+/// The Compose files, in `-f` order (`docker-compose.yml` when unset).
+fn compose_files(cfg: &Value) -> Vec<String> {
     let files = string_list(cfg.get("files"));
-    let files = if files.is_empty() {
+    if files.is_empty() {
         vec!["docker-compose.yml".to_string()]
     } else {
         files
-    };
+    }
+}
+
+/// Every repo file this deployer ships as-is — the Compose files and each
+/// `include:` — so preflight can check them before anything is built.
+pub fn input_files(cfg: &Value) -> Vec<String> {
+    let mut files = compose_files(cfg);
+    files.extend(string_list(cfg.get("include")));
+    files
+}
+
+pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
+    let files = compose_files(cfg);
     let project = cfg_str(cfg, "project").unwrap_or_else(|| ctx.app.clone());
     let root = ctx.target.dir.trim_end_matches('/').to_string();
     let sudo = ctx.sudo_prefix();

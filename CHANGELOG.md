@@ -13,6 +13,11 @@
   `deploy`, `verify`, `status`, `history`, `logs` and `rollback`; `fleet`
   refuses it.
 
+- Preflight checks a `docker-compose` service's Compose files (`files:`, or
+  `docker-compose.yml` when unset) and each `include:` exist in the repo, so a
+  misspelled `docker-compose.prod.yml` stops the run in seconds instead of at
+  `scp`, after the image build.
+
 - Compose backups are pruned. A `docker-compose` service with a `backup:` block
   used to keep every pre-deploy database dump and volume archive forever; now
   `backup.keep` (default 10) keeps the newest of each kind — the dump and each

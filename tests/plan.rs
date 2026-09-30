@@ -7699,3 +7699,39 @@ fn fleet_refuses_target() {
         output_text(&out)
     );
 }
+
+#[test]
+fn preflight_catches_a_missing_compose_file_before_the_build() {
+    let dir = compose_repo("compose-files-missing", "");
+    std::fs::remove_file(dir.join("docker-compose.prod.yml")).unwrap();
+    let out = run_in(&dir, &["deploy", "--dry-run", "--yes"]);
+    let text = output_text(&out);
+    assert!(
+        text.contains("missing file referenced by config: docker-compose.prod.yml"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("docker build"),
+        "stopped before the build: {text}"
+    );
+    assert_ne!(out.status.code(), Some(0), "{text}");
+}
+
+#[test]
+fn preflight_checks_the_default_compose_file_and_includes() {
+    let dir = compose_repo("compose-files-default", "      include: [nats/nats.conf]");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "      files: [docker-compose.yml, docker-compose.prod.yml]\n",
+        "",
+    );
+    std::fs::write(&cfg, body).unwrap();
+    std::fs::remove_file(dir.join("docker-compose.yml")).unwrap();
+    let text = output_text(&run_in(&dir, &["preflight"]));
+    for missing in ["docker-compose.yml", "nats/nats.conf"] {
+        assert!(
+            text.contains(&format!("missing file referenced by config: {missing}")),
+            "{missing}: {text}"
+        );
+    }
+}
