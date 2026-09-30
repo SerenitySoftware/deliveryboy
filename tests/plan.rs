@@ -7554,18 +7554,10 @@ services:
     dir
 }
 
-fn both(out: &std::process::Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
-}
-
 #[test]
 fn target_flag_moves_unpinned_services_and_says_which_stay() {
     let dir = two_target_repo("target-plan");
-    let text = both(&run_in(&dir, &["plan", "--target", "staging"]));
+    let text = output_text(&run_in(&dir, &["plan", "--target", "staging"]));
     assert!(text.contains("target: staging (--target)"), "{text}");
     assert!(text.contains("▸ ship  → staging"), "{text}");
     assert!(text.contains("▸ docs  → pinned"), "{text}");
@@ -7575,7 +7567,7 @@ fn target_flag_moves_unpinned_services_and_says_which_stay() {
     );
 
     // Without the flag the file's default still decides.
-    let text = both(&run_in(&dir, &["plan"]));
+    let text = output_text(&run_in(&dir, &["plan"]));
     assert!(text.contains("▸ ship  → production"), "{text}");
     assert!(!text.contains("--target"), "{text}");
 }
@@ -7584,7 +7576,7 @@ fn target_flag_moves_unpinned_services_and_says_which_stay() {
 fn target_flag_is_global_and_reaches_plan_json() {
     let dir = two_target_repo("target-json");
     let out = run_in(&dir, &["--target", "staging", "plan", "--json"]);
-    assert!(out.status.success(), "{}", both(&out));
+    assert!(out.status.success(), "{}", output_text(&out));
     let text = String::from_utf8_lossy(&out.stdout);
     let json_start = text.find('[').unwrap();
     let plan: serde_json::Value = serde_json::from_str(&text[json_start..]).unwrap();
@@ -7602,8 +7594,8 @@ fn unknown_target_is_a_config_error_naming_the_real_ones() {
     let dir = two_target_repo("target-unknown");
     for cmd in ["plan", "preflight", "deploy", "verify", "rollback"] {
         let out = run_in(&dir, &[cmd, "--target", "prod"]);
-        assert_eq!(out.status.code(), Some(2), "{cmd}: {}", both(&out));
-        let text = both(&out);
+        assert_eq!(out.status.code(), Some(2), "{cmd}: {}", output_text(&out));
+        let text = output_text(&out);
         assert!(
             text.contains(
                 "unknown target 'prod' — this config defines: pinned, production, staging"
@@ -7628,7 +7620,7 @@ fn deploy_with_target_ships_there_and_leaves_the_default_alone() {
             "staging",
         ],
     );
-    assert!(out.status.success(), "{}", both(&out));
+    assert!(out.status.success(), "{}", output_text(&out));
     assert!(dir.join("staging/payload.txt").exists());
     assert!(
         std::fs::read_dir(dir.join("production"))
@@ -7636,7 +7628,7 @@ fn deploy_with_target_ships_there_and_leaves_the_default_alone() {
             .next()
             .is_none(),
         "production was touched: {}",
-        both(&out)
+        output_text(&out)
     );
 }
 
@@ -7655,7 +7647,7 @@ fn release_confirmation_names_the_selected_target() {
         .unwrap();
     child.stdin.as_mut().unwrap().write_all(b"n\n").unwrap();
     let out = child.wait_with_output().unwrap();
-    let text = both(&out);
+    let text = output_text(&out);
     let asked = text
         .lines()
         .find(|l| l.contains("Deploy release v3.1.4"))
@@ -7676,8 +7668,8 @@ fn fleet_refuses_target() {
     let out = run_in(&dir, &["--target", "staging", "fleet", "status"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        both(&out).contains("--target names one config's target"),
+        output_text(&out).contains("--target names one config's target"),
         "{}",
-        both(&out)
+        output_text(&out)
     );
 }
