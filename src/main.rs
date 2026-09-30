@@ -38,8 +38,21 @@ struct Cli {
     #[arg(long, short, global = true)]
     config: Option<PathBuf>,
 
+    /// Deploy to this target instead of `defaults.target` (a service that
+    /// names its own `target:` keeps it)
+    #[arg(long, global = true, value_name = "NAME")]
+    target: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+/// The two global flags every config-reading command shares: which config to
+/// load, and which of its targets to aim at.
+#[derive(Clone, Copy)]
+struct ConfigArgs<'a> {
+    path: Option<&'a Path>,
+    target: Option<&'a str>,
 }
 
 #[derive(Subcommand)]
@@ -235,6 +248,10 @@ fn main() {
 }
 
 fn run(cli: &Cli) -> Result<i32> {
+    let args = ConfigArgs {
+        path: cli.config.as_deref(),
+        target: cli.target.as_deref(),
+    };
     match &cli.command {
         Commands::Init {
             path,
@@ -263,7 +280,7 @@ fn run(cli: &Cli) -> Result<i32> {
             service,
             version,
             json,
-        } => cmd_plan(cli.config.as_deref(), service, version.as_deref(), *json),
+        } => cmd_plan(args, service, version.as_deref(), *json),
         Commands::Deploy {
             service,
             dry_run,
@@ -272,7 +289,7 @@ fn run(cli: &Cli) -> Result<i32> {
             force,
             no_soak,
         } => cmd_deploy(
-            cli.config.as_deref(),
+            args,
             service,
             *dry_run,
             false,
@@ -281,47 +298,39 @@ fn run(cli: &Cli) -> Result<i32> {
             *force,
             *no_soak,
         ),
-        Commands::Verify { service } => cmd_deploy(
-            cli.config.as_deref(),
-            service,
-            false,
-            true,
-            true,
-            None,
-            false,
-            true,
-        ),
-        Commands::Status { service, json } => {
-            cmd_readback(cli.config.as_deref(), service, Readback::Status, *json)
+        Commands::Verify { service } => {
+            cmd_deploy(args, service, false, true, true, None, false, true)
         }
+        Commands::Status { service, json } => cmd_readback(args, service, Readback::Status, *json),
         Commands::History {
             service,
             limit,
             json,
-        } => cmd_readback(
-            cli.config.as_deref(),
-            service,
-            Readback::History { limit: *limit },
-            *json,
-        ),
+        } => cmd_readback(args, service, Readback::History { limit: *limit }, *json),
         Commands::Logs {
             service,
             follow,
             tail,
-        } => cmd_logs(cli.config.as_deref(), service, *follow, *tail),
+        } => cmd_logs(args, service, *follow, *tail),
         Commands::Rollback { service, to, force } => match to {
-            Some(deploy_id) => cmd_rollback_to(cli.config.as_deref(), service, deploy_id, *force),
-            None => cmd_rollback(cli.config.as_deref(), service, *force),
+            Some(deploy_id) => cmd_rollback_to(args, service, deploy_id, *force),
+            None => cmd_rollback(args, service, *force),
         },
-        Commands::Preflight { service } => cmd_preflight(cli.config.as_deref(), service),
+        Commands::Preflight { service } => cmd_preflight(args, service),
         Commands::Fleet {
             fleet,
             repo,
             action,
-        } => cmd_fleet(cli.config.as_deref(), fleet.as_deref(), repo, action),
-        Commands::Secrets { action } => cmd_secrets(cli.config.as_deref(), action),
-        Commands::Clean => cmd_clean(cli.config.as_deref()),
-        Commands::Validate => cmd_validate(cli.config.as_deref()),
+        } => cmd_fleet(
+            cli.config.as_deref(),
+            cli.target.as_deref(),
+            fleet.as_deref(),
+            repo,
+            action,
+        ),
+        Commands::Secrets { action } => cmd_secrets(args, action),
+        Commands::Clean => cmd_clean(args),
+        Commands::Validate => cmd_validate(args),
         Commands::Schema => {
             print!("{}", config::SCHEMA);
             Ok(0)
@@ -757,7 +766,7 @@ fn resolve_release(
     )))
 }
 
-fn cmd_secrets(explicit: Option<&Path>, action: &Option<SecretsAction>) -> Result<i32> {
+fn cmd_secrets(explicit: ConfigArgs<'_>, action: &Option<SecretsAction>) -> Result<i32> {
     ui::banner();
     let (config, _path) = load_announced(explicit)?;
 
@@ -837,9 +846,9 @@ fn cmd_secrets(explicit: Option<&Path>, action: &Option<SecretsAction>) -> Resul
 
 /// Remove the local work directory. Deploys clean up after themselves on
 /// success; this is for when one failed and left artifacts behind.
-fn cmd_clean(explicit: Option<&Path>) -> Result<i32> {
+fn cmd_clean(explicit: ConfigArgs<'_>) -> Result<i32> {
     ui::banner();
-    let path = config::resolve(explicit)?;
+    let path = config::resolve(explicit.path)?;
     let config = config::load(&path)?;
     let scratch = version::scratch_root(&config.app);
     ui::phase("Cleaning");
@@ -857,7 +866,7 @@ fn cmd_clean(explicit: Option<&Path>) -> Result<i32> {
     Ok(0)
 }
 
-fn cmd_validate(explicit: Option<&Path>) -> Result<i32> {
+fn cmd_validate(explicit: ConfigArgs<'_>) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
     let v = version_announced(&config, &repo_root(&path));
@@ -878,12 +887,17 @@ fn cmd_validate(explicit: Option<&Path>) -> Result<i32> {
     Ok(0)
 }
 
-/// Phase 0: find and load the config, reporting what was picked up.
-fn load_announced(explicit: Option<&Path>) -> Result<(config::Config, PathBuf)> {
+/// Phase 0: find and load the config, reporting what was picked up — and,
+/// with `--target`, where it is aimed, before anything says what it will do.
+fn load_announced(explicit: ConfigArgs<'_>) -> Result<(config::Config, PathBuf)> {
     ui::phase("Loading configuration");
-    let path = config::resolve(explicit)?;
+    let path = config::resolve(explicit.path)?;
     ui::detail(format!("config: {}", path.display()));
-    let config = config::load(&path)?;
+    let mut config = config::load(&path)?;
+    let pinned = match explicit.target {
+        Some(name) => config.select_target(name)?,
+        None => Vec::new(),
+    };
     let target_names: Vec<&str> = config.targets.keys().map(|s| s.as_str()).collect();
     ui::detail(format!(
         "app: {} · {} service(s) · target(s): {}",
@@ -891,6 +905,14 @@ fn load_announced(explicit: Option<&Path>) -> Result<(config::Config, PathBuf)> 
         config.services.len(),
         target_names.join(", ")
     ));
+    if let Some(name) = explicit.target {
+        ui::detail(format!("target: {name} (--target)"));
+    }
+    for (service, own) in &pinned {
+        ui::note(format!(
+            "service '{service}' pins target '{own}' — --target does not move it."
+        ));
+    }
     Ok((config, path))
 }
 
@@ -1083,7 +1105,7 @@ fn preflight_announced(
 }
 
 fn cmd_plan(
-    explicit: Option<&Path>,
+    explicit: ConfigArgs<'_>,
     only: &[String],
     version_arg: Option<&str>,
     json: bool,
@@ -1167,6 +1189,7 @@ fn shipping_approved(
     plan: &[plan::ServicePlan],
     root: &Path,
     v: &version::DeployVersion,
+    selected_target: Option<&str>,
     assume_yes: bool,
     dry_run: bool,
 ) -> Result<bool> {
@@ -1204,9 +1227,13 @@ fn shipping_approved(
     if assume_yes || dry_run {
         return Ok(true);
     }
+    // With --target the operator chose *where*, so the question names it.
+    let to = selected_target
+        .map(|name| format!(" to {name}"))
+        .unwrap_or_default();
     let question = match shipping::summary(&shipments) {
-        Some(what) => format!("Deploy release {tag} ({}), {what}?", v.git.short_sha),
-        None => format!("Deploy release {tag} ({})?", v.git.short_sha),
+        Some(what) => format!("Deploy release {tag} ({}){to}, {what}?", v.git.short_sha),
+        None => format!("Deploy release {tag} ({}){to}?", v.git.short_sha),
     };
     // No stdin: the tag exists and was chosen deliberately by tagging it.
     Ok(prompt_yes_no(&question)?.unwrap_or(true))
@@ -1214,7 +1241,7 @@ fn shipping_approved(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_deploy(
-    explicit: Option<&Path>,
+    explicit: ConfigArgs<'_>,
     only: &[String],
     dry_run: bool,
     verify_only: bool,
@@ -1292,7 +1319,17 @@ fn cmd_deploy(
     }
 
     // What this release ships: the commits between what is live and HEAD.
-    if !verify_only && !shipping_approved(&config, &plan, &root, &v, assume_yes, dry_run)? {
+    if !verify_only
+        && !shipping_approved(
+            &config,
+            &plan,
+            &root,
+            &v,
+            explicit.target,
+            assume_yes,
+            dry_run,
+        )?
+    {
         ui::phase("Aborted");
         ui::note("canceled — nothing was built, shipped, or changed.");
         return Ok(0);
@@ -1460,7 +1497,7 @@ enum Readback {
 /// exactly where the write went. Nothing on the target is modified, and no
 /// release is resolved — there is no deploy here to version.
 fn cmd_readback(
-    explicit: Option<&Path>,
+    explicit: ConfigArgs<'_>,
     only: &[String],
     what: Readback,
     json: bool,
@@ -1527,7 +1564,7 @@ fn cmd_readback(
     Ok(0)
 }
 
-fn cmd_logs(explicit: Option<&Path>, only: &[String], follow: bool, tail: usize) -> Result<i32> {
+fn cmd_logs(explicit: ConfigArgs<'_>, only: &[String], follow: bool, tail: usize) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
     let root = repo_root(&path);
@@ -1626,7 +1663,7 @@ fn take_deploy_lock(
     }
 }
 
-fn cmd_rollback(explicit: Option<&Path>, only: &[String], force_lock: bool) -> Result<i32> {
+fn cmd_rollback(explicit: ConfigArgs<'_>, only: &[String], force_lock: bool) -> Result<i32> {
     ui::banner();
     let timer = ui::Timer::start();
     let (config, path) = load_announced(explicit)?;
@@ -1659,7 +1696,7 @@ fn cmd_rollback(explicit: Option<&Path>, only: &[String], force_lock: bool) -> R
 /// service that cannot be satisfied refuses the whole run while the target is
 /// still untouched, so a multi-service rollback never half-lands.
 fn cmd_rollback_to(
-    explicit: Option<&Path>,
+    explicit: ConfigArgs<'_>,
     only: &[String],
     deploy_id: &str,
     force_lock: bool,
@@ -1788,6 +1825,7 @@ fn cmd_rollback_to(
 /// one of them fails.
 fn cmd_fleet(
     config: Option<&Path>,
+    target: Option<&str>,
     fleet_path: Option<&Path>,
     only_repos: &[String],
     action: &FleetAction,
@@ -1798,6 +1836,13 @@ fn cmd_fleet(
     if config.is_some() {
         ui::fail("--config names one repo's config, so it cannot be used with `fleet`");
         ui::note("pass --fleet PATH to choose the fleet file, or --repo NAME to narrow the run.");
+        return Ok(2);
+    }
+    // Target names are per repo, so one name cannot mean the same thing
+    // across the fleet.
+    if target.is_some() {
+        ui::fail("--target names one config's target, so it cannot be used with `fleet`");
+        ui::note("run `deliver --target NAME deploy` in the repo instead.");
         return Ok(2);
     }
 
@@ -1841,6 +1886,11 @@ fn cmd_fleet(
         _ => false,
     };
 
+    // Each repo finds its own config and uses its own default target.
+    let each = ConfigArgs {
+        path: None,
+        target: None,
+    };
     let mut outcomes: Vec<(&fleet::Repo, fleet::RepoOutcome)> = Vec::new();
     let mut stopped = false;
     for repo in &selected {
@@ -1850,15 +1900,15 @@ fn cmd_fleet(
         }
         ui::phase(&format!("{} — {}", repo.name, repo.path.display()));
         let outcome = fleet::run_in(repo, || match action {
-            FleetAction::Preflight { service } => cmd_preflight(None, service),
+            FleetAction::Preflight { service } => cmd_preflight(each, service),
             FleetAction::Deploy {
                 service,
                 dry_run,
                 yes,
                 force,
                 ..
-            } => cmd_deploy(None, service, *dry_run, false, *yes, None, *force, false),
-            FleetAction::Status { service } => cmd_readback(None, service, Readback::Status, false),
+            } => cmd_deploy(each, service, *dry_run, false, *yes, None, *force, false),
+            FleetAction::Status { service } => cmd_readback(each, service, Readback::Status, false),
         });
         if !outcome.ok() && stop_on_failure {
             stopped = true;
@@ -1893,7 +1943,7 @@ fn cmd_fleet(
         .unwrap_or(0))
 }
 
-fn cmd_preflight(explicit: Option<&Path>, only: &[String]) -> Result<i32> {
+fn cmd_preflight(explicit: ConfigArgs<'_>, only: &[String]) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
     let secrets_ok = secrets_announced(&config, &repo_root(&path));

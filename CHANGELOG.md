@@ -4,6 +4,15 @@
 
 ### Added
 
+- `--target NAME` picks which of the config's targets a run is aimed at, so
+  one `.deliver.yml` ships to staging and then the same commit to production.
+  It replaces `defaults.target` for services without their own `target:` (a
+  service that pins one keeps it, and the run says so), must name a target the
+  config defines, and is echoed in the "Loading configuration" phase and the
+  release confirmation. Global, so it works with `plan`, `preflight`,
+  `deploy`, `verify`, `status`, `history`, `logs` and `rollback`; `fleet`
+  refuses it.
+
 - Compose backups are pruned. A `docker-compose` service with a `backup:` block
   used to keep every pre-deploy database dump and volume archive forever; now
   `backup.keep` (default 10) keeps the newest of each kind — the dump and each

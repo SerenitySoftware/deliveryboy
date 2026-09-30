@@ -618,6 +618,30 @@ impl Config {
         }
     }
 
+    /// Aim the config at `name` (the `--target` flag): it becomes
+    /// `defaults.target`, so every service without its own `target:` follows.
+    /// Returns the services that pin a different target, which stay put.
+    pub fn select_target(&mut self, name: &str) -> Result<Vec<(String, String)>> {
+        if !self.targets.contains_key(name) {
+            let known: Vec<&str> = self.targets.keys().map(|s| s.as_str()).collect();
+            bail!(
+                "unknown target '{name}' — this config defines: {}",
+                known.join(", ")
+            );
+        }
+        self.defaults.target = Some(name.to_string());
+        Ok(self
+            .services
+            .iter()
+            .filter_map(|(service, s)| {
+                s.target
+                    .as_ref()
+                    .filter(|own| *own != name)
+                    .map(|own| (service.clone(), own.clone()))
+            })
+            .collect())
+    }
+
     pub fn target_for(&self, service: &Service) -> Result<(String, Target)> {
         let name = self.target_name_for(service)?;
         let target = self

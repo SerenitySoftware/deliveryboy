@@ -12,6 +12,15 @@ Pass `--config PATH` before or after a command to use a specific config instead 
 deliver --config ops/production.yml plan
 ```
 
+Pass `--target NAME` to aim the same config at another of its `targets:` — ship to staging, look, then ship the same commit to production without editing the file:
+
+```bash
+deliver deploy --dry-run --target production   # what would this do to prod?
+deliver deploy --target staging
+```
+
+It replaces `defaults.target` for this run, so every service without its own `target:` follows it; a service that pins its own target keeps it, and the "Loading configuration" phase says so. The name must be one the config defines, and it is echoed there and in the release confirmation (`Deploy release v1.4.0 (abc1234) to staging, …?`). It works with every command that reads the config — `plan`, `preflight`, `deploy`, `verify`, `status`, `history`, `logs` and `rollback` — but not with `fleet`, where each repo names its own targets.
+
 `deliver --version` prints the CLI version. `deliver --help` and `deliver COMMAND --help` show the installed command surface.
 
 ## `deliver init`

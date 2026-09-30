@@ -7514,3 +7514,170 @@ fn status_says_nothing_about_backups_for_a_service_that_takes_none() {
     let text = compose_status("readback-backups-off", "", &[]);
     assert!(!text.contains("backups "), "{text}");
 }
+
+// --- `--target`: aim the same config at another environment ----------------
+
+/// Two local targets, a default of `production`, and one service that pins
+/// its own target — the shape `--target` has to get right.
+fn two_target_repo(name: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::write(dir.join("payload.txt"), "hi\n").unwrap();
+    for env in ["staging", "production", "pinned"] {
+        std::fs::create_dir_all(dir.join(env)).unwrap();
+    }
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: production}}
+targets:
+  staging: {{method: local, dir: {staging}}}
+  production: {{method: local, dir: {production}}}
+  pinned: {{method: local, dir: {pinned}}}
+services:
+  ship:
+    deployer: files
+    config: {{src: payload.txt}}
+  docs:
+    deployer: files
+    target: pinned
+    config: {{src: payload.txt}}
+"#,
+            staging = dir.join("staging").display(),
+            production = dir.join("production").display(),
+            pinned = dir.join("pinned").display(),
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+fn both(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn target_flag_moves_unpinned_services_and_says_which_stay() {
+    let dir = two_target_repo("target-plan");
+    let text = both(&run_in(&dir, &["plan", "--target", "staging"]));
+    assert!(text.contains("target: staging (--target)"), "{text}");
+    assert!(text.contains("▸ ship  → staging"), "{text}");
+    assert!(text.contains("▸ docs  → pinned"), "{text}");
+    assert!(
+        text.contains("service 'docs' pins target 'pinned' — --target does not move it."),
+        "{text}"
+    );
+
+    // Without the flag the file's default still decides.
+    let text = both(&run_in(&dir, &["plan"]));
+    assert!(text.contains("▸ ship  → production"), "{text}");
+    assert!(!text.contains("--target"), "{text}");
+}
+
+#[test]
+fn target_flag_is_global_and_reaches_plan_json() {
+    let dir = two_target_repo("target-json");
+    let out = run_in(&dir, &["--target", "staging", "plan", "--json"]);
+    assert!(out.status.success(), "{}", both(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let json_start = text.find('[').unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&text[json_start..]).unwrap();
+    let ship = plan
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|sp| sp["service"] == "ship")
+        .unwrap();
+    assert_eq!(ship["target"], "staging");
+}
+
+#[test]
+fn unknown_target_is_a_config_error_naming_the_real_ones() {
+    let dir = two_target_repo("target-unknown");
+    for cmd in ["plan", "preflight", "deploy", "verify", "rollback"] {
+        let out = run_in(&dir, &[cmd, "--target", "prod"]);
+        assert_eq!(out.status.code(), Some(2), "{cmd}: {}", both(&out));
+        let text = both(&out);
+        assert!(
+            text.contains(
+                "unknown target 'prod' — this config defines: pinned, production, staging"
+            ),
+            "{cmd}: {text}"
+        );
+    }
+}
+
+#[test]
+fn deploy_with_target_ships_there_and_leaves_the_default_alone() {
+    let dir = two_target_repo("target-deploy");
+    git_init_tagged(&dir, "v1.0.0");
+    let out = run_in(
+        &dir,
+        &[
+            "deploy",
+            "--yes",
+            "--service",
+            "ship",
+            "--target",
+            "staging",
+        ],
+    );
+    assert!(out.status.success(), "{}", both(&out));
+    assert!(dir.join("staging/payload.txt").exists());
+    assert!(
+        std::fs::read_dir(dir.join("production"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "production was touched: {}",
+        both(&out)
+    );
+}
+
+#[test]
+fn release_confirmation_names_the_selected_target() {
+    use std::io::Write;
+    let dir = two_target_repo("target-confirm");
+    git_init_tagged(&dir, "v3.1.4");
+    let mut child = deliver()
+        .current_dir(&dir)
+        .args(["deploy", "--target", "staging"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"n\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = both(&out);
+    let asked = text
+        .lines()
+        .find(|l| l.contains("Deploy release v3.1.4"))
+        .unwrap_or_else(|| panic!("should confirm: {text}"));
+    assert!(asked.contains(") to staging"), "{asked}");
+    assert!(
+        std::fs::read_dir(dir.join("staging"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "declined, so nothing ships: {text}"
+    );
+}
+
+#[test]
+fn fleet_refuses_target() {
+    let dir = tmpdir("target-fleet");
+    let out = run_in(&dir, &["--target", "staging", "fleet", "status"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        both(&out).contains("--target names one config's target"),
+        "{}",
+        both(&out)
+    );
+}
