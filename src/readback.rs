@@ -56,6 +56,10 @@ pub struct Deploy {
     pub release: String,
     pub sha: String,
     pub at: String,
+    /// True for a row `deliver rollback` appended: the deploy id is the
+    /// release it restored, not one that was shipped at that time.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rollback: bool,
 }
 
 /// Everything read back for one service on one host.
@@ -83,6 +87,10 @@ pub struct Status {
     pub backups: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backups_dir: Option<String>,
+    /// What the previous-release marker names — where a plain `deliver
+    /// rollback` would go. Read for the rollback preview, not reported.
+    #[serde(skip)]
+    pub previous: Option<String>,
 }
 
 impl Status {
@@ -112,7 +120,7 @@ impl Status {
     }
 }
 
-fn basename(path: &str) -> &str {
+pub(crate) fn basename(path: &str) -> &str {
     path.trim_end_matches('/')
         .rsplit('/')
         .next()
@@ -235,6 +243,15 @@ fn probes_for(index: usize, state: &ReleaseState, sudo: &str) -> Vec<Probe> {
             ),
         });
     }
+    if let Some(marker) = &state.previous_marker {
+        probes.push(Probe {
+            key: format!("{index}:previous"),
+            snippet: format!(
+                "if [ -f {m} ]; then {sudo}cat -- {m}; fi",
+                m = shell_quote(marker)
+            ),
+        });
+    }
     if let Some(backups) = &state.backups_dir {
         probes.push(Probe {
             key: format!("{index}:backups"),
@@ -268,7 +285,9 @@ pub fn sort_backups(text: &str) -> Vec<String> {
 ///
 /// Rows that are not five tab-separated fields are skipped rather than guessed
 /// at: the file is appended to by a shell `printf` on the target and a
-/// half-written line should not turn into a confident wrong answer.
+/// half-written line should not turn into a confident wrong answer. A sixth
+/// field of `rollback` marks a row `deliver rollback` wrote; older readers
+/// ignore it.
 pub fn parse_history(text: &str) -> Vec<Deploy> {
     let mut rows: Vec<Deploy> = text
         .lines()
@@ -283,6 +302,7 @@ pub fn parse_history(text: &str) -> Vec<Deploy> {
                 release: fields[2].trim().to_string(),
                 sha: fields[3].trim().to_string(),
                 at: fields[4].trim().to_string(),
+                rollback: fields.get(5).is_some_and(|f| f.trim() == "rollback"),
             })
         })
         .collect();
@@ -389,6 +409,10 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                         .unwrap_or_default()
                 }),
                 backups_dir: request.state.backups_dir,
+                previous: answer
+                    .get(&format!("{i}:previous"))
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty()),
             }
         })
         .collect()
@@ -512,14 +536,19 @@ pub fn render_history(statuses: &[Status], limit: usize) -> String {
         } else {
             limit.min(status.history.len())
         };
+        // A rollback row repeats the id it restored, so only the newest row
+        // for the live id carries the marker.
+        let mut marked = false;
         for deploy in status.history.iter().take(shown) {
-            let marker = if Some(&deploy.deploy_id) == live.as_ref() {
+            let marker = if !marked && Some(&deploy.deploy_id) == live.as_ref() {
+                marked = true;
                 "  ← live"
             } else {
                 ""
             };
+            let kind = if deploy.rollback { "  (rollback)" } else { "" };
             out.push_str(&format!(
-                "    {:>4}  {:<24}  {:<12}  {:<10}  {}{marker}\n",
+                "    {:>4}  {:<24}  {:<12}  {:<10}  {}{kind}{marker}\n",
                 deploy.number,
                 deploy.deploy_id,
                 deploy.release,
@@ -644,6 +673,7 @@ mod tests {
             previous_marker: state().previous_marker,
             backups: None,
             backups_dir: None,
+            previous: None,
         };
         assert_eq!(status.live_deploy_id().as_deref(), Some("20260202-b"));
         assert_eq!(status.live_deploy().unwrap().release, "v0.2.0");
@@ -674,6 +704,7 @@ mod tests {
             previous_marker: state().previous_marker,
             backups: None,
             backups_dir: None,
+            previous: None,
         };
         let text = render_status(&[status]);
         assert!(text.contains("unknown release · 20260303-c"), "{text}");
@@ -696,6 +727,7 @@ mod tests {
             previous_marker: state().previous_marker,
             backups: None,
             backups_dir: None,
+            previous: None,
         };
         let text = render_status(&[status]);
         assert!(text.contains("could not read the target"), "{text}");
@@ -718,6 +750,7 @@ mod tests {
             previous_marker: None,
             backups: None,
             backups_dir: None,
+            previous: None,
         };
         assert!(!status.live_is_recorded());
         let text = render_status(&[status]);
@@ -725,5 +758,17 @@ mod tests {
         assert!(text.contains("no live symlink"), "{text}");
         // No release directory means no retained count to claim.
         assert!(!text.contains("retained"), "{text}");
+    }
+
+    #[test]
+    fn a_sixth_field_marks_a_rollback_row() {
+        let rows = parse_history(
+            "1\ta\tv1\tsha1\t2026-01-01T00:00:00Z\n\
+             2\tb\tv2\tsha2\t2026-01-02T00:00:00Z\n\
+             3\ta\tv1\tsha1\t2026-01-03T00:00:00Z\trollback\n",
+        );
+        assert!(rows[0].rollback);
+        assert!(!rows[1].rollback);
+        assert!(!rows[2].rollback);
     }
 }

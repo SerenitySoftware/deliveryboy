@@ -565,7 +565,11 @@ pub struct VersioningConfig {
 }
 
 fn default_notification_events() -> Vec<String> {
-    vec!["succeeded".to_string(), "failed".to_string()]
+    vec![
+        "succeeded".to_string(),
+        "failed".to_string(),
+        "rolled_back".to_string(),
+    ]
 }
 
 /// A release-level notice. Notices run outside the deploy plan: a failed notice
@@ -709,9 +713,12 @@ pub fn load(path: &Path) -> Result<Config> {
             );
         }
         for event in &notice.events {
-            if !matches!(event.as_str(), "started" | "succeeded" | "failed") {
+            if !matches!(
+                event.as_str(),
+                "started" | "succeeded" | "failed" | "rolled_back"
+            ) {
                 bail!(
-                    "notification event '{event}' is not supported (have: started, succeeded, failed)"
+                    "notification event '{event}' is not supported (have: started, succeeded, failed, rolled_back)"
                 );
             }
         }

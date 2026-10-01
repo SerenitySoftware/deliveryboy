@@ -4,6 +4,15 @@
 
 ### Added
 
+- `deliver rollback` previews, confirms, verifies, records and announces, the
+  way `deploy` does. It reads the target first and prints both ends per
+  service (`web: live … (v0.2.0) → back to … (v0.1.0)`), asks before acting
+  (`-y` skips it, `--dry-run` changes nothing), appends a history row marked
+  `rollback` so `deliver history` tells it from a re-deploy, runs the restored
+  services' verify and health checks (exit `1` if they fail), and sends a
+  `rolled_back` notice — a new notification event, on by default. `--to`
+  gets the same. It no longer announces a "deploy version" it will not deploy.
+
 - `--target NAME` picks which of the config's targets a run is aimed at, so
   one `.deliver.yml` ships to staging and then the same commit to production.
   It replaces `defaults.target` for services without their own `target:` (a

@@ -237,6 +237,140 @@ pub fn describe(swap: &Swap) -> String {
     ))
 }
 
+/// Where a plain `deliver rollback` takes one service, read off the target
+/// before anything is touched, so the operator sees both ends first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepBack {
+    pub service: String,
+    pub target: String,
+    pub host: String,
+    pub reachable: bool,
+    pub from: Option<String>,
+    pub from_release: Option<String>,
+    /// The deploy id the undo restores, when the target records one.
+    pub to: Option<String>,
+    pub to_release: Option<String>,
+    pub to_sha: Option<String>,
+    pub history_path: String,
+}
+
+/// Work out what one step back means for a service that keeps a record.
+///
+/// With a live symlink, the previous-release marker the activate step wrote
+/// is the answer — it is exactly what the undo swaps to. Compose has no
+/// symlink: its undo re-tags the image that was running before the newest
+/// *deploy*, so the restored release is the row below the newest row that
+/// was not itself a rollback.
+pub fn step_back(status: &Status) -> StepBack {
+    let row = |id: &str| status.history.iter().find(|d| d.deploy_id == id);
+    let from = status.live_deploy_id();
+    let to = match &status.live {
+        Live::NotApplicable => status
+            .history
+            .iter()
+            .position(|d| !d.rollback)
+            .and_then(|newest| status.history.get(newest + 1))
+            .map(|d| d.deploy_id.clone()),
+        _ => status
+            .previous
+            .as_deref()
+            .map(|path| crate::readback::basename(path).to_string()),
+    };
+    StepBack {
+        service: status.service.clone(),
+        target: status.target.clone(),
+        host: status.host.clone(),
+        reachable: status.reachable,
+        from_release: from.as_deref().and_then(|id| release_of(status, id)),
+        from,
+        to_release: to.as_deref().and_then(|id| release_of(status, id)),
+        to_sha: to.as_deref().and_then(row).map(|d| d.sha.clone()),
+        to,
+        history_path: status.history_path.clone(),
+    }
+}
+
+/// A `--to` swap seen as where it leaves the service, so it is recorded and
+/// verified exactly as a one-step rollback is.
+pub fn landed(swap: &Swap, status: &Status) -> StepBack {
+    StepBack {
+        service: swap.service.clone(),
+        target: swap.target.clone(),
+        host: swap.host.clone(),
+        reachable: true,
+        from: swap.from.clone(),
+        from_release: swap.from_release.clone(),
+        to: Some(swap.to.clone()),
+        to_release: swap.to_release.clone(),
+        to_sha: status
+            .history
+            .iter()
+            .find(|d| d.deploy_id == swap.to)
+            .map(|d| d.sha.clone()),
+        history_path: status.history_path.clone(),
+    }
+}
+
+/// `web: live 20260202-bbb2222 (v0.2.0) → back to 20260130-aaa1111 (v0.1.9)`
+pub fn describe_step_back(back: &StepBack) -> String {
+    let end = |id: Option<&String>, release: Option<&String>| match (id, release) {
+        (Some(id), Some(release)) => format!("{id} ({release})"),
+        (Some(id), None) => format!("{id} (unknown release)"),
+        (None, _) => "nothing recorded".to_string(),
+    };
+    let line = if !back.reachable {
+        format!(
+            "{}: could not read the target — cannot say what is live or where this goes",
+            back.service
+        )
+    } else if back.to.is_none() {
+        format!(
+            "{}: live {} → no previous release recorded on the target",
+            back.service,
+            end(back.from.as_ref(), back.from_release.as_ref())
+        )
+    } else {
+        format!(
+            "{}: live {} → back to {}",
+            back.service,
+            end(back.from.as_ref(), back.from_release.as_ref()),
+            end(back.to.as_ref(), back.to_release.as_ref())
+        )
+    };
+    scrub(&line)
+}
+
+/// The shell that appends a rollback row to the target's history: the
+/// restored deploy id with its release and sha, and a sixth `rollback` field
+/// so `deliver history` can tell it from a re-deploy. Same numbering as the
+/// deployers' own record step.
+pub fn record_command(
+    history_path: &str,
+    deploy_id: &str,
+    release: &str,
+    sha: &str,
+    sudo: &str,
+) -> String {
+    let dir = history_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or(".");
+    format!(
+        "set -e; {sudo}mkdir -p {dir}; \
+         N=1; if {sudo}test -f {h}; then \
+           N=$(( $({sudo}wc -l {h} | awk '{{print $1}}') + 1 )); fi; \
+         printf '%s\\t%s\\t%s\\t%s\\t%s\\trollback\\n' \"$N\" {id} {release} {sha} \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \
+           | {sudo}tee -a {h} >/dev/null; \
+         echo \"rollback #$N · \"{id}",
+        dir = shell_quote(dir),
+        h = shell_quote(history_path),
+        id = shell_quote(deploy_id),
+        release = shell_quote(release),
+        sha = shell_quote(sha),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +383,7 @@ mod tests {
             release: release.into(),
             sha: "abc1234def5678".into(),
             at: "2026-02-02T10:00:00Z".into(),
+            rollback: false,
         }
     }
 
@@ -272,6 +407,7 @@ mod tests {
             previous_marker: Some("/var/app/releases/.deliver-previous".into()),
             backups: None,
             backups_dir: None,
+            previous: None,
         }
     }
 
@@ -389,5 +525,57 @@ mod tests {
         assert!(!id_is_addressable(""));
         assert!(!id_is_addressable("a b"));
         assert!(!id_is_addressable("$(whoami)"));
+    }
+
+    #[test]
+    fn one_step_back_on_a_symlink_goes_where_the_marker_points() {
+        let mut files = status();
+        files.previous = Some("/var/app/releases/20260101-aaa".into());
+        let back = step_back(&files);
+        assert_eq!(back.from.as_deref(), Some("20260202-bbb"));
+        assert_eq!(back.to.as_deref(), Some("20260101-aaa"));
+        assert_eq!(back.to_release.as_deref(), Some("v0.1.0"));
+        assert_eq!(
+            describe_step_back(&back),
+            "web: live 20260202-bbb (v0.2.0) → back to 20260101-aaa (v0.1.0)"
+        );
+    }
+
+    #[test]
+    fn no_marker_says_so_instead_of_guessing() {
+        let back = step_back(&status());
+        assert_eq!(back.to, None);
+        assert!(describe_step_back(&back).contains("no previous release recorded"));
+    }
+
+    #[test]
+    fn compose_steps_back_past_its_own_rollback_rows() {
+        // The `:rollback` image is whatever ran before the newest *deploy*, so
+        // a second rollback lands on the same release as the first.
+        let mut compose = status();
+        compose.live = Live::NotApplicable;
+        let mut again = deploy("3", "20260101-aaa", "v0.1.0");
+        again.rollback = true;
+        compose.history.insert(0, again);
+        let back = step_back(&compose);
+        assert_eq!(back.from.as_deref(), Some("20260101-aaa"));
+        assert_eq!(back.to.as_deref(), Some("20260101-aaa"));
+
+        let mut fresh = status();
+        fresh.live = Live::NotApplicable;
+        assert_eq!(step_back(&fresh).to.as_deref(), Some("20260101-aaa"));
+    }
+
+    #[test]
+    fn the_history_row_quotes_what_it_read_off_the_target() {
+        let cmd = record_command(
+            "/var/app/.deliver/history.tsv",
+            "20260101-aaa",
+            "v0.1.0; rm -rf /",
+            "abc",
+            "",
+        );
+        assert!(cmd.contains("'v0.1.0; rm -rf /'"), "{cmd}");
+        assert!(cmd.contains("\\trollback\\n"), "{cmd}");
     }
 }

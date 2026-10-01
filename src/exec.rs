@@ -322,6 +322,28 @@ fn soak(
     Ok(None)
 }
 
+/// Run each step once, in order, with nothing to unwind: the checks
+/// `deliver rollback` runs against the release it just restored. Returns the
+/// first step that failed — scrubbed, since it travels on into the notice.
+pub fn check(plan: &[ServicePlan], targets: &BTreeMap<String, Target>) -> Result<Option<String>> {
+    for sp in plan {
+        let target = &targets[&sp.target];
+        println!("  • {} → {} [{}]", sp.service, sp.target, sp.host);
+        for step in &sp.steps {
+            println!("    {} [{}]", scrub(&step.label), step.type_name());
+            if !run_step(step, target, &sp.host, false)? {
+                eprintln!(
+                    "\n✗ failed: {} ({})",
+                    scrub(&step.label),
+                    scrub(&step.detail())
+                );
+                return Ok(Some(scrub(&step.label)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// `deliver rollback` — repoint each service's live symlink at its previous
 /// release, newest service first.
 pub fn rollback(plan: &[ServicePlan], targets: &BTreeMap<String, Target>) -> Result<bool> {

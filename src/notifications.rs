@@ -39,6 +39,13 @@ fn generic_payload(
             version.marketing_version()
         ),
         "succeeded" => format!("{} {} is live", config.app, version.marketing_version()),
+        // A rollback restores releases this checkout did not build, so the
+        // detail names them rather than the version resolved here.
+        "rolled_back" => format!(
+            "{} rolled back: {}",
+            config.app,
+            failed.unwrap_or("to the previous release")
+        ),
         "failed" => format!(
             "{} {} deploy failed at {}",
             config.app,
@@ -196,7 +203,7 @@ pub fn send(
 
 #[cfg(test)]
 mod tests {
-    use super::expand;
+    use super::{expand, generic_payload};
     use crate::{config::Config, version};
 
     #[test]
@@ -217,5 +224,36 @@ mod tests {
             ),
             "demo 1.2.3 v1.2.3 succeeded"
         );
+    }
+
+    #[test]
+    fn a_rollback_notice_names_what_was_restored_not_the_checkout() {
+        let cfg: Config = serde_yaml::from_str(
+            "version: 1\napp: demo\ntargets: {local: {host: localhost, dir: /tmp/demo}}\nservices: {}\n",
+        )
+        .unwrap();
+        let v = version::resolve(std::path::Path::new("."), Some("commit"))
+            .with_release("v9.9.9".into(), "tag");
+        let payload = generic_payload(
+            &cfg,
+            &v,
+            "rolled_back",
+            Some("web: live 20260202-b (v0.2.0) → back to 20260101-a (v0.1.0)"),
+        );
+        assert!(payload.contains("demo rolled back: web: live"), "{payload}");
+        assert!(!payload.contains("9.9.9"), "{payload}");
+    }
+
+    #[test]
+    fn rollbacks_are_announced_by_default() {
+        let cfg: Config = serde_yaml::from_str(
+            "version: 1\napp: demo\ntargets: {local: {host: localhost, dir: /tmp/demo}}\n\
+             services: {}\nnotifications: [{channel: slack, webhook_secret: HOOK}]\n",
+        )
+        .unwrap();
+        assert!(cfg.notifications[0]
+            .events
+            .iter()
+            .any(|e| e == "rolled_back"));
     }
 }

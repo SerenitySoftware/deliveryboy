@@ -203,6 +203,12 @@ enum Commands {
         /// Take the target's deploy lock even if another run holds it
         #[arg(long)]
         force: bool,
+        /// Don't prompt before rolling back
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Read the target and show what would be rolled back, changing nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Run the preflight checks only (tools, input files, ssh reachability)
     Preflight {
@@ -312,10 +318,23 @@ fn run(cli: &Cli) -> Result<i32> {
             follow,
             tail,
         } => cmd_logs(args, service, *follow, *tail),
-        Commands::Rollback { service, to, force } => match to {
-            Some(deploy_id) => cmd_rollback_to(args, service, deploy_id, *force),
-            None => cmd_rollback(args, service, *force),
-        },
+        Commands::Rollback {
+            service,
+            to,
+            force,
+            yes,
+            dry_run,
+        } => {
+            let how = RollbackRun {
+                force_lock: *force,
+                assume_yes: *yes,
+                dry_run: *dry_run,
+            };
+            match to {
+                Some(deploy_id) => cmd_rollback_to(args, service, deploy_id, how),
+                None => cmd_rollback(args, service, how),
+            }
+        }
         Commands::Preflight { service } => cmd_preflight(args, service),
         Commands::Fleet {
             fleet,
@@ -1663,29 +1682,223 @@ fn take_deploy_lock(
     }
 }
 
-fn cmd_rollback(explicit: ConfigArgs<'_>, only: &[String], force_lock: bool) -> Result<i32> {
+/// How a rollback was asked to run: the flags `deploy` has, honoured the same
+/// way.
+#[derive(Clone, Copy)]
+struct RollbackRun {
+    force_lock: bool,
+    assume_yes: bool,
+    dry_run: bool,
+}
+
+/// The last window before a rollback acts. `--yes` and a dry run never block,
+/// and no stdin is not a refusal — it is a script, which chose this already.
+/// Returns false only when a human said no.
+fn rollback_confirmed(how: RollbackRun, services: usize) -> Result<bool> {
+    if how.assume_yes || how.dry_run {
+        return Ok(true);
+    }
+    Ok(prompt_yes_no(&format!("Roll back {services} service(s)?"))?.unwrap_or(true))
+}
+
+/// After the swap: record each restored release in the target's history,
+/// run the restored services' verify and health checks, and send the notice.
+///
+/// `restored` is (service, the one-line description, where it now stands).
+/// Returns the exit code.
+fn finish_rollback(
+    config: &config::Config,
+    root: &Path,
+    v: &version::DeployVersion,
+    plan: &[plan::ServicePlan],
+    restored: &[(String, String, Option<rollback::StepBack>)],
+    timer: &ui::Timer,
+) -> Result<i32> {
+    let records: Vec<&rollback::StepBack> = restored
+        .iter()
+        .filter_map(|(_, _, back)| back.as_ref())
+        .filter(|back| back.to.is_some())
+        .collect();
+    if !records.is_empty() {
+        ui::phase("Recording");
+        for back in records {
+            let target = &config.targets[&back.target];
+            let sudo = if target.uses_sudo() { "sudo " } else { "" };
+            let id = back.to.as_deref().unwrap_or_default();
+            let command = rollback::record_command(
+                &back.history_path,
+                id,
+                back.to_release.as_deref().unwrap_or("unknown"),
+                back.to_sha.as_deref().unwrap_or("unknown"),
+                sudo,
+            );
+            // The release is already back; a history row that did not land
+            // is worth a warning, not a failed rollback.
+            if !matches!(exec::run_ssh(target, &back.host, &command), Ok(true)) {
+                ui::note(format!(
+                    "{}: could not append the rollback to {}",
+                    back.service, back.history_path
+                ));
+            }
+        }
+    }
+
+    let services: Vec<&str> = restored.iter().map(|(s, _, _)| s.as_str()).collect();
+    let checks: Vec<plan::ServicePlan> = plan
+        .iter()
+        .filter(|sp| services.contains(&sp.service.as_str()))
+        .map(|sp| plan::ServicePlan {
+            service: sp.service.clone(),
+            target: sp.target.clone(),
+            host: sp.host.clone(),
+            steps: sp
+                .steps
+                .iter()
+                .filter(|s| s.label.starts_with("verify") || s.label.starts_with("health check"))
+                .cloned()
+                .collect(),
+            after_tag: false,
+            soak: None,
+        })
+        .filter(|sp| !sp.steps.is_empty())
+        .collect();
+    ui::phase("Verifying the restored release");
+    let failed = if checks.is_empty() {
+        ui::detail("no verify or health checks configured — nothing proves the restored release");
+        None
+    } else {
+        exec::check(&checks, &config.targets)?
+    };
+
+    let summary = restored
+        .iter()
+        .map(|(_, line, _)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    match failed {
+        None => {
+            notifications::send(config, root, v, "rolled_back", Some(&summary));
+            ui::phase("Done");
+            ui::ok(format!(
+                "rolled back {} service(s) in {}",
+                restored.len(),
+                timer.elapsed()
+            ));
+            Ok(0)
+        }
+        Some(step) => {
+            notifications::send(
+                config,
+                root,
+                v,
+                "failed",
+                Some(&format!("rollback check {step}")),
+            );
+            ui::phase("Failed");
+            ui::fail(format!("the restored release did not pass: {step}"));
+            ui::note("the rollback itself landed — `deliver status` says what is live now.");
+            Ok(1)
+        }
+    }
+}
+
+fn cmd_rollback(explicit: ConfigArgs<'_>, only: &[String], how: RollbackRun) -> Result<i32> {
     ui::banner();
     let timer = ui::Timer::start();
     let (config, path) = load_announced(explicit)?;
-    let v = version_announced(&config, &repo_root(&path));
-    let plan = compile_announced(&config, only, &repo_root(&path), &v)?;
+    let root = repo_root(&path);
+    // Quietly, as `--to` does: a rollback restores what is already on the
+    // target, so announcing a "deploy version" from this checkout would name
+    // something nothing is going to deploy.
+    let v = version::resolve(
+        &root,
+        config
+            .versioning
+            .as_ref()
+            .and_then(|r| r.version_from.as_deref()),
+    );
+    let plan = compile_announced(&config, only, &root, &v)?;
+
+    let reversible: Vec<&plan::ServicePlan> = plan
+        .iter()
+        .filter(|sp| sp.steps.iter().any(|s| s.rollback.is_some()))
+        .collect();
+    if reversible.is_empty() {
+        // Lets `exec::rollback` say so in its own words.
+        ui::phase("Failed");
+        exec::rollback(&plan, &config.targets)?;
+        return Ok(1);
+    }
+
+    // Read the target first, so both ends of every swap are on screen before
+    // anything is touched. Read-only, so a dry run reads it too: the preview
+    // is the whole point of one.
+    let names: Vec<&str> = reversible.iter().map(|sp| sp.service.as_str()).collect();
+    let requests: Vec<readback::Request> = readback::collect(&plan)
+        .into_iter()
+        .filter(|r| names.contains(&r.service.as_str()))
+        .collect();
+    ui::phase("Reading the target");
+    let backs: Vec<rollback::StepBack> = if requests.is_empty() {
+        Vec::new()
+    } else {
+        readback::read(requests, &config.targets)
+            .iter()
+            .map(rollback::step_back)
+            .collect()
+    };
+    let mut restored: Vec<(String, String, Option<rollback::StepBack>)> = Vec::new();
+    for sp in &reversible {
+        match backs.iter().find(|b| b.service == sp.service) {
+            Some(back) => {
+                let line = rollback::describe_step_back(back);
+                ui::detail(&line);
+                restored.push((sp.service.clone(), line, Some(back.clone())));
+            }
+            // No record on the target (a deployer with an undo but no
+            // history): name the undo itself.
+            None => {
+                for step in sp.steps.iter().filter(|s| s.rollback.is_some()) {
+                    let line =
+                        secrets::redact::scrub(&format!("{}: undo \"{}\"", sp.service, step.label));
+                    ui::detail(&line);
+                    restored.push((sp.service.clone(), line, None));
+                }
+            }
+        }
+    }
+    restored.dedup_by(|a, b| a.0 == b.0);
+
+    if how.dry_run {
+        ui::phase("Dry run (nothing will be executed)");
+        ui::detail(format!(
+            "would roll back {} service(s), record each in the target's history, and run their checks",
+            reversible.len()
+        ));
+        ui::note("nothing was changed on the target.");
+        return Ok(0);
+    }
+    if !rollback_confirmed(how, reversible.len())? {
+        ui::phase("Aborted");
+        ui::note("canceled — nothing was changed on the target.");
+        return Ok(0);
+    }
+
     // A rollback swaps the same symlink a deploy does, so it contends for the
     // same lock — the `rollback` fired at a target mid-deploy is one of the
     // races this exists to stop.
-    let _lock = match take_deploy_lock(&plan, &config, &v, force_lock) {
+    let _lock = match take_deploy_lock(&plan, &config, &v, how.force_lock) {
         Ok(guard) => guard,
         Err(code) => return Ok(code),
     };
     ui::phase("Rolling back");
-    let ok = exec::rollback(&plan, &config.targets)?;
-    if ok {
-        ui::phase("Done");
-        ui::ok(format!("rolled back in {}", timer.elapsed()));
-        Ok(0)
-    } else {
+    if !exec::rollback(&plan, &config.targets)? {
+        notifications::send(&config, &root, &v, "failed", Some("rollback"));
         ui::phase("Failed");
-        Ok(1)
+        ui::note("some undo did not complete — `deliver status` says where each service stands.");
+        return Ok(1);
     }
+    finish_rollback(&config, &root, &v, &plan, &restored, &timer)
 }
 
 /// `deliver rollback --to <deploy-id>` — restore any *retained* release, not
@@ -1699,7 +1912,7 @@ fn cmd_rollback_to(
     explicit: ConfigArgs<'_>,
     only: &[String],
     deploy_id: &str,
-    force_lock: bool,
+    how: RollbackRun,
 ) -> Result<i32> {
     ui::banner();
     let timer = ui::Timer::start();
@@ -1774,11 +1987,6 @@ fn cmd_rollback_to(
         return Ok(0);
     }
 
-    let _lock = match take_deploy_lock(&plan, &config, &v, force_lock) {
-        Ok(guard) => guard,
-        Err(code) => return Ok(code),
-    };
-
     ui::phase(&format!("Rolling back to {deploy_id}"));
     for resolution in &resolved {
         if let rollback::Resolution::AlreadyLive { service, .. } = resolution {
@@ -1788,6 +1996,21 @@ fn cmd_rollback_to(
     for swap in &swaps {
         ui::detail(rollback::describe(swap));
     }
+    if how.dry_run {
+        ui::phase("Dry run (nothing will be executed)");
+        ui::note("nothing was changed on the target.");
+        return Ok(0);
+    }
+    if !rollback_confirmed(how, swaps.len())? {
+        ui::phase("Aborted");
+        ui::note("canceled — nothing was changed on the target.");
+        return Ok(0);
+    }
+
+    let _lock = match take_deploy_lock(&plan, &config, &v, how.force_lock) {
+        Ok(guard) => guard,
+        Err(code) => return Ok(code),
+    };
 
     let mut all_ok = true;
     for swap in &swaps {
@@ -1801,14 +2024,20 @@ fn cmd_rollback_to(
         }
     }
     if all_ok {
-        ui::phase("Done");
-        ui::ok(format!(
-            "rolled back {} service(s) to {deploy_id} in {}",
-            swaps.len(),
-            timer.elapsed()
-        ));
-        Ok(0)
+        let restored: Vec<(String, String, Option<rollback::StepBack>)> = swaps
+            .iter()
+            .filter_map(|swap| {
+                let status = statuses.iter().find(|s| s.service == swap.service)?;
+                Some((
+                    swap.service.clone(),
+                    rollback::describe(swap),
+                    Some(rollback::landed(swap, status)),
+                ))
+            })
+            .collect();
+        finish_rollback(&config, &root, &v, &plan, &restored, &timer)
     } else {
+        notifications::send(&config, &root, &v, "failed", Some("rollback"));
         ui::phase("Failed");
         ui::note("some services did not swap — `deliver status` says where each one stands.");
         Ok(1)

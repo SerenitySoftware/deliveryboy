@@ -173,6 +173,17 @@ selected service cannot be satisfied, nothing is changed anywhere — so a
 multi-service rollback never half-lands. Narrow the run with `--service NAME`
 when only one app should move.
 
+Before it acts, every rollback prints both ends for each service —
+`web: live 20260202-1000-bbb2222 (v0.2.0) → back to 20260101-0900-aaa1111 (v0.1.0)` —
+and asks. `--yes` skips the question (so does a run with no terminal on stdin),
+and `--dry-run` reads the target, prints the same preview and changes nothing.
+
+After the swap it appends a row to the target's `.deliver/history.tsv` for each
+restored release, marked as a rollback (`deliver history` shows `(rollback)`),
+runs the restored services' `verify:` checks and Compose health checks, and
+sends a `rolled_back` notice. A restored release that fails its checks exits
+`1` — the rollback still landed, and `deliver status` says what is live.
+
 ## `deliver fleet`
 
 Run one command across every repo listed in `deliver.fleet.yml`, instead of

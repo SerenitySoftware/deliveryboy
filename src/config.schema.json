@@ -181,9 +181,9 @@
           "type": "string"
         },
         "events": {
-          "description": "Default: succeeded and failed.",
+          "description": "Default: succeeded, failed and rolled_back.",
           "type": "array",
-          "items": { "enum": ["started", "succeeded", "failed"] }
+          "items": { "enum": ["started", "succeeded", "failed", "rolled_back"] }
         },
         "success_payload_command": {
           "description": "Command that prints a complete JSON payload for a successful release. Runs in the repository root.",

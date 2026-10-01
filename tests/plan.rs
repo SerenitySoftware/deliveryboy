@@ -5594,6 +5594,202 @@ fn rollback_to_rejects_an_id_that_is_not_a_single_directory_name() {
     }
 }
 
+// --- plain `deliver rollback`: preview, confirm, record, verify ------------
+
+/// The deployed fixture after one deploy on top of another: the activate step
+/// left `.deliver-previous` naming the release it replaced. `verify` is the
+/// service's check, or none.
+#[cfg(unix)]
+fn stepped_fixture(
+    dir: &std::path::Path,
+    verify: Option<&str>,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = deployed_fixture(dir, Some("20260202-1000-bbb2222"));
+    std::fs::write(
+        root.join("releases/.deliver-previous"),
+        format!(
+            "{}\n",
+            root.join("releases/20260101-0900-aaa1111").display()
+        ),
+    )
+    .unwrap();
+    let checks = verify
+        .map(|cmd| format!("    verify:\n      - remote_command: \"{cmd}\"\n"))
+        .unwrap_or_default();
+    let cfg = write_config(
+        dir,
+        &format!(
+            r#"
+version: 1
+app: readback
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+{checks}"#,
+            root.display()
+        ),
+    );
+    (root, cfg)
+}
+
+#[cfg(unix)]
+fn rollback_with(
+    dir: &std::path::Path,
+    cfg: &std::path::Path,
+    args: &[&str],
+    stdin: &str,
+) -> (Option<i32>, String) {
+    use std::io::Write;
+    let mut child = deliver()
+        .current_dir(dir)
+        .arg("--config")
+        .arg(cfg)
+        .arg("rollback")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rollback_dry_run_names_both_ends_and_changes_nothing() {
+    let dir = tmpdir("rollback-dry-run");
+    let (root, cfg) = stepped_fixture(&dir, None);
+    let history = std::fs::read_to_string(root.join(".deliver/history.tsv")).unwrap();
+    let (code, text) = rollback_with(&dir, &cfg, &["--dry-run"], "");
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains(
+            "web: live 20260202-1000-bbb2222 (v0.2.0) → back to 20260101-0900-aaa1111 (v0.1.0)"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("nothing was changed on the target"), "{text}");
+    // The old command announced a fresh "deploy version" nothing would deploy.
+    assert!(!text.contains("deploy version"), "{text}");
+    assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{text}");
+    assert_eq!(
+        std::fs::read_to_string(root.join(".deliver/history.tsv")).unwrap(),
+        history
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declined_rollback_changes_nothing() {
+    let dir = tmpdir("rollback-declined");
+    let (root, cfg) = stepped_fixture(&dir, None);
+    let (code, text) = rollback_with(&dir, &cfg, &[], "n\n");
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("Roll back 1 service(s)?"), "{text}");
+    assert!(text.contains("canceled — nothing was changed"), "{text}");
+    assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rollback_is_recorded_in_history_and_verified() {
+    if !mv_can_replace_a_symlink() {
+        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
+        return;
+    }
+    let dir = tmpdir("rollback-recorded");
+    let (root, cfg) = stepped_fixture(&dir, Some("test -L web"));
+    let marker = root.join("checked");
+    // The check runs against the restored release; prove it ran.
+    let cfg_text = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("test -L web", &format!("touch {}", marker.display()));
+    std::fs::write(&cfg, cfg_text).unwrap();
+
+    let (code, text) = rollback_with(&dir, &cfg, &["-y"], "");
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(live_release_of(&root), "20260101-0900-aaa1111", "{text}");
+    assert!(text.contains("Verifying the restored release"), "{text}");
+    assert!(marker.exists(), "the verify check did not run:\n{text}");
+
+    let history = std::fs::read_to_string(root.join(".deliver/history.tsv")).unwrap();
+    let last = history.lines().last().unwrap();
+    let fields: Vec<&str> = last.split('\t').collect();
+    assert_eq!(fields[0], "3", "{history}");
+    assert_eq!(fields[1], "20260101-0900-aaa1111", "{history}");
+    assert_eq!(fields[2], "v0.1.0", "{history}");
+    assert_eq!(fields[3], "aaa1111deadbeef00", "{history}");
+    assert_eq!(fields[5], "rollback", "{history}");
+
+    // `deliver history` tells the rollback from a re-deploy, and marks the
+    // newest row for the live release, not the bad deploy above it.
+    let out = deliver()
+        .current_dir(&dir)
+        .arg("--config")
+        .arg(&cfg)
+        .arg("history")
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&out.stdout);
+    let rollback_row = shown
+        .lines()
+        .find(|l| l.contains("(rollback)"))
+        .unwrap_or_else(|| panic!("no rollback row:\n{shown}"));
+    assert!(rollback_row.contains("← live"), "{shown}");
+    assert_eq!(shown.matches("← live").count(), 1, "{shown}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rollback_whose_restored_release_fails_its_checks_exits_1() {
+    if !mv_can_replace_a_symlink() {
+        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
+        return;
+    }
+    let dir = tmpdir("rollback-unverified");
+    let (root, cfg) = stepped_fixture(&dir, Some("false"));
+    let (code, text) = rollback_with(&dir, &cfg, &["-y"], "");
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("the restored release did not pass"), "{text}");
+    // The swap still landed; the exit code is about the proof.
+    assert_eq!(live_release_of(&root), "20260101-0900-aaa1111", "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_to_honours_dry_run() {
+    let dir = tmpdir("rollback-to-dry-run");
+    let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
+    let cfg = files_config(&dir, &root);
+    let (code, text) = rollback_with(
+        &dir,
+        &cfg,
+        &["--to", "20260101-0900-aaa1111", "--dry-run"],
+        "",
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("nothing was changed on the target"), "{text}");
+    assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{text}");
+}
+
 #[cfg(unix)]
 #[test]
 fn rollback_to_refuses_a_deployer_that_keeps_no_release_directories() {
@@ -6829,10 +7025,20 @@ services:
 #[test]
 fn a_rollback_contends_for_the_same_lock_as_a_deploy() {
     let dir = local_deploy_repo("lock-rollback");
+    // A release-based service, so there is something to roll back: a config
+    // with no undo at all is told so before any lock is contended.
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi\n").unwrap();
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        cfg.replace("{src: payload.txt}", "{src: site, remote_subdir: web}"),
+    )
+    .unwrap();
     git_init_tagged(&dir, "v1.0.0");
     hold_lock(&dir, 90);
 
-    let out = run_in(&dir, &["rollback"]);
+    let out = run_in(&dir, &["rollback", "-y"]);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
