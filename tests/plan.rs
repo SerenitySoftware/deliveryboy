@@ -7385,6 +7385,83 @@ fn soak_fails_a_release_that_stops_passing_after_it_went_live() {
     assert_eq!(probes(&counter), 3, "{text}");
 }
 
+/// Ctrl-C at a terminal reaches the whole foreground process group: `deliver`
+/// and the step it is waiting on. The test stands in for the terminal.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_mid_deploy_stops_the_release_and_exits_1() {
+    use std::os::unix::process::CommandExt;
+    let dir = tmpdir("ctrl-c");
+    let dest = dir.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let started = dir.join("started");
+    let later = dir.join("later");
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+versioning:
+  tag: {{enabled: true}}
+defaults: {{target: local}}
+targets:
+  local: {{method: local, dir: {dest}}}
+services:
+  api:
+    deployer: commands
+    config:
+      steps:
+        - ssh: "touch {started} && sleep 30"
+        - ssh: "touch {later}"
+"#,
+            dest = dest.display(),
+            started = started.display(),
+            later = later.display(),
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "scratch");
+    git_in(&dir, &["tag", "-d", "scratch"]);
+
+    let begun = std::time::Instant::now();
+    let child = deliver()
+        .current_dir(&dir)
+        .args(["deploy", "--version", "2.0.0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    while !started.exists() {
+        assert!(begun.elapsed().as_secs() < 20, "the step never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let group = format!("-{}", child.id());
+    let kill = std::process::Command::new("kill")
+        .args(["-INT", "--", &group])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let out = child.wait_with_output().unwrap();
+    let text = output_text(&out);
+
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        begun.elapsed().as_secs() < 20,
+        "waited out the step: {text}"
+    );
+    assert!(text.contains("✗ interrupted at: ssh: touch"), "{text}");
+    assert!(text.contains("interrupted (Ctrl-C)"), "{text}");
+    assert!(text.contains("nothing to roll back"), "{text}");
+    assert!(!later.exists(), "a step ran after Ctrl-C:\n{text}");
+    assert!(
+        !tag_exists(&dir, "v2.0.0"),
+        "an interrupted release must not tag:\n{text}"
+    );
+}
+
 #[test]
 fn soak_passes_when_every_round_holds() {
     let (dir, counter) = soak_repo("soak-holds", 99, "soak: {for: 2s, every: 1s}");

@@ -8,6 +8,7 @@ mod deployers;
 mod detect;
 mod exec;
 mod fleet;
+mod interrupt;
 mod lock;
 mod logs;
 mod notifications;
@@ -1452,7 +1453,11 @@ fn cmd_deploy(
             let finalized = exec::execute(&after_tag_plan, &config.targets, dry_run)?;
             if !finalized.ok {
                 ui::phase("Failed");
-                ui::note("the release tag exists, but an after-tag step failed.");
+                ui::note(if finalized.interrupted {
+                    "the release tag exists, but the after-tag steps were interrupted (Ctrl-C)."
+                } else {
+                    "the release tag exists, but an after-tag step failed."
+                });
                 ui::note("after-tag commands should support a safe retry of the same release.");
                 if !dry_run {
                     notifications::send(
@@ -1486,7 +1491,15 @@ fn cmd_deploy(
         Ok(0)
     } else {
         ui::phase("Failed");
-        if outcome.rolled_back > 0 {
+        if outcome.interrupted {
+            ui::note("interrupted (Ctrl-C) — the release was stopped where it stood.");
+        }
+        if outcome.abandoned {
+            ui::note(format!(
+                "rollback abandoned after {} step(s) — `deliver status` says where each service stands.",
+                outcome.rolled_back
+            ));
+        } else if outcome.rolled_back > 0 {
             ui::note(format!(
                 "rolled back {} step(s) — the target is back on its previous release.",
                 outcome.rolled_back
@@ -2139,7 +2152,9 @@ fn cmd_fleet(
             } => cmd_deploy(each, service, *dry_run, false, *yes, None, *force, false),
             FleetAction::Status { service } => cmd_readback(each, service, Readback::Status, false),
         });
-        if !outcome.ok() && stop_on_failure {
+        // Ctrl-C ends the fleet run even with --keep-going: the operator
+        // stopped one repo and did not ask for the next to start.
+        if !outcome.ok() && (stop_on_failure || interrupt::seen()) {
             stopped = true;
         }
         outcomes.push((repo, outcome));

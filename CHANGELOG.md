@@ -4,6 +4,15 @@
 
 ### Added
 
+- Ctrl-C during a deploy unwinds the target instead of abandoning it. The
+  step in flight stops with the keypress and counts as failed: later steps and
+  services do not run, the reversible steps that already succeeded are undone
+  in reverse, the deploy lock is released, the `failed` notice names
+  `interrupted at <step>`, and `deliver` exits `1`. A second Ctrl-C during the
+  unwind abandons it and says so. A soak window and `http` check retries stop
+  waiting at once. `fleet deploy` stops after an interrupted repo even with
+  `--keep-going`. Dry runs and read-only commands are unchanged.
+
 - `deliver rollback` previews, confirms, verifies, records and announces, the
   way `deploy` does. It reads the target first and prints both ends per
   service (`web: live … (v0.2.0) → back to … (v0.1.0)`), asks before acting
