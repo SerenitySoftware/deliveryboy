@@ -101,7 +101,7 @@ deliver deploy --service web
 
 ## Secrets
 
-Declare names in the config and resolve values from the environment, a gitignored file, the macOS Keychain, 1Password, or SOPS. Plans show names and hidden placeholders, never values.
+Declare names in the config and resolve values from the environment, a gitignored file, the macOS Keychain, 1Password, or SOPS. Plans show names and hidden placeholders, never values. A `file:` provider inside the repo must stay out of git: `secrets`, `preflight` and `deploy` refuse a committed one (exit `2`) and warn about one `.gitignore` does not cover.
 
 ```yaml
 secrets:

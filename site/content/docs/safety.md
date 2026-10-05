@@ -75,6 +75,8 @@ A lock that cannot be taken at all — no route to the host, a directory the rel
 
 Declare secret names in `.deliver.yml` and resolve values from the environment, a gitignored file, SOPS, 1Password, or the macOS Keychain. Delivery Boy hides resolved values in text and JSON plans, but a command you run can still print a secret. Keep logs private and test command output.
 
+A dotenv file is only as private as `.gitignore` makes it. When a `file:` provider's path is committed, `deliver secrets`, `preflight` and `deploy` stop with `✗ .env.deploy is committed to git` and the fix (`git rm --cached`, then ignore it); a file that is present but not ignored gets a `!` warning. Untracking it does not remove the value from history — rotate the secret.
+
 Use a release account with only the access that release needs. Avoid a root SSH account when the target can use a narrower account with specific `sudo` rights.
 
 ## Rollback limits

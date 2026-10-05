@@ -41,6 +41,11 @@ pub fn fail(msg: impl AsRef<str>) {
     eprintln!("    ✗ {}", scrub(msg.as_ref()));
 }
 
+/// A finding that does not stop the run.
+pub fn warn(msg: impl AsRef<str>) {
+    eprintln!("    ! {}", scrub(msg.as_ref()));
+}
+
 pub fn note(msg: impl AsRef<str>) {
     eprintln!("  {}", scrub(msg.as_ref()));
 }

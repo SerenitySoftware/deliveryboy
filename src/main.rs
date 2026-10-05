@@ -816,7 +816,8 @@ fn cmd_secrets(explicit: ConfigArgs<'_>, action: &Option<SecretsAction>) -> Resu
         let reqs = secrets::requirements(&config);
         let resolver = secrets::resolver(&config, &repo_root(&_path))?;
         let declared = secrets::declared_status(&resolver);
-        if reqs.is_empty() && declared.is_empty() {
+        let exposed = resolver.file_hygiene();
+        if reqs.is_empty() && declared.is_empty() && exposed.is_empty() {
             ui::detail("this config needs no secrets");
             return Ok(0);
         }
@@ -847,20 +848,25 @@ fn cmd_secrets(explicit: ConfigArgs<'_>, action: &Option<SecretsAction>) -> Resu
                 }
             }
         }
-        ui::phase(if missing == 0 {
-            "Done"
-        } else {
-            "Missing secrets"
+        let tracked = report_exposure(&exposed);
+        ui::phase(match (missing, tracked) {
+            (0, 0) => "Done",
+            (0, _) => "Secrets file in git",
+            _ => "Missing secrets",
         });
-        if missing == 0 {
+        if missing == 0 && tracked == 0 {
             ui::ok("everything this config needs is in place");
-            Ok(0)
-        } else {
+            return Ok(0);
+        }
+        if missing > 0 {
             ui::note(format!(
                 "{missing} secret(s) missing — a deploy would fail partway."
             ));
-            Ok(2)
         }
+        if tracked > 0 {
+            ui::note("a committed secrets file — deploy refuses to run until it is untracked.");
+        }
+        Ok(2)
     }
 }
 
@@ -966,11 +972,12 @@ fn secrets_announced(config: &config::Config, root: &Path) -> bool {
         }
     };
     let declared = secrets::declared_status(&resolver);
-    if reqs.is_empty() && declared.is_empty() {
+    let exposed = resolver.file_hygiene();
+    if reqs.is_empty() && declared.is_empty() && exposed.is_empty() {
         return true;
     }
     ui::phase("Secrets");
-    let mut ok = true;
+    let mut ok = report_exposure(&exposed) == 0;
     if !declared.is_empty() {
         let found = declared.iter().filter(|d| d.provider.is_some()).count();
         ui::ok(format!(
@@ -999,6 +1006,22 @@ fn secrets_announced(config: &config::Config, root: &Path) -> bool {
         }
     }
     ok
+}
+
+/// Say which secrets files git can see. Returns how many are committed — the
+/// kind that is already a leak, and stops a deploy.
+fn report_exposure(exposed: &[secrets::Exposure]) -> usize {
+    let mut tracked = 0;
+    for exposure in exposed {
+        match exposure {
+            secrets::Exposure::Tracked(_) => {
+                tracked += 1;
+                ui::fail(exposure.message());
+            }
+            secrets::Exposure::Unignored(_) => ui::warn(exposure.message()),
+        }
+    }
+    tracked
 }
 
 /// Phase: compile the plan, reporting its size.
@@ -1278,7 +1301,7 @@ fn cmd_deploy(
     // Before anything is tagged, built, or shipped.
     if !secrets_announced(&config, &root) && !dry_run {
         ui::phase("Aborted");
-        ui::note("missing secrets — nothing was tagged, built, or changed.");
+        ui::note("secrets not ready — nothing was tagged, built, or changed.");
         return Ok(2);
     }
 

@@ -4,6 +4,13 @@
 
 ### Added
 
+- A dotenv secrets file git can see is caught. When a `file:` provider's
+  path is committed, `deliver secrets`, `preflight` and `deploy` print
+  `✗ .env.deploy is committed to git` with the fix and exit `2`; a file that
+  is present but not in `.gitignore` gets a `!` warning. `sops:` files and
+  paths outside the repo are not checked. `deliver init`'s env-file note now
+  says the provider file belongs in `.gitignore`.
+
 - Ctrl-C during a deploy unwinds the target instead of abandoning it. The
   step in flight stops with the keypress and counts as failed: later steps and
   services do not run, the reversible steps that already succeeded are undone

@@ -8018,3 +8018,85 @@ fn preflight_checks_the_default_compose_file_and_includes() {
         );
     }
 }
+
+// --- a dotenv secrets file git can see ---------------------------------------
+
+/// A repo whose `.env.deploy` holds a secret, in the state `git_state` leaves
+/// it: "tracked", "unignored", or "ignored".
+fn dotenv_repo(name: &str, git_state: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: demo
+defaults: {target: local}
+targets:
+  local: {method: local, dir: .}
+secrets:
+  providers: [{file: .env.deploy}]
+  define: {API_TOKEN: {}}
+services:
+  api:
+    deployer: commands
+    config: {steps: [{ssh: "true"}]}
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".env.deploy"), "API_TOKEN=s3cr3t-value\n").unwrap();
+    if git_state == "ignored" {
+        std::fs::write(dir.join(".gitignore"), ".env.deploy\n").unwrap();
+    }
+    git_init_tagged(&dir, "v1.0.0");
+    if git_state == "unignored" {
+        git_in(&dir, &["rm", "-q", "--cached", ".env.deploy"]);
+        git_in(&dir, &["commit", "-qm", "untrack"]);
+        git_in(&dir, &["tag", "-f", "v1.0.0"]);
+    }
+    dir
+}
+
+#[test]
+fn a_committed_secrets_file_fails_secrets_preflight_and_deploy() {
+    let dir = dotenv_repo("dotenv-tracked", "tracked");
+    for args in [vec!["secrets"], vec!["preflight"], vec!["deploy", "--yes"]] {
+        let out = run_in(&dir, &args);
+        let text = output_text(&out);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {text}");
+        assert!(
+            text.contains("✗ .env.deploy is committed to git"),
+            "{args:?}: {text}"
+        );
+        assert!(
+            text.contains("git rm --cached .env.deploy"),
+            "{args:?}: {text}"
+        );
+        assert!(!text.contains("s3cr3t-value"), "{args:?}: {text}");
+    }
+}
+
+#[test]
+fn an_unignored_secrets_file_is_a_warning_not_a_failure() {
+    let dir = dotenv_repo("dotenv-unignored", "unignored");
+    let out = run_in(&dir, &["secrets"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("! .env.deploy is not in .gitignore"),
+        "{text}"
+    );
+    assert!(
+        text.contains("API_TOKEN — found in file .env.deploy"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_ignored_secrets_file_says_nothing_about_git() {
+    let dir = dotenv_repo("dotenv-ignored", "ignored");
+    let out = run_in(&dir, &["secrets"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains(".gitignore"), "{text}");
+    assert!(!text.contains("committed to git"), "{text}");
+}

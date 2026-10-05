@@ -10,7 +10,7 @@
 pub mod redact;
 pub mod resolve;
 
-pub use resolve::{parse_definitions, parse_providers, Resolver};
+pub use resolve::{parse_definitions, parse_providers, Exposure, Resolver};
 
 use crate::config::Config;
 use std::path::Path;

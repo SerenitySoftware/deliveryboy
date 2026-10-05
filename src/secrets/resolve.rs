@@ -238,6 +238,29 @@ pub fn parse_definitions(value: Option<&Value>) -> Result<Vec<Definition>> {
     Ok(defs)
 }
 
+/// A dotenv secrets file git can see.
+#[derive(Debug, PartialEq)]
+pub enum Exposure {
+    /// Committed: its values are in the repo's history.
+    Tracked(String),
+    /// Not committed, but not ignored either.
+    Unignored(String),
+}
+
+impl Exposure {
+    pub fn message(&self) -> String {
+        match self {
+            Exposure::Tracked(path) => format!(
+                "{path} is committed to git — a secrets file must not be tracked: \
+                 git rm --cached {path}, then add it to .gitignore"
+            ),
+            Exposure::Unignored(path) => {
+                format!("{path} is not in .gitignore — one `git add -A` commits its secrets")
+            }
+        }
+    }
+}
+
 /// Resolves names against the provider chain, caching whole-file providers so a
 /// 29-variable config doesn't shell out 29 times.
 pub struct Resolver {
@@ -366,6 +389,41 @@ impl Resolver {
                     .then(|| String::from_utf8_lossy(&out.stdout).to_string())
             }
         }
+    }
+
+    /// Plain dotenv providers that git would carry: committed, or sitting in
+    /// the checkout where the next `git add -A` picks them up. `sops` files
+    /// are left out — encrypted at rest is the point of them — and so is any
+    /// path outside the repo, or a repo that is not a git checkout.
+    pub fn file_hygiene(&self) -> Vec<Exposure> {
+        let mut found = Vec::new();
+        for provider in &self.providers {
+            let Provider::File { path } = provider else {
+                continue;
+            };
+            let git = |args: &[&str]| {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&self.repo_root)
+                    .args(args)
+                    .arg("--")
+                    .arg(path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .ok()
+                    .and_then(|status| status.code())
+            };
+            if git(&["ls-files", "--error-unmatch"]) == Some(0) {
+                found.push(Exposure::Tracked(path.clone()));
+            } else if self.repo_root.join(path).exists()
+                // 0 ignored, 1 not ignored, 128 not a repo or outside it.
+                && git(&["check-ignore", "-q"]) == Some(1)
+            {
+                found.push(Exposure::Unignored(path.clone()));
+            }
+        }
+        found
     }
 
     /// Read (and cache) a dotenv or sops-decrypted file.

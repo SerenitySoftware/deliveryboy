@@ -501,7 +501,8 @@ pub fn detect(root: &Path) -> Vec<Finding> {
             notes.push(format!(
                 "services read an env file ({}) — add an `env_file:` block with `literals:` and \
                  `from_secrets:` so it is rendered from your secret store; without one, no env \
-                 file is shipped and the existing one on the target is left alone",
+                 file is shipped and the existing one on the target is left alone; a `file:` \
+                 secrets provider such as `.env.deploy` belongs in `.gitignore`",
                 if project.env_files.is_empty() {
                     ".env".to_string()
                 } else {
