@@ -48,7 +48,7 @@ Before it executes anything, `deliver deploy` reads the live nginx vhost and Doc
 
 A file that already matches says `no changes to live config`, and a file that is not on the target yet is reported as a new file. When anything does change, `deploy` asks before applying it; `--yes` and a run with no terminal skip the question, and `--dry-run` prints the diff without asking.
 
-The read is read-only and never fails a release. If the file cannot be read — no route to the host, a path the release account cannot open — `deliver` says so on that line and carries on. Resolved secrets are elided from both sides of the diff, because the value already live on the target is the same secret as the one replacing it.
+The read is read-only and never fails a release. If the file cannot be read — no route to the host, a path the release account cannot open — `deliver` says so on that line and carries on. Resolved secrets are elided from both sides of the diff. When a secret has been rotated, the live side holds a value this run never resolved, so in a file whose rendering carries a secret the live side is masked by position: a line shaped like the new one around a secret prints `[NAME: value changed]`, and any other removed line prints as `changed (value hidden)` instead of its text.
 
 ## One release at a time
 

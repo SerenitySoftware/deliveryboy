@@ -17,9 +17,12 @@
 //! * **One round trip per host.** Every path for a given (target, host) is read
 //!   by a single `cat` loop, not one connection per file.
 //! * **Scrubbed.** A rendered vhost holds resolved secrets, so every line
-//!   leaving here goes through [`crate::secrets::redact`] — both sides of the
-//!   diff, since the value that is *already live* on the target is the same
-//!   secret as the one about to replace it.
+//!   leaving here goes through [`crate::secrets::redact`]. That only elides
+//!   values this run resolved, and the live side of a rotated secret is one it
+//!   never saw — so in a file whose rendering carries a secret, the live side
+//!   is masked by *position*: a line shaped like a pending line around a
+//!   secret prints `[NAME: value changed]`, and any other removed line prints
+//!   as `changed (value hidden)` rather than as itself.
 
 use crate::config::Target;
 use crate::plan::ServicePlan;
@@ -321,6 +324,65 @@ pub fn unified(old: &str, new: &str) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
+/// What a removed live line prints as when it cannot be shown safely.
+const HIDDEN: &str = "changed (value hidden)";
+
+/// Mask both sides of a file whose pending content carries a resolved secret.
+///
+/// The pending side is scrubbed as usual. A live line with the same text
+/// around a secret as a pending line is masked in that position — the same
+/// `[redacted:NAME]` when the value is unchanged, so it diffs as context, or
+/// `[NAME: value changed]` when it is not. A live line that is neither that
+/// nor present verbatim in the pending file would print as a removal, and it
+/// may hold a retired value nobody resolved this run, so it is hidden.
+fn mask(live: &str, pending: &str) -> (String, String) {
+    use crate::secrets::redact;
+    if !redact::appears_in(pending) {
+        return (live.to_string(), pending.to_string());
+    }
+    let pending = redact::scrub(pending);
+    // (prefix, marker, suffix) for every pending line around a secret.
+    let shapes: Vec<(&str, &str, &str)> = pending
+        .lines()
+        .filter_map(|line| {
+            let start = line.find("[redacted:")?;
+            let end = start + line[start..].find(']')? + 1;
+            Some((&line[..start], &line[start..end], &line[end..]))
+        })
+        .collect();
+    let kept: std::collections::HashSet<&str> = pending.lines().collect();
+    let masked: Vec<String> = live
+        .split('\n')
+        .map(|raw| {
+            let line = redact::scrub(raw);
+            if kept.contains(line.as_str()) {
+                return line;
+            }
+            for (prefix, marker, suffix) in &shapes {
+                if line.len() >= prefix.len() + suffix.len()
+                    && line.starts_with(prefix)
+                    && line.ends_with(suffix)
+                {
+                    let middle = &line[prefix.len()..line.len() - suffix.len()];
+                    if middle == *marker {
+                        return line;
+                    }
+                    let name = &marker["[redacted:".len()..marker.len() - 1];
+                    return format!("{prefix}[{name}: value changed]{suffix}");
+                }
+            }
+            HIDDEN.to_string()
+        })
+        .collect();
+    (masked.join("\n"), pending)
+}
+
+/// The diff as printed: [`unified`] over the [`mask`]ed sides.
+fn masked_diff(live: &str, pending: &str) -> Option<String> {
+    let (live, pending) = mask(live, pending);
+    unified(&live, &pending)
+}
+
 /// Render every change as the block printed before a deploy.
 ///
 /// Returns `None` when there is nothing to say — no service in this plan owns a
@@ -356,7 +418,7 @@ pub fn render(changes: &[Change]) -> Option<String> {
                 out.push_str(&format!("{service} → {where_}\n"));
                 out.push_str(&format!("   could not read the live file: {reason}\n\n"));
             }
-            Live::Present(text) => match unified(text, content) {
+            Live::Present(text) => match masked_diff(text, content) {
                 None => {
                     out.push_str(&format!("{service} → {where_}\n"));
                     out.push_str("   no changes to live config\n\n");
@@ -541,6 +603,60 @@ mod tests {
         assert!(!text.contains("zzz-live-config-secret-77"), "{text}");
         assert!(text.contains("[redacted:VHOST_TOKEN]"), "{text}");
         assert!(text.contains("+ new line;"), "{text}");
+    }
+
+    fn rotated(live: &str, pending: &str) -> String {
+        let change = Change {
+            pending: Pending {
+                service: "nginx".into(),
+                target: "production".into(),
+                host: "host".into(),
+                remote_path: "/etc/nginx/sites-available/x".into(),
+                content: pending.into(),
+            },
+            live: Live::Present(live.into()),
+        };
+        render(std::slice::from_ref(&change)).unwrap()
+    }
+
+    #[test]
+    fn a_rotated_secret_never_prints_the_retired_value() {
+        crate::secrets::redact::record("ROTATED_TOKEN", "zzz-new-rotated-secret-31");
+        let text = rotated(
+            "listen 80;\nproxy_set_header X-Token zzz-OLD-retired-secret-19;\n",
+            "listen 80;\nproxy_set_header X-Token zzz-new-rotated-secret-31;\n",
+        );
+        assert!(!text.contains("zzz-OLD-retired-secret-19"), "{text}");
+        assert!(!text.contains("zzz-new-rotated-secret-31"), "{text}");
+        assert!(
+            text.contains("- proxy_set_header X-Token [ROTATED_TOKEN: value changed];"),
+            "{text}"
+        );
+        assert!(
+            text.contains("+ proxy_set_header X-Token [redacted:ROTATED_TOKEN];"),
+            "{text}"
+        );
+        // Unchanged lines still read as context.
+        assert!(text.contains("   listen 80;"), "{text}");
+    }
+
+    #[test]
+    fn a_removed_line_that_cannot_be_attributed_is_hidden_in_a_secret_bearing_file() {
+        crate::secrets::redact::record("SHAPED_TOKEN", "zzz-shaped-secret-value-42");
+        // A hand edit on the box moved the old value onto a differently shaped line.
+        let text = rotated(
+            "set $token \"zzz-hand-edited-old-value-8\";\n",
+            "proxy_set_header X-Token zzz-shaped-secret-value-42;\n",
+        );
+        assert!(!text.contains("zzz-hand-edited-old-value-8"), "{text}");
+        assert!(text.contains("- changed (value hidden)"), "{text}");
+    }
+
+    #[test]
+    fn a_file_with_no_secret_in_it_diffs_as_before() {
+        let text = rotated("listen 80;\n", "listen 8080;\n");
+        assert!(text.contains("- listen 80;"), "{text}");
+        assert!(text.contains("+ listen 8080;"), "{text}");
     }
 
     #[test]

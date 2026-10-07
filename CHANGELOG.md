@@ -191,6 +191,13 @@
 
 ### Fixed
 
+- The live-config diff no longer prints a rotated secret's old value. Only
+  values this run resolved were elided, so the retired one printed in full
+  on the live side — in a terminal, and in a `deploy -y` CI transcript. In a
+  file whose rendering carries a secret, a line shaped like the new one
+  prints `[NAME: value changed]` and any other removed line prints as
+  `changed (value hidden)`.
+
 - `deliver deploy --yes` and `deliver verify` on an untagged `HEAD` exit `2`
   instead of `0`. Both printed "no release to deploy" and stopped, but a CI
   job running `deploy -y` on an untagged commit went green having shipped

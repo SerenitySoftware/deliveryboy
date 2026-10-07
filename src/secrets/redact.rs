@@ -73,6 +73,14 @@ pub fn scrub(text: &str) -> String {
     out
 }
 
+/// True when `text` holds any value this run resolved.
+pub fn appears_in(text: &str) -> bool {
+    registry()
+        .read()
+        .map(|reg| reg.iter().any(|(value, _)| text.contains(value.as_str())))
+        .unwrap_or(false)
+}
+
 /// Format an error chain with its values elided — what `main` prints.
 pub fn scrub_error(err: &anyhow::Error) -> String {
     scrub(&format!("{err:#}"))
