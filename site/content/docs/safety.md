@@ -81,7 +81,7 @@ Use a release account with only the access that release needs. Avoid a root SSH 
 
 ## Rollback limits
 
-File and Hugo releases use complete release directories and a live symlink, so Delivery Boy can restore the prior directory. Docker Compose keeps a rollback image when one exists. Not every command can be reversed.
+File and Hugo releases use complete release directories and a live symlink, so Delivery Boy can restore the prior directory. Docker Compose keeps a rollback image when one exists, and a copy of the Compose files and `.env` it replaced, which go back first. Not every command can be reversed.
 
 Ctrl-C during `deliver deploy` is treated as a failed step, not a crash. The step in flight is stopped with it, nothing after it runs, the steps that already changed the target are undone in reverse, the lock is given back, a `failed` notice names `interrupted at <step>`, and the run exits `1`. A command running over SSH can still finish on the target after the local `ssh` exits; the undo runs after that. Pressing Ctrl-C again while the rollback runs abandons it, and `deliver` says so — `deliver status` then shows where each service stands.
 

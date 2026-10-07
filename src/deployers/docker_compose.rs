@@ -33,6 +33,7 @@
 //! ```
 
 use super::{cfg_bool, cfg_str, LogSource, PlanContext, PlannedStep, ReleaseState};
+use crate::remote::shell_quote;
 use crate::secrets::Resolver;
 use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
@@ -179,6 +180,68 @@ fn builds_image(cfg: &Value, ctx: &PlanContext, files: &[String], tag: &str) -> 
 }
 
 /// The Compose files, in `-f` order (`docker-compose.yml` when unset).
+/// Where on the target the config a deploy is about to overwrite is kept, one
+/// directory per deploy id, relative to the project root.
+const SNAPSHOTS: &str = ".deliver/config";
+
+/// The paths, relative to the project root, that a deploy overwrites: each
+/// Compose file and `.env` land at the root under their own name, an
+/// `include:` at its repo-relative path. Anything that would resolve outside
+/// the root is left out rather than copied around blind.
+fn shipped_config(cfg: &Value, files: &[String]) -> Vec<String> {
+    let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let mut paths: Vec<String> = files.iter().map(|f| basename(f)).collect();
+    paths.extend(
+        string_list(cfg.get("include"))
+            .into_iter()
+            .map(|p| p.trim_end_matches('/').to_string()),
+    );
+    if let Some(env) = cfg.get("env_file") {
+        let path = env.get("path").and_then(|v| v.as_str()).unwrap_or(".env");
+        paths.push(basename(path));
+    }
+    paths.retain(|p| {
+        !p.is_empty() && !p.starts_with('/') && p.split('/').all(|seg| seg != ".." && seg != ".")
+    });
+    paths.dedup();
+    paths
+}
+
+/// Copy the live config aside before the deploy overwrites it. A path the
+/// target does not have yet is skipped: there is nothing to put back. Two
+/// deploys of one commit inside a second share an id, so a taken one gets a
+/// suffix that still sorts after it.
+fn snapshot_command(root: &str, sudo: &str, id: &str, paths: &[String]) -> String {
+    let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
+    format!(
+        "set -e; cd {root}; S={SNAPSHOTS}/{id}; \
+         if [ -e \"$S\" ]; then I=2; while [ -e \"$S-$I\" ]; do I=$((I+1)); done; S=\"$S-$I\"; fi; \
+         {sudo}mkdir -p \"$S\"; N=0; \
+         for p in {list}; do if [ -e \"$p\" ]; then \
+           {sudo}mkdir -p \"$S/$(dirname \"$p\")\"; {sudo}cp -Rp \"$p\" \"$S/$p\"; N=$((N+1)); fi; \
+         done; echo \"saved $N live config path(s) to $S\"",
+        list = quoted.join(" ")
+    )
+}
+
+/// Put back the newest snapshot. Newest, not this run's id: `deliver
+/// rollback` compiles a fresh plan, and the snapshot it has to restore is the
+/// one the last deploy took. Sets `RESTORED` when there was one, and never
+/// fails on its own, so the image undo that follows it still runs.
+fn restore_command(root: &str, sudo: &str, paths: &[String]) -> String {
+    let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
+    format!(
+        "cd {root}; RESTORED=; S=$(ls -1d {SNAPSHOTS}/*/ 2>/dev/null | sed 's:/*$::' | LC_ALL=C sort | tail -n 1); \
+         if [ -n \"$S\" ]; then \
+           for p in {list}; do \
+             if [ -d \"$S/$p\" ]; then {sudo}mkdir -p \"$p\" && {sudo}cp -Rp \"$S/$p/.\" \"$p/\"; \
+             elif [ -e \"$S/$p\" ]; then {sudo}cp -p \"$S/$p\" \"$p\"; fi; \
+           done; RESTORED=1; echo \"restored the config saved in $S\"; \
+         else echo 'no config snapshot on the target — the shipped config stays' >&2; fi",
+        list = quoted.join(" ")
+    )
+}
+
 fn compose_files(cfg: &Value) -> Vec<String> {
     let files = string_list(cfg.get("files"));
     if files.is_empty() {
@@ -389,6 +452,21 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         format!("ensure {root}"),
         format!("{sudo}mkdir -p {root}"),
     ));
+    // Everything below overwrites the live config in place, and the image undo
+    // alone would bring the previous image back up under the new files. So the
+    // live copies go aside first, and putting them back is this step's undo —
+    // the last thing an unwind does, after which the snapshot is spent.
+    let config_paths = shipped_config(cfg, &files);
+    let restore = restore_command(&root, sudo, &config_paths);
+    steps.push(
+        PlannedStep::ssh(
+            format!("snapshot live config → {SNAPSHOTS}/{}", ctx.version.id),
+            snapshot_command(&root, sudo, &ctx.version.id, &config_paths),
+        )
+        .with_rollback(format!(
+            "{restore}; if [ -n \"$S\" ]; then {sudo}rm -rf \"$S\"; fi"
+        )),
+    );
     for file in &files {
         let step = PlannedStep::command(format!("ship {file}"), ctx.copy(file, &root));
         // The compose file is shipped byte-for-byte, so what is in the repo is
@@ -604,9 +682,11 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // The undo this deployer owns is the image swap. With nothing shipped there
     // is none, and saying so is better than an undo that silently does nothing:
     // the project is running whatever its Compose file pins.
+    // The config goes back first, so the previous image comes up under the
+    // files and `.env` it was released with.
     steps.push(if builds {
         start.with_rollback(format!(
-            "set -e; cd {root}; \
+            "{restore}; set -e; cd {root}; \
                  if {sudo}docker image inspect {0}:rollback >/dev/null 2>&1; then \
                    {sudo}docker tag {0}:rollback {tag}; {sudo}{compose} up -d --remove-orphans; \
                    echo 'rolled back to the previous image'; \
@@ -614,11 +694,15 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             image_name
         ))
     } else {
-        start.with_rollback(
-            "echo 'no image was shipped — this project pulls its images, so there is no \
-             previous image to restore' >&2; exit 1"
-                .to_string(),
-        )
+        // A pull-only project's release *is* its config: the files pin the
+        // images, so restoring them and coming back up is the whole undo.
+        start.with_rollback(format!(
+            "{restore}; set -e; cd {root}; \
+                 if [ -n \"$RESTORED\" ]; then {sudo}{compose} up -d --remove-orphans; \
+                   echo 'rolled back to the previous config'; \
+                 else echo 'no image was shipped and no config snapshot was recorded — \
+                   nothing to restore' >&2; exit 1; fi"
+        ))
     });
 
     // --- health --------------------------------------------------------------
@@ -742,6 +826,21 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             .into_cleanup(),
         );
     }
+    // Config snapshots follow the backups' `keep`, newest by deploy id.
+    let keep_snapshots = backups.as_ref().map(|(_, keep, _)| *keep).unwrap_or(10);
+    steps.push(
+        PlannedStep::ssh(
+            format!("prune old config snapshots (keep {keep_snapshots})"),
+            format!(
+                "cd {root}/{SNAPSHOTS} 2>/dev/null || exit 0; \
+                 ls -1d -- */ 2>/dev/null | sed 's:/*$::' | LC_ALL=C sort -r | tail -n +{next} \
+                   | xargs -r {sudo}rm -rf; \
+                 echo \"kept newest {keep_snapshots}\"",
+                next = keep_snapshots + 1,
+            ),
+        )
+        .into_cleanup(),
+    );
     if let Some((dir, keep, kinds)) = &backups {
         if !kinds.is_empty() {
             steps.push(

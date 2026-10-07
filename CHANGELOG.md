@@ -4,6 +4,14 @@
 
 ### Added
 
+- A Compose rollback restores the config, not just the image. Each
+  `docker-compose` deploy copies the live Compose files, `include:` paths and
+  `.env` into `.deliver/config/<deploy-id>/` on the target before overwriting
+  them; the automatic unwind and `deliver rollback` put them back before the
+  previous image comes up. Snapshots follow `backup.keep` (default 10). A
+  pull-only project, which had no undo, now rolls back by restoring its
+  config and running `up -d`.
+
 - A dotenv secrets file git can see is caught. When a `file:` provider's
   path is committed, `deliver secrets`, `preflight` and `deploy` print
   `✗ .env.deploy is committed to git` with the fix and exit `2`; a file that

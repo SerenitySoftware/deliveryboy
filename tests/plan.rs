@@ -8100,3 +8100,162 @@ fn an_ignored_secrets_file_says_nothing_about_git() {
     assert!(!text.contains(".gitignore"), "{text}");
     assert!(!text.contains("committed to git"), "{text}");
 }
+
+// --- compose config snapshot ------------------------------------------------
+// Real deploys against a `method: local` target, with `docker` stubbed out:
+// what is under test is which Compose file and `.env` are live afterwards.
+
+#[cfg(unix)]
+fn compose_snapshot_repo(name: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmpdir(name);
+    let live = dir.join("live");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    // `exec` is the health check; it fails while `fail-health` exists.
+    let stub = bin.join("docker");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *' exec '*) test ! -e {}/fail-health;; *) exit 0;; esac\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join(".gitignore"), "live/\nbin/\nfail-health\n").unwrap();
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  web:\n    image: nginx:1.25\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: snap
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  stack:
+    deployer: docker-compose
+    config:
+      files: [docker-compose.yml]
+      env_file: {{literals: {{MODE: one}}}}
+      health: {{service: web, command: "true", retries: 1, interval: 0}}
+"#,
+            live.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (dir, live, path)
+}
+
+#[cfg(unix)]
+fn deliver_with_path(dir: &std::path::Path, path: &str, args: &[&str]) -> (bool, String) {
+    let out = deliver()
+        .current_dir(dir)
+        .env("PATH", path)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+/// Ship release two: the image pin and the `.env` both change.
+#[cfg(unix)]
+fn change_release(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  web:\n    image: nginx:1.27\n",
+    )
+    .unwrap();
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        cfg.replace("MODE: one", "MODE: two"),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_compose_deploy_puts_the_previous_config_back() {
+    let (dir, live, path) = compose_snapshot_repo("compose-snapshot-unwind");
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("snapshot live config"), "{text}");
+    let first = std::fs::read_to_string(live.join("docker-compose.yml")).unwrap();
+    assert!(first.contains("nginx:1.25"), "{first}");
+
+    change_release(&dir);
+    std::fs::write(dir.join("fail-health"), "").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+    assert!(!ok, "the health check was meant to fail:\n{text}");
+
+    let compose = std::fs::read_to_string(live.join("docker-compose.yml")).unwrap();
+    assert!(compose.contains("nginx:1.25"), "{compose}\n{text}");
+    let env = std::fs::read_to_string(live.join(".env")).unwrap();
+    assert!(env.contains("MODE=one"), "{env}\n{text}");
+    assert!(
+        text.contains("rolled back to the previous config"),
+        "{text}"
+    );
+    // The unwind spent its snapshot; the one release one took is still there.
+    let snapshots: Vec<_> = std::fs::read_dir(live.join(".deliver/config"))
+        .unwrap()
+        .collect();
+    assert_eq!(snapshots.len(), 1, "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn deliver_rollback_restores_the_compose_config_the_last_deploy_replaced() {
+    let (dir, live, path) = compose_snapshot_repo("compose-snapshot-rollback");
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(ok, "{text}");
+    change_release(&dir);
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+    assert!(ok, "{text}");
+    let compose = std::fs::read_to_string(live.join("docker-compose.yml")).unwrap();
+    assert!(compose.contains("nginx:1.27"), "{compose}");
+
+    let (_, text) = deliver_with_path(&dir, &path, &["rollback", "-y"]);
+    let compose = std::fs::read_to_string(live.join("docker-compose.yml")).unwrap();
+    assert!(compose.contains("nginx:1.25"), "{compose}\n{text}");
+    let env = std::fs::read_to_string(live.join(".env")).unwrap();
+    assert!(env.contains("MODE=one"), "{env}\n{text}");
+}
+
+#[test]
+fn compose_snapshots_are_pruned_to_the_backup_keep() {
+    let dir = compose_repo(
+        "compose-snapshot-prune",
+        "      backup:\n        keep: 3\n        volumes: [media]\n",
+    );
+    let text = String::from_utf8_lossy(&run_in(&dir, &["plan"]).stdout).to_string();
+    assert!(
+        text.contains("snapshot live config → .deliver/config/"),
+        "{text}"
+    );
+    assert!(
+        text.contains("prune old config snapshots (keep 3)"),
+        "{text}"
+    );
+}
