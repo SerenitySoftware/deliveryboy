@@ -75,6 +75,17 @@ targets:
       stale_after: 7200
 ```
 
+When a target serves an `nginx-vhost` that issues certificates, preflight looks up every name the certificate will cover and compares it with the address the target's host resolves to. A name that does not resolve yet, or resolves elsewhere, is printed as `! example.com resolves to 203.0.113.9 — target app-1.example.com is 198.51.100.4` — before the temporary ACME vhost is installed and before Let's Encrypt counts a failed authorization against its rate limit. The lookup uses this machine's resolver and is skipped in a dry run. A name behind a CDN or proxy legitimately points elsewhere, so the default only warns; `preflight: {dns: fail}` stops the run instead, and `dns: skip` does not look.
+
+```yaml
+targets:
+  production:
+    host: app-1.example.com
+    dir: /var/www/example
+    preflight:
+      dns: fail      # warn (default) | fail | skip
+```
+
 ## Services and order
 
 Each service uses one deployer. Use `needs` to order related services:

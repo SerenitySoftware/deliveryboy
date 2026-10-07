@@ -90,6 +90,16 @@
             }
           }
         },
+        "preflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "dns": {
+              "description": "Whether preflight checks that every name a certificate will be issued for resolves to this target: `warn` (default) prints a mismatch, `fail` stops the run, `skip` does not look.",
+              "enum": ["fail", "warn", "skip"]
+            }
+          }
+        },
         "user": {
           "description": "Deprecated: use `ssh.user`.",
           "type": "string"

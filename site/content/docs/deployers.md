@@ -35,7 +35,7 @@ Before the first file is overwritten, the live Compose files, each `include:` an
 
 ## `nginx-vhost`
 
-Install nginx configuration safely. The managed mode can prepare Certbot, issue or expand certificates, stage the vhost, run `nginx -t`, reload, and restore the prior configuration if validation fails.
+Install nginx configuration safely. The managed mode can prepare Certbot, issue or expand certificates, stage the vhost, run `nginx -t`, reload, and restore the prior configuration if validation fails. Before any of that, preflight checks that each certificate name resolves to the target (see `preflight.dns` on a target).
 
 ## `macos-app`
 

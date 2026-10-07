@@ -8259,3 +8259,86 @@ fn compose_snapshots_are_pruned_to_the_backup_keep() {
         "{text}"
     );
 }
+
+// --- preflight: certificate names resolve to the target ---------------------
+// `.invalid` is reserved never to resolve (RFC 6761), so the check has a name
+// it is guaranteed to flag on any machine, CI included.
+
+fn dns_repo(name: &str, preflight: &str) -> std::path::PathBuf {
+    let dir = tmpdir(name);
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/site.conf"),
+        "server {\n    listen 443 ssl;\n    server_name fresh.deliver-test.invalid;\n    \
+         ssl_certificate /etc/letsencrypt/live/fresh.deliver-test.invalid/fullchain.pem;\n    \
+         ssl_certificate_key /etc/letsencrypt/live/fresh.deliver-test.invalid/privkey.pem;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: example
+defaults: {{target: production}}
+targets:
+  production: {{host: 127.0.0.1, dir: /var/universal/example{preflight}}}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config:
+      conf: nginx/site.conf
+      certbot: {{email: ops@example.md}}
+"#
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+fn stderr_of(dir: &std::path::Path, args: &[&str]) -> String {
+    String::from_utf8_lossy(&run_in(dir, args).stderr).to_string()
+}
+
+#[test]
+fn preflight_warns_when_a_certificate_name_does_not_resolve() {
+    let dir = dns_repo("dns-warn", "");
+    let err = stderr_of(&dir, &["preflight"]);
+    assert!(
+        err.contains(
+            "! fresh.deliver-test.invalid does not resolve — target 127.0.0.1 is 127.0.0.1"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn preflight_dns_fail_makes_it_a_problem() {
+    let dir = dns_repo("dns-fail", ", preflight: {dns: fail}");
+    let err = stderr_of(&dir, &["preflight"]);
+    assert!(
+        err.contains("✗ fresh.deliver-test.invalid does not resolve"),
+        "{err}"
+    );
+}
+
+#[test]
+fn preflight_dns_skip_does_not_look() {
+    let dir = dns_repo("dns-skip", ", preflight: {dns: skip}");
+    let err = stderr_of(&dir, &["preflight"]);
+    assert!(!err.contains("deliver-test.invalid"), "{err}");
+}
+
+#[test]
+fn a_dry_run_never_looks_up_certificate_names() {
+    let dir = dns_repo("dns-dry-run", ", preflight: {dns: fail}");
+    let err = stderr_of(&dir, &["deploy", "--dry-run", "--version", "1.0.0"]);
+    assert!(!err.contains("does not resolve"), "{err}");
+}
+
+#[test]
+fn an_unknown_dns_mode_is_refused() {
+    let dir = dns_repo("dns-unknown", ", preflight: {dns: sometimes}");
+    let out = run_in(&dir, &["validate"]);
+    assert_eq!(out.status.code(), Some(2));
+}

@@ -5,16 +5,19 @@
 //! docs/deploy-lifecycle.md. Every problem is reported in one pass rather than
 //! one-at-a-time.
 
-use crate::config::{Config, Target};
+use crate::config::{Config, DnsCheck, Target};
 use crate::deployers::StepKind;
 use crate::plan::ServicePlan;
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub struct Report {
     pub problems: Vec<String>,
     pub checked: Vec<String>,
+    /// Printed, but not problems: the run goes on.
+    pub warnings: Vec<String>,
 }
 
 impl Report {
@@ -226,6 +229,100 @@ fn ssh_reachable(target: &Target, host: &str) -> Result<(), String> {
     }
 }
 
+/// Every name a certificate step will ask a CA for, by (target, host).
+fn cert_names(plan: &[ServicePlan]) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut names: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for sp in plan {
+        for step in &sp.steps {
+            if step.cert_domains.is_empty() {
+                continue;
+            }
+            names
+                .entry((sp.target.clone(), sp.host.clone()))
+                .or_default()
+                .extend(step.cert_domains.iter().cloned());
+        }
+    }
+    names
+}
+
+/// The addresses a name resolves to here, or `None` when it does not.
+fn resolve(name: &str) -> Option<BTreeSet<IpAddr>> {
+    let addrs: BTreeSet<IpAddr> = (name, 443)
+        .to_socket_addrs()
+        .ok()?
+        .map(|a| a.ip())
+        .collect();
+    (!addrs.is_empty()).then_some(addrs)
+}
+
+/// The name ssh would actually dial: a `Host` alias in `~/.ssh/config` is not
+/// something DNS can answer for.
+fn dial_name(host: &str) -> String {
+    Command::new("ssh")
+        .args(["-G", host])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix("hostname ").map(str::to_string))
+        })
+        .unwrap_or_else(|| host.to_string())
+}
+
+fn show(addrs: &BTreeSet<IpAddr>) -> String {
+    addrs
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One line per certificate name that does not resolve to the target, and
+/// nothing when they agree. A wildcard cannot be looked up, and a name still
+/// holding a placeholder is refused at compile time, so neither is asked.
+fn dns_mismatches(
+    names: &BTreeSet<String>,
+    host: &str,
+    lookup: impl Fn(&str) -> Option<BTreeSet<IpAddr>>,
+) -> Vec<String> {
+    let checkable: Vec<&String> = names
+        .iter()
+        .filter(|n| !n.starts_with("*.") && !n.contains("__") && !n.contains(['{', '$']))
+        .collect();
+    if checkable.is_empty() {
+        return Vec::new();
+    }
+    let Some(target) = lookup(host) else {
+        return vec![format!(
+            "target {host} does not resolve here — cannot check that {} point at it",
+            checkable
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )];
+    };
+    checkable
+        .into_iter()
+        .filter_map(|name| match lookup(name) {
+            None => Some(format!(
+                "{name} does not resolve — target {host} is {}; certbot cannot issue it until it does",
+                show(&target)
+            )),
+            Some(addrs) if addrs.is_disjoint(&target) => Some(format!(
+                "{name} resolves to {} — target {host} is {}",
+                show(&addrs),
+                show(&target)
+            )),
+            Some(_) => None,
+        })
+        .collect()
+}
+
 /// `also_hosts` are (target, host) pairs to probe on top of the plan's own —
 /// how `deliver preflight` still checks reachability for a service whose plan
 /// would not compile. Empty for every other caller.
@@ -238,6 +335,7 @@ pub fn run(
 ) -> Report {
     let mut problems = Vec::new();
     let mut checked = Vec::new();
+    let mut warnings = Vec::new();
 
     // 1. local tooling
     let tools = tools_needed(plan);
@@ -325,9 +423,31 @@ pub fn run(
                 }
             }
         }
+
+        // 5. certificate names point at the target — certbot's HTTP-01
+        // challenge cannot pass otherwise, and failed authorizations are
+        // rate-limited. Read off this machine's resolver, not the target's.
+        for ((target_name, host), names) in cert_names(plan) {
+            let Some(target) = config.targets.get(&target_name) else {
+                continue;
+            };
+            let mode = target.preflight.as_ref().map(|p| p.dns).unwrap_or_default();
+            if target.is_local() || mode == DnsCheck::Skip {
+                continue;
+            }
+            let lines = dns_mismatches(&names, &dial_name(&host), resolve);
+            match mode {
+                DnsCheck::Fail => problems.extend(lines),
+                _ => warnings.extend(lines),
+            }
+        }
     }
 
-    Report { problems, checked }
+    Report {
+        problems,
+        checked,
+        warnings,
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +486,66 @@ mod tests {
         let script = probe_script(&tools(&["docker compose"]));
         assert!(script.contains("docker compose version"), "{script}");
         assert!(!script.contains("command -v 'docker compose'"), "{script}");
+    }
+
+    fn addrs(list: &[&str]) -> Option<BTreeSet<IpAddr>> {
+        Some(list.iter().map(|a| a.parse().unwrap()).collect())
+    }
+
+    fn lookup(name: &str) -> Option<BTreeSet<IpAddr>> {
+        match name {
+            "box.example.com" => addrs(&["209.38.61.110"]),
+            "example.com" | "www.example.com" => addrs(&["209.38.61.110", "2001:db8::1"]),
+            "elsewhere.example.com" => addrs(&["203.0.113.9"]),
+            _ => None,
+        }
+    }
+
+    fn names(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn names_that_point_at_the_target_say_nothing() {
+        let lines = dns_mismatches(
+            &names(&["example.com", "www.example.com"]),
+            "box.example.com",
+            lookup,
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn a_name_pointed_elsewhere_names_both_addresses() {
+        let lines = dns_mismatches(
+            &names(&["example.com", "elsewhere.example.com"]),
+            "box.example.com",
+            lookup,
+        );
+        assert_eq!(
+            lines,
+            vec!["elsewhere.example.com resolves to 203.0.113.9 — target box.example.com is 209.38.61.110"]
+        );
+    }
+
+    #[test]
+    fn a_name_that_does_not_resolve_yet_says_so() {
+        let lines = dns_mismatches(&names(&["new.example.com"]), "box.example.com", lookup);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("new.example.com does not resolve"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn wildcards_and_placeholders_are_not_looked_up() {
+        let lines = dns_mismatches(
+            &names(&["*.example.com", "__SITE_DOMAIN__"]),
+            "unresolvable.example.com",
+            lookup,
+        );
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     #[test]

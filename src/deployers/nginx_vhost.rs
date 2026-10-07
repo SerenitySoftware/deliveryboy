@@ -539,6 +539,7 @@ fn certbot_ensure_step(cert: &CertNeed, cfg: &Value, ctx: &PlanContext) -> Plann
         ),
         script,
     )
+    .issues_cert_for(&cert.domains)
 }
 
 /// `content` is what will land at `sites-available/<site>`: the rendered text

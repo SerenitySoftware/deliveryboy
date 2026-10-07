@@ -29,6 +29,7 @@ pub fn compile(check: &Value, ctx: &PlanContext) -> Result<PlannedStep> {
             release_state: None,
             log_source: None,
             remote_tools: Vec::new(),
+            cert_domains: Vec::new(),
         });
     }
     if let Some(cmd) = check.get("remote_command").and_then(|v| v.as_str()) {

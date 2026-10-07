@@ -192,6 +192,10 @@ pub struct PlannedStep {
     /// `<name> version`.
     #[serde(skip_serializing)]
     pub remote_tools: Vec<String>,
+    /// Names this step asks a CA to issue a certificate for, so preflight can
+    /// check they resolve to the target before an authorization is spent.
+    #[serde(skip_serializing)]
+    pub cert_domains: Vec<String>,
 }
 
 impl PlannedStep {
@@ -209,6 +213,7 @@ impl PlannedStep {
             release_state: None,
             log_source: None,
             remote_tools: Vec::new(),
+            cert_domains: Vec::new(),
         }
     }
     pub fn command_in(
@@ -229,6 +234,7 @@ impl PlannedStep {
             release_state: None,
             log_source: None,
             remote_tools: Vec::new(),
+            cert_domains: Vec::new(),
         }
     }
     pub fn ssh(label: impl Into<String>, command: impl Into<String>) -> Self {
@@ -244,6 +250,7 @@ impl PlannedStep {
             release_state: None,
             log_source: None,
             remote_tools: Vec::new(),
+            cert_domains: Vec::new(),
         }
     }
 
@@ -268,6 +275,7 @@ impl PlannedStep {
             release_state: None,
             log_source: None,
             remote_tools: Vec::new(),
+            cert_domains: Vec::new(),
         }
     }
 
@@ -300,6 +308,7 @@ impl PlannedStep {
             release_state: None,
             log_source: None,
             remote_tools: Vec::new(),
+            cert_domains: Vec::new(),
         }
     }
 
@@ -341,6 +350,12 @@ impl PlannedStep {
     pub fn needs_remote(mut self, tools: &[&str]) -> Self {
         self.remote_tools
             .extend(tools.iter().map(|tool| tool.to_string()));
+        self
+    }
+
+    /// Declare the names this step has a certificate issued for.
+    pub fn issues_cert_for(mut self, domains: &[String]) -> Self {
+        self.cert_domains.extend(domains.iter().cloned());
         self
     }
 

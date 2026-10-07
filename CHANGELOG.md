@@ -4,6 +4,14 @@
 
 ### Added
 
+- Preflight checks that every name a certificate will be issued for
+  resolves to the target. A name that does not resolve, or resolves
+  elsewhere, prints `! example.com resolves to 203.0.113.9 — target … is …`
+  before the temporary ACME vhost goes in and before a failed authorization
+  is spent. `preflight: {dns: fail}` on a target stops the run instead, and
+  `dns: skip` turns it off; wildcards are not looked up, and a dry run skips
+  it with the other remote checks.
+
 - A Compose rollback restores the config, not just the image. Each
   `docker-compose` deploy copies the live Compose files, `include:` paths and
   `.env` into `.deliver/config/<deploy-id>/` on the target before overwriting

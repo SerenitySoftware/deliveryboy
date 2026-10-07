@@ -1140,6 +1140,9 @@ fn preflight_announced(
     for line in &report.checked {
         ui::ok(line);
     }
+    for line in &report.warnings {
+        ui::warn(line);
+    }
     for problem in &report.problems {
         ui::fail(problem);
     }

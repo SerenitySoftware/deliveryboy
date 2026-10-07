@@ -142,12 +142,35 @@ pub struct Target {
     /// [`crate::lock`] — but how long an abandoned lock blocks the next run is.
     #[serde(default)]
     pub lock: Option<LockConfig>,
+    /// Per-target preflight knobs.
+    #[serde(default)]
+    pub preflight: Option<PreflightConfig>,
     /// Deprecated: `user`/`port` now live under `ssh:`. Still accepted so older
     /// configs keep working; the values are folded into `ssh` on load.
     #[serde(default)]
     user: Option<String>,
     #[serde(default)]
     port: Option<u16>,
+}
+
+/// What preflight does about a target it can only partly check from here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightConfig {
+    /// Whether every name a certificate is issued for resolves to the target.
+    #[serde(default)]
+    pub dns: DnsCheck,
+}
+
+/// A name behind a CDN or proxy legitimately resolves elsewhere, so a
+/// mismatch only warns unless the target says it should stop the run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsCheck {
+    Fail,
+    #[default]
+    Warn,
+    Skip,
 }
 
 /// How long a deploy lock may sit before a later run is allowed to take it
@@ -875,6 +898,7 @@ targets:
     method: ssh
     sudo: true
     lock: {stale_after: 600}
+    preflight: {dns: fail}
     ssh:
       user: deploy
       port: 2222
