@@ -22,6 +22,8 @@ Build an image locally, ship it as a tarball or through a registry, preserve the
 
 A project whose services only pull published images is deployed without building anything: the config is shipped, the backup taken, the project brought up, checked and recorded. Delivery Boy builds when the service declares an `image:` block, when a Compose service has a `build:`, or when a Compose service names the tag this deploy would produce; `build: true` or `build: false` in the service config settles it either way. A Compose file that cannot be read or parsed is treated as building, since not knowing is not evidence of a pull-only project.
 
+An `env_file:` block renders the `.env` from `literals:` and resolved secrets with every value quoted, so a `$`, a ` #` or a quote reaches the container exactly as written; a value containing a newline stops the plan, because Compose cannot read one.
+
 A `backup:` block dumps the database and archives named volumes into `backups/` before anything is replaced. After a successful deploy each kind is pruned to its newest `keep` (default 10) — the Postgres dump and every volume separately — and `deliver status` names the newest backup and the count, so what there is to restore from is known before anyone opens a shell. A failed deploy prunes nothing.
 
 ```yaml

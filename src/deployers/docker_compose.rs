@@ -58,6 +58,26 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One `NAME=value` line, quoted so Compose reads the value back byte-for-byte.
+///
+/// Unquoted, Compose interpolates `$` and treats ` #` as a comment, so a
+/// password like `x7$Kq9pL` reached the container as `x7`. Single quotes are
+/// literal; a value that itself holds a single quote is double-quoted with
+/// `\`, `"` and `$` escaped instead.
+fn env_line(name: &str, value: &str) -> Result<String> {
+    if value.contains('\n') || value.contains('\r') {
+        bail!("docker-compose: env_file value {name} contains a newline — Compose cannot read it");
+    }
+    if !value.contains('\'') {
+        return Ok(format!("{name}='{value}'"));
+    }
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "$$");
+    Ok(format!("{name}=\"{escaped}\""))
+}
+
 /// Render the `.env` the containers will read.
 ///
 /// Values come from the resolver's provider chain. A missing one is fatal here
@@ -92,7 +112,7 @@ fn render_env(
             ) else {
                 continue;
             };
-            lines.push(format!("{k}={}", expand(&v, ctx)));
+            lines.push(env_line(k, &expand(&v, ctx))?);
         }
     }
 
@@ -111,7 +131,7 @@ fn render_env(
     let mut missing = Vec::new();
     for name in &wanted {
         match resolver.get(name) {
-            Some(found) => lines.push(format!("{name}={}", found.value)),
+            Some(found) => lines.push(env_line(name, &found.value)?),
             // Optional secrets may legitimately be absent.
             None if resolver.definition(name).is_some_and(|d| !d.required) => {}
             None => missing.push(name.clone()),
@@ -865,4 +885,33 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     }
 
     Ok(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_line;
+
+    #[test]
+    fn values_are_single_quoted_so_compose_reads_them_literally() {
+        assert_eq!(env_line("A", "x7$Kq9pL").unwrap(), "A='x7$Kq9pL'");
+        assert_eq!(env_line("A", "a #b").unwrap(), "A='a #b'");
+        assert_eq!(env_line("A", "").unwrap(), "A=''");
+    }
+
+    #[test]
+    fn a_single_quote_falls_back_to_escaped_double_quotes() {
+        assert_eq!(
+            env_line("A", r#"it's $5 "now" \o/"#).unwrap(),
+            r#"A="it's $$5 \"now\" \\o/""#
+        );
+    }
+
+    #[test]
+    fn a_newline_is_refused_by_name() {
+        let err = env_line("CERT", "a\nb").unwrap_err().to_string();
+        assert!(
+            err.contains("env_file value CERT contains a newline"),
+            "{err}"
+        );
+    }
 }

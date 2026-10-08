@@ -199,6 +199,13 @@
 
 ### Fixed
 
+- The `docker-compose` deployer quotes every value it writes to `.env`.
+  Unquoted, Compose interpolated `$` and read ` #` as a comment, so a
+  secret like `x7$Kq9pL` reached the container as `x7`. Values are now
+  single-quoted (double-quoted with `\`, `"` and `$` escaped when the value
+  holds a single quote), and a value containing a newline fails the plan
+  by name instead of shipping a file Compose cannot read.
+
 - The live-config diff no longer prints a rotated secret's old value. Only
   values this run resolved were elided, so the retired one printed in full
   on the live side — in a terminal, and in a `deploy -y` CI transcript. In a

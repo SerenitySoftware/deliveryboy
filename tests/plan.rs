@@ -8212,7 +8212,7 @@ fn a_failed_compose_deploy_puts_the_previous_config_back() {
     let compose = std::fs::read_to_string(live.join("docker-compose.yml")).unwrap();
     assert!(compose.contains("nginx:1.25"), "{compose}\n{text}");
     let env = std::fs::read_to_string(live.join(".env")).unwrap();
-    assert!(env.contains("MODE=one"), "{env}\n{text}");
+    assert!(env.contains("MODE='one'"), "{env}\n{text}");
     assert!(
         text.contains("rolled back to the previous config"),
         "{text}"
@@ -8240,7 +8240,59 @@ fn deliver_rollback_restores_the_compose_config_the_last_deploy_replaced() {
     let compose = std::fs::read_to_string(live.join("docker-compose.yml")).unwrap();
     assert!(compose.contains("nginx:1.25"), "{compose}\n{text}");
     let env = std::fs::read_to_string(live.join(".env")).unwrap();
-    assert!(env.contains("MODE=one"), "{env}\n{text}");
+    assert!(env.contains("MODE='one'"), "{env}\n{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn env_values_with_dollars_hashes_and_quotes_reach_the_env_file_quoted() {
+    let (dir, live, path) = compose_snapshot_repo("compose-env-quoting");
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        cfg.replace(
+            "      env_file: {literals: {MODE: one}}\n",
+            "      env_file:\n        literals: {MODE: one, NOTE: \"a #b\", QUIP: \"it's $5\"}\n        from_secrets: [DB_PASSWORD]\n",
+        )
+        .replace(
+            "services:\n",
+            "secrets: {providers: [env]}\nservices:\n",
+        ),
+    )
+    .unwrap();
+    let out = deliver()
+        .current_dir(&dir)
+        .env("PATH", &path)
+        .env("DB_PASSWORD", "x7$Kq9pL")
+        .args(["deploy", "--version", "1.0.0"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    let env = std::fs::read_to_string(live.join(".env")).unwrap();
+    assert_eq!(
+        env, "DB_PASSWORD='x7$Kq9pL'\nMODE='one'\nNOTE='a #b'\nQUIP=\"it's $$5\"\n",
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_env_value_with_a_newline_fails_compile_by_name() {
+    let (dir, _live, path) = compose_snapshot_repo("compose-env-newline");
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        cfg.replace("{MODE: one}", "{MODE: \"one\\ntwo\"}"),
+    )
+    .unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["plan"]);
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("env_file value MODE contains a newline"),
+        "{text}"
+    );
 }
 
 #[test]
