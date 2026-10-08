@@ -230,7 +230,13 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
            echo \"rolled back {subdir} → $PREV\"; \
          else \
            echo 'no previous release recorded — cannot roll back {subdir}' >&2; exit 1; \
-         fi"
+         fi; {record}",
+        record = crate::rollback::unwind_record_command(
+            &format!("{state}/.deliver/history.tsv"),
+            &stamp,
+            "basename \"$PREV\"",
+            sudo,
+        )
     );
     steps.push(
         PlannedStep::ssh(

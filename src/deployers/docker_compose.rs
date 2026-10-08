@@ -699,6 +699,18 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         Some(_) => start,
         None => start.needs_remote(&["docker", "docker compose"]),
     };
+    // Once the previous release is back up, say so in the history: the restored
+    // deploy is the row just above this one's.
+    let history = format!("{root}/.deliver/history.tsv");
+    let unwind_record = crate::rollback::unwind_record_command(
+        &history,
+        &ctx.version.id,
+        &format!(
+            "{sudo}awk -F'\\t' -v id={} '$2==id{{print p; exit}} {{p=$2}}' \"$H\"",
+            shell_quote(&ctx.version.id)
+        ),
+        sudo,
+    );
     // The undo this deployer owns is the image swap. With nothing shipped there
     // is none, and saying so is better than an undo that silently does nothing:
     // the project is running whatever its Compose file pins.
@@ -710,7 +722,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                  if {sudo}docker image inspect {0}:rollback >/dev/null 2>&1; then \
                    {sudo}docker tag {0}:rollback {tag}; {sudo}{compose} up -d --remove-orphans; \
                    echo 'rolled back to the previous image'; \
-                 else echo 'no rollback image recorded' >&2; exit 1; fi",
+                 else echo 'no rollback image recorded' >&2; exit 1; fi; {unwind_record}",
             image_name
         ))
     } else {
@@ -721,7 +733,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                  if [ -n \"$RESTORED\" ]; then {sudo}{compose} up -d --remove-orphans; \
                    echo 'rolled back to the previous config'; \
                  else echo 'no image was shipped and no config snapshot was recorded — \
-                   nothing to restore' >&2; exit 1; fi"
+                   nothing to restore' >&2; exit 1; fi; {unwind_record}"
         ))
     });
 

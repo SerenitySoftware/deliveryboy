@@ -5708,6 +5708,165 @@ fn a_declined_rollback_changes_nothing() {
     assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{text}");
 }
 
+/// Commit whatever changed, so the next deploy has its own sha and id.
+#[cfg(unix)]
+fn commit_all(dir: &std::path::Path, msg: &str) {
+    for args in [vec!["add", "-A"], vec!["commit", "-qm", msg]] {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(&args)
+            .output()
+            .unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unwound_files_deploy_is_followed_by_a_rollback_row_for_the_release_it_restored() {
+    if !mv_can_replace_a_symlink() {
+        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
+        return;
+    }
+    let dir = tmpdir("unwind-history-files");
+    let root = dir.join("live");
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dir.join("site/index.html"), "one\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), "live/\nfail-verify\n").unwrap();
+    let fail = dir.join("fail-verify");
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: unwind
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+    verify: [{{remote_command: "test ! -e {}"}}]
+"#,
+            root.display(),
+            fail.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    let deploy = |version: &str| {
+        let out = deliver()
+            .current_dir(&dir)
+            .args(["deploy", "-y", "--version", version])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (out.status.success(), output_text(&out))
+    };
+
+    let (ok, text) = deploy("1.0.0");
+    assert!(ok, "{text}");
+    let first = live_release_of(&root);
+
+    std::fs::write(dir.join("site/index.html"), "two\n").unwrap();
+    commit_all(&dir, "two");
+    std::fs::write(&fail, "").unwrap();
+    let (ok, text) = deploy("2.0.0");
+    assert!(!ok, "verify was meant to fail:\n{text}");
+    assert_eq!(live_release_of(&root), first, "{text}");
+
+    let history = std::fs::read_to_string(root.join(".deliver/history.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = history.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 3, "{history}\n{text}");
+    assert_eq!(rows[2][0], "3", "{history}");
+    assert_eq!(rows[2][1], first, "{history}");
+    assert_eq!(rows[2][2], rows[0][2], "{history}");
+    assert_eq!(rows[2][3], rows[0][3], "{history}");
+    assert_eq!(rows[2].get(5), Some(&"rollback"), "{history}");
+
+    let out = deliver().current_dir(&dir).arg("history").output().unwrap();
+    let shown = String::from_utf8_lossy(&out.stdout);
+    let live_rows: Vec<&str> = shown.lines().filter(|l| l.contains("← live")).collect();
+    assert_eq!(live_rows.len(), 1, "{shown}");
+    assert!(live_rows[0].contains("(rollback)"), "{shown}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unwound_compose_deploy_is_followed_by_a_rollback_row_for_the_release_it_restored() {
+    let (dir, live, path) = compose_snapshot_repo("unwind-history-compose");
+    let fail = dir.join("fail-verify");
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            "{cfg}    verify: [{{remote_command: \"test ! -e {}\"}}]\n",
+            fail.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".gitignore"),
+        "live/\nbin/\nfail-health\nfail-verify\n",
+    )
+    .unwrap();
+    commit_all(&dir, "verify");
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(ok, "{text}");
+
+    change_release(&dir);
+    commit_all(&dir, "two");
+    std::fs::write(&fail, "").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+    assert!(!ok, "verify was meant to fail:\n{text}");
+
+    let history = std::fs::read_to_string(live.join(".deliver/history.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = history.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 3, "{history}\n{text}");
+    assert_eq!(rows[2][1], rows[0][1], "{history}");
+    assert_eq!(rows[2][2], rows[0][2], "{history}");
+    assert_eq!(rows[2].get(5), Some(&"rollback"), "{history}");
+    assert!(text.contains("recorded rollback #3"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_compose_failure_before_the_record_step_adds_no_history_row() {
+    let (dir, live, path) = compose_snapshot_repo("unwind-history-compose-early");
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(ok, "{text}");
+    change_release(&dir);
+    commit_all(&dir, "two");
+    std::fs::write(dir.join("fail-health"), "").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+    assert!(!ok, "the health check was meant to fail:\n{text}");
+    let history = std::fs::read_to_string(live.join(".deliver/history.tsv")).unwrap();
+    assert_eq!(history.lines().count(), 1, "{history}\n{text}");
+}
+
+#[test]
+fn the_compose_unwind_appends_its_rollback_row_conditionally() {
+    let dir = compose_repo("unwind-history-plan", "");
+    let out = run_in(&dir, &["plan", "--json"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let plan: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    let undo = plan
+        .to_string()
+        .split("\"rollback\":")
+        .skip(1)
+        .find(|chunk| chunk.contains("rolled back to the previous"))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no compose undo in the plan:\n{text}"));
+    assert!(
+        undo.contains("/var/universal/demo/.deliver/history.tsv"),
+        "{undo}"
+    );
+    assert!(undo.contains("trollback"), "{undo}");
+    assert!(undo.contains("$2==id{print 1; exit}"), "{undo}");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_rollback_is_recorded_in_history_and_verified() {

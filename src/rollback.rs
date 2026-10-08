@@ -371,6 +371,35 @@ pub fn record_command(
     )
 }
 
+/// Shell that records an automatic unwind in `history.tsv`.
+///
+/// Appended to an undo after it has moved the target back. Without it the
+/// failed deploy stays the newest row, so `deliver status` reads a release
+/// that was just rolled back as live and `deliver rollback` offers to go
+/// "back" to what is already running. The row is the one [`record_command`]
+/// writes; it lands only when this run's own deploy row (`stamp`) exists, so a
+/// failure before the record step adds nothing. `id_expr` is a shell command
+/// printing the restored deploy id; release and sha come from that id's own
+/// row, `unknown` when it has none.
+pub fn unwind_record_command(history_path: &str, stamp: &str, id_expr: &str, sudo: &str) -> String {
+    format!(
+        "H={h}; \
+         if {sudo}test -f \"$H\" && [ -n \"$({sudo}awk -F'\\t' -v id={stamp} '$2==id{{print 1; exit}}' \"$H\")\" ]; then \
+           ID=$({id_expr}); \
+           if [ -n \"$ID\" ]; then \
+             REL=$({sudo}awk -F'\\t' -v id=\"$ID\" '$2==id{{r=$3}} END{{print (r==\"\" ? \"unknown\" : r)}}' \"$H\"); \
+             SHA=$({sudo}awk -F'\\t' -v id=\"$ID\" '$2==id{{r=$4}} END{{print (r==\"\" ? \"unknown\" : r)}}' \"$H\"); \
+             N=$(( $({sudo}wc -l \"$H\" | awk '{{print $1}}') + 1 )); \
+             printf '%s\\t%s\\t%s\\t%s\\t%s\\trollback\\n' \"$N\" \"$ID\" \"$REL\" \"$SHA\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \
+               | {sudo}tee -a \"$H\" >/dev/null; \
+             echo \"recorded rollback #$N · $ID\"; \
+           fi; \
+         fi",
+        h = shell_quote(history_path),
+        stamp = shell_quote(stamp),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -199,6 +199,14 @@
 
 ### Fixed
 
+- The automatic unwind after a failed step is recorded in `history.tsv`.
+  The failed deploy used to stay the newest row, so `deliver status` on a
+  Compose service read the release that had just been rolled back as live,
+  and `deliver rollback` offered to go "back" to what was already running.
+  The `files`/`hugo` and `docker-compose` undos now append a `rollback` row
+  for the release they restored, once the target has been moved back and
+  only when this run's own deploy row exists.
+
 - The `docker-compose` deployer quotes every value it writes to `.env`.
   Unquoted, Compose interpolated `$` and read ` #` as a comment, so a
   secret like `x7$Kq9pL` reached the container as `x7`. Values are now

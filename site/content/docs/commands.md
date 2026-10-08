@@ -118,6 +118,8 @@ deliver history --limit 0
 
 `--limit N` shows the newest `N` per service (default 10); `--limit 0` shows every recorded deploy.
 
+A deploy that failed and was unwound is followed by a `(rollback)` row for the release it restored, so the live marker stays on what is actually running.
+
 ## `deliver logs`
 
 Tail what the deploy is running, without an ssh session.
