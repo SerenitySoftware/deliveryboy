@@ -324,18 +324,52 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         .map(|t| expand(t, ctx))
         .collect();
     let image_name = tag.split(':').next().unwrap_or(&tag);
+    // Every image the project ships, as `(name, tag)`: the primary and each
+    // further `images:` entry. `extra_tags` are the primary under other names
+    // and need no rollback of their own. A rollback has to cover all of them,
+    // or the previous release's `api` comes back up beside the new `web`.
+    let shipped_images: Vec<(String, String)> = std::iter::once(tag.clone())
+        .chain(image_specs.iter().skip(1).filter_map(|spec| {
+            spec.get("tag")
+                .and_then(|v| v.as_str())
+                .map(|t| expand(t, ctx))
+        }))
+        .map(|t| (t.split(':').next().unwrap_or(&t).to_string(), t))
+        .collect();
+    let image_names = shipped_images
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
 
     // Loading or pulling the new image replaces the local `:latest` tag on
     // the target. Record the outgoing image immediately before that happens;
     // doing it later would make `:rollback` point at the release we are trying
     // to undo.
     let mark_rollback = || {
+        if shipped_images.len() == 1 {
+            return PlannedStep::ssh(
+                "mark the current image as rollback".to_string(),
+                format!(
+                    "{sudo}docker image inspect {tag} >/dev/null 2>&1 && \
+                     {sudo}docker tag {tag} {image_name}:rollback || true"
+                ),
+            );
+        }
         PlannedStep::ssh(
-            "mark the current image as rollback".to_string(),
             format!(
-                "{sudo}docker image inspect {tag} >/dev/null 2>&1 && \
-                 {sudo}docker tag {tag} {image_name}:rollback || true"
+                "mark the current images as rollback ({})",
+                image_names.join(", ")
             ),
+            shipped_images
+                .iter()
+                .map(|(name, t)| {
+                    format!(
+                        "{{ {sudo}docker image inspect {t} >/dev/null 2>&1 && \
+                         {sudo}docker tag {t} {name}:rollback || true; }}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
         )
     };
 
@@ -455,13 +489,38 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                     tag.rsplit('/').next().unwrap_or(&tag)
                 );
                 steps.push(mark_rollback());
-                steps.push(
-                    PlannedStep::ssh(
-                        format!("pull {primary} on the target"),
-                        format!("{sudo}docker pull {primary} && {sudo}docker tag {primary} {tag}"),
-                    )
-                    .needs_remote(&["docker"]),
-                );
+                if shipped_images.len() == 1 {
+                    steps.push(
+                        PlannedStep::ssh(
+                            format!("pull {primary} on the target"),
+                            format!(
+                                "{sudo}docker pull {primary} && {sudo}docker tag {primary} {tag}"
+                            ),
+                        )
+                        .needs_remote(&["docker"]),
+                    );
+                } else {
+                    // Every image was pushed above; every one has to come down.
+                    let pulls = shipped_images
+                        .iter()
+                        .map(|(_, t)| {
+                            let remote = format!(
+                                "{}/{}",
+                                registry.trim_end_matches('/'),
+                                t.rsplit('/').next().unwrap_or(t)
+                            );
+                            format!("{sudo}docker pull {remote} && {sudo}docker tag {remote} {t}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" && ");
+                    steps.push(
+                        PlannedStep::ssh(
+                            format!("pull {} image(s) on the target", shipped_images.len()),
+                            format!("set -e; {pulls}"),
+                        )
+                        .needs_remote(&["docker"]),
+                    );
+                }
             }
             other => bail!("docker-compose: unknown image.transport '{other}' (tarball|registry)"),
         }
@@ -716,7 +775,26 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // the project is running whatever its Compose file pins.
     // The config goes back first, so the previous image comes up under the
     // files and `.env` it was released with.
-    steps.push(if builds {
+    steps.push(if builds && shipped_images.len() > 1 {
+        // Every image goes back or none does: a mix of the previous and the
+        // new images is neither release, so it is never brought up as one.
+        let names = image_names.join(" ");
+        let retag: String = shipped_images
+            .iter()
+            .map(|(name, t)| format!("{sudo}docker tag {name}:rollback {t}; "))
+            .collect();
+        start.with_rollback(format!(
+            "{restore}; set -e; cd {root}; MISSING=; \
+                 for i in {names}; do \
+                   {sudo}docker image inspect \"$i:rollback\" >/dev/null 2>&1 || MISSING=\"$MISSING $i\"; \
+                 done; \
+                 if [ -z \"$MISSING\" ]; then \
+                   {retag}{sudo}{compose} up -d --remove-orphans; \
+                   echo 'rolled back to the previous images ({})'; \
+                 else echo \"no rollback image recorded for:$MISSING\" >&2; exit 1; fi; {unwind_record}",
+            image_names.join(", ")
+        ))
+    } else if builds {
         start.with_rollback(format!(
             "{restore}; set -e; cd {root}; \
                  if {sudo}docker image inspect {0}:rollback >/dev/null 2>&1; then \

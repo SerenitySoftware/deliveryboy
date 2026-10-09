@@ -3226,6 +3226,134 @@ fn a_failed_start_can_roll_back_to_the_previous_image() {
     assert!(rollback.contains("demo:rollback"), "{rollback}");
 }
 
+/// A three-image project shaped like a real api/web/exporter split.
+fn three_image_repo(name: &str, primary_extra: &str) -> std::path::PathBuf {
+    compose_repo(
+        name,
+        &format!(
+            "      images:\n        - {{tag: 'demo-api:latest'{primary_extra}}}\n        - {{tag: 'demo-web:latest'}}\n        - {{tag: 'demo-exporter:latest'}}\n"
+        ),
+    )
+}
+
+fn plan_steps(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let out = run_in(dir, &["plan", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    plan[0]["steps"].as_array().unwrap().clone()
+}
+
+fn ssh_command(step: &serde_json::Value) -> &str {
+    step["kind"]["Ssh"]["command"].as_str().unwrap_or("")
+}
+
+#[test]
+fn every_image_of_a_multi_image_project_is_marked_and_restored_together() {
+    let steps = plan_steps(&three_image_repo("compose-multi-rollback", ""));
+    let label = "mark the current images as rollback (demo-api, demo-web, demo-exporter)";
+    let mark = steps
+        .iter()
+        .position(|s| s["label"] == label)
+        .unwrap_or_else(|| panic!("no `{label}` step"));
+    let load = steps
+        .iter()
+        .position(|s| s["label"] == "load image on the target")
+        .expect("no load step");
+    assert!(
+        mark < load,
+        "images must be marked before the load replaces them"
+    );
+    let marked = ssh_command(&steps[mark]);
+    for name in ["demo-api", "demo-web", "demo-exporter"] {
+        assert!(
+            marked.contains(&format!("docker tag {name}:latest {name}:rollback")),
+            "{name} is not marked: {marked}"
+        );
+    }
+
+    let start = steps
+        .iter()
+        .find(|s| s["label"] == "start services")
+        .expect("no start step");
+    let undo = start["rollback"].as_str().expect("start has no undo");
+    for name in ["demo-api", "demo-web", "demo-exporter"] {
+        assert!(
+            undo.contains(&format!("docker tag {name}:rollback {name}:latest")),
+            "{name} is not restored: {undo}"
+        );
+    }
+    // A missing `:rollback` refuses by name rather than bringing up a mix.
+    assert!(
+        undo.contains("for i in demo-api demo-web demo-exporter"),
+        "{undo}"
+    );
+    assert!(
+        undo.contains("no rollback image recorded for:$MISSING"),
+        "{undo}"
+    );
+    assert!(
+        undo.find("MISSING=").unwrap() < undo.find("docker tag demo-api:rollback").unwrap(),
+        "every image must be checked before any is re-tagged: {undo}"
+    );
+    assert!(
+        undo.contains("rolled back to the previous images (demo-api, demo-web, demo-exporter)"),
+        "{undo}"
+    );
+}
+
+#[test]
+fn a_registry_transport_pulls_every_image_it_pushed() {
+    let steps = plan_steps(&three_image_repo(
+        "compose-multi-registry",
+        ", transport: registry, registry: ghcr.io/acme",
+    ));
+    let pull = steps
+        .iter()
+        .find(|s| s["label"] == "pull 3 image(s) on the target")
+        .expect("no pull step for every image");
+    let cmd = ssh_command(pull);
+    assert_eq!(cmd.matches("docker pull").count(), 3, "{cmd}");
+    for name in ["demo-api", "demo-web", "demo-exporter"] {
+        assert!(
+            cmd.contains(&format!(
+                "docker pull ghcr.io/acme/{name}:latest && sudo docker tag ghcr.io/acme/{name}:latest {name}:latest"
+            )),
+            "{name} is never pulled: {cmd}"
+        );
+    }
+}
+
+#[test]
+fn a_single_image_keeps_its_single_rollback() {
+    let steps = plan_steps(&compose_repo(
+        "compose-single-rollback",
+        "      image: {tag: 'demo:latest', transport: registry, registry: ghcr.io/acme}\n",
+    ));
+    let labels: Vec<&str> = steps.iter().filter_map(|s| s["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"mark the current image as rollback"),
+        "{labels:?}"
+    );
+    assert!(
+        labels.contains(&"pull ghcr.io/acme/demo:latest on the target"),
+        "{labels:?}"
+    );
+    let start = steps
+        .iter()
+        .find(|s| s["label"] == "start services")
+        .unwrap();
+    let undo = start["rollback"].as_str().unwrap();
+    assert!(
+        undo.contains("rolled back to the previous image'"),
+        "{undo}"
+    );
+    assert!(!undo.contains("MISSING"), "{undo}");
+}
+
 // --- secrets.define ---------------------------------------------------------
 
 fn declared_repo(name: &str, define: &str) -> std::path::PathBuf {

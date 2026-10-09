@@ -199,6 +199,15 @@
 
 ### Fixed
 
+- A Compose project with several `images:` rolls all of them back. Only the
+  first image used to get a `:rollback` tag, so a failed deploy brought the
+  previous `api` back up beside the new `web` and `exporter` while saying the
+  target was on its previous release, and `transport: registry` pulled only
+  the first image. Every shipped image is now marked before the new ones
+  land, the undo re-tags all of them or, when any `:rollback` is missing,
+  changes nothing and names it, and the registry transport pulls each one.
+  A single `image:` compiles to the same commands as before.
+
 - The automatic unwind after a failed step is recorded in `history.tsv`.
   The failed deploy used to stay the newest row, so `deliver status` on a
   Compose service read the release that had just been rolled back as live,
