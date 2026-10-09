@@ -199,6 +199,12 @@
 
 ### Fixed
 
+- A `docker-compose` deploy to a `method: local` target can roll back. The
+  build runs on the target's own Docker daemon and moved `:latest` to the new
+  image before the outgoing one was tagged `:rollback`, so an unwind
+  re-tagged the failed release over itself and reported success. On a local
+  target the outgoing images are now marked before the build.
+
 - A Compose project with several `images:` rolls all of them back. Only the
   first image used to get a `:rollback` tag, so a failed deploy brought the
   previous `api` back up beside the new `web` and `exporter` while saying the

@@ -3354,6 +3354,54 @@ fn a_single_image_keeps_its_single_rollback() {
     assert!(!undo.contains("MISSING"), "{undo}");
 }
 
+#[test]
+fn a_local_target_marks_the_rollback_image_before_building_over_it() {
+    // `method: local` builds on the target's own daemon: the build itself
+    // moves `:latest`, so a mark placed before the load would tag the new image.
+    let dir = tmpdir("compose-local-mark");
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services: {app: {image: demo:latest}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        r#"
+version: 1
+app: demo
+defaults: {target: box}
+targets:
+  box: {host: localhost, method: local, sudo: false, dir: /srv/demo}
+services:
+  app:
+    deployer: docker-compose
+    config:
+      files: [docker-compose.yml]
+      project: demo
+      images:
+        - {tag: 'demo-api:latest'}
+        - {tag: 'demo-web:latest'}
+"#,
+    )
+    .unwrap();
+    let steps = plan_steps(&dir);
+    let labels: Vec<&str> = steps.iter().filter_map(|s| s["label"].as_str()).collect();
+    let mark = labels
+        .iter()
+        .position(|l| l.starts_with("mark the current images as rollback"))
+        .unwrap_or_else(|| panic!("no mark step: {labels:?}"));
+    let build = labels
+        .iter()
+        .position(|l| l.starts_with("build "))
+        .unwrap_or_else(|| panic!("no build step: {labels:?}"));
+    assert!(mark < build, "mark must precede the build: {labels:?}");
+    assert_eq!(
+        labels.iter().filter(|l| l.starts_with("mark ")).count(),
+        1,
+        "marked twice: {labels:?}"
+    );
+}
+
 // --- secrets.define ---------------------------------------------------------
 
 fn declared_repo(name: &str, define: &str) -> std::path::PathBuf {

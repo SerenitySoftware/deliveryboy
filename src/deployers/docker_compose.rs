@@ -383,7 +383,14 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // --- build ---------------------------------------------------------------
     // Built here, never on the target: a shared box tuned to the edge of its
     // memory can't afford a docker build.
+    // On a `method: local` target the build runs on the target's own daemon
+    // and moves `:latest` to the new image itself, so the outgoing image has
+    // to be marked before the build, not before the load.
+    let mark_before_build = ctx.target.is_local();
     if builds {
+        if mark_before_build {
+            steps.push(mark_rollback());
+        }
         let all_tags: Vec<String> = std::iter::once(tag.clone())
             .chain(extra_tags.iter().map(|t| {
                 if t.contains(':') {
@@ -448,7 +455,9 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                     ctx.copy(&tar, &root),
                 ));
                 let remote_tar = format!("{root}/{}-image.tar.gz", ctx.app);
-                steps.push(mark_rollback());
+                if !mark_before_build {
+                    steps.push(mark_rollback());
+                }
                 steps.push(
                     PlannedStep::ssh(
                         "load image on the target".to_string(),
@@ -488,7 +497,9 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                     registry.trim_end_matches('/'),
                     tag.rsplit('/').next().unwrap_or(&tag)
                 );
-                steps.push(mark_rollback());
+                if !mark_before_build {
+                    steps.push(mark_rollback());
+                }
                 if shipped_images.len() == 1 {
                     steps.push(
                         PlannedStep::ssh(
