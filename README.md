@@ -156,6 +156,19 @@ $ deliver plan
    1. [command] build (.)  — export VITE_ANALYTICS_KEY='[redacted:BUILD_TOKEN]'; npm run build
 ```
 
+## Azure releases from a local checkout
+
+The source checkout adds `deliver release` for retained build artifacts, required
+checks on local/Windows hosts, private Azure Blob receipts and leases, ACR image
+publication, Container Apps jobs/revisions and separate Static Web Apps sites.
+It calls project Task/Bicep hooks and accepts a release only after application,
+browser and docs checks pass. It never automatically reverses a database change.
+
+See the [Azure release guide](docs/azure-releases.md),
+[ThankTank-compatible example](examples/thanktank.release.yml), and
+[integration handoff](docs/thanktank-handoff.md). This feature is not in the
+published 0.2.0 package. Live Azure and native Windows acceptance remain open.
+
 ## Built-in deployers
 
 - Hugo sites and prepared files

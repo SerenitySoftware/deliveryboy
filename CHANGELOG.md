@@ -4,6 +4,13 @@
 
 ### Added
 
+- An opt-in `deliver release` Azure path with local Task/command producers,
+  hash-pinned private artifacts and check receipts, cross-machine Blob leases,
+  immutable version reservations, ACR digests, Container Apps jobs/revisions,
+  migration guards and separate Static Web Apps publication. Failed migrations
+  retain locks and recovery evidence; no database or code rollback runs.
+  Includes a ThankTank integration contract without changing that project.
+
 - Preflight checks that every name a certificate will be issued for
   resolves to the target. A name that does not resolve, or resolves
   elsewhere, prints `! example.com resolves to 203.0.113.9 — target … is …`

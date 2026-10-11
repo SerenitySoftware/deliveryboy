@@ -19,6 +19,8 @@ include = [
     "/LICENSE",
     "/CHANGELOG.md",
     "/SECURITY.md",
+    "/docs/**",
+    "/examples/**",
 ]
 
 # `deliveryboy` is the package; `deliver` is the command it installs.
@@ -32,6 +34,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 anyhow = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 jsonschema = { version = "0.57.0", default-features = false }

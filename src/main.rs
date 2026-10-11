@@ -15,6 +15,7 @@ mod notifications;
 mod plan;
 mod preflight;
 mod readback;
+mod release;
 mod remote;
 mod rollback;
 mod secrets;
@@ -106,6 +107,11 @@ enum FleetAction {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Prepare, check and deploy retained artifacts with the Azure release adapter
+    Release {
+        #[command(subcommand)]
+        action: release::Action,
+    },
     /// Inspect a repo, report how it's deployed, and scaffold a config
     Init {
         /// Repo to inspect (default: current directory)
@@ -260,6 +266,7 @@ fn run(cli: &Cli) -> Result<i32> {
         target: cli.target.as_deref(),
     };
     match &cli.command {
+        Commands::Release { action } => release::run(args.path, args.target, action),
         Commands::Init {
             path,
             host,

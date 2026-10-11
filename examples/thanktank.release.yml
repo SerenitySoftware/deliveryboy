@@ -1,0 +1,129 @@
+# Integration contract, not a ready-to-deploy ThankTank configuration.
+# Copy to ThankTank's root as .deliver-release.yml and implement delivery:* tasks
+# described in docs/thanktank-handoff.md. Replace the identity/store/registry values.
+release_version: 1
+app: thanktank
+checkout: .
+source: {remote: origin, branch: main}
+artifacts: .local/deliveryboy-bundle
+secret_env: [] # Name any pre-existing secret environment variables; never put values here.
+build:
+  # task test already builds, tests, rehearses, exports and scans every release image
+  # and builds both docs sites. Do not add release:build or docs:build again.
+  - {argv: [task, test], platforms: [macos, linux]}
+  # This new task wraps existing up/down with guaranteed cleanup on failure.
+  - {argv: [task, delivery:compose-check], platforms: [macos, linux]}
+  # Copy the existing sealed outputs; this task must not build anything.
+  - {argv: [task, delivery:export], platforms: [macos, linux]}
+checks:
+  bundle:
+    argv: [task, delivery:check-bundle]
+    platforms: [macos, linux]
+  windows:
+    argv: [task, delivery:check-windows]
+    platforms: [windows]
+targets:
+  dev:
+    provider: azure
+    production: false
+    subscription: 00000000-0000-0000-0000-000000000000
+    tenant: 00000000-0000-0000-0000-000000000000
+    resource_group: thanktank-dev-platform
+    store:
+      account: replaceprivateevidence
+      resource_group: replace-evidence-group
+      container: releases
+      locks: [locks/thanktank-dev, locks/thanktank-docs]
+    registry: replacedevregistry
+    images:
+      backend: thanktank/backend
+      api: thanktank/api
+      document-generator: thanktank/document-generator
+      portal: thanktank/portal
+      angular: thanktank/angular
+      operations: thanktank/operations
+    writers: [tt-dev-api, tt-dev-worker, tt-dev-portal-api, tt-dev-document-generator]
+    guard: {argv: [task, delivery:writer-guard]}
+    infrastructure: [{argv: [task, delivery:infrastructure]}]
+    migrate: {argv: [task, delivery:migration-guard]}
+    migration_jobs: [tt-dev-migrate]
+    rollout: [{argv: [task, delivery:rollout]}]
+    applications:
+      tt-dev-api: backend
+      tt-dev-worker: backend
+      tt-dev-portal-api: api
+      tt-dev-document-generator: document-generator
+      tt-dev-portal: portal
+      tt-dev-angular: angular
+    verification_jobs: [tt-dev-verify]
+    verify: [{argv: [task, delivery:verify]}]
+    browser: [{argv: [task, delivery:browser]}]
+    docs:
+      internal:
+        name: thanktank-docs-internal
+        resource_group: thanktank-docs-platform
+        artifact: docs/internal
+        policy: docs/sites/internal/staticwebapp.config.json
+        access: internal
+        validate: {argv: [task, delivery:docs-check, --, internal]}
+        verify: {argv: [task, delivery:docs-verify, --, internal]}
+      public:
+        name: thanktank-docs-external
+        resource_group: thanktank-docs-platform
+        artifact: docs/external
+        policy: docs/sites/external/staticwebapp.config.json
+        access: public
+        validate: {argv: [task, delivery:docs-check, --, external]}
+        verify: {argv: [task, delivery:docs-verify, --, external]}
+  production:
+    provider: azure
+    production: true
+    subscription: 00000000-0000-0000-0000-000000000000
+    tenant: 00000000-0000-0000-0000-000000000000
+    resource_group: thanktank-prod-platform
+    store:
+      account: replaceprivateevidence
+      resource_group: replace-evidence-group
+      container: releases
+      locks: [locks/thanktank-production, locks/thanktank-docs]
+    registry: replaceprodregistry
+    images:
+      backend: thanktank/backend
+      api: thanktank/api
+      document-generator: thanktank/document-generator
+      portal: thanktank/portal
+      angular: thanktank/angular
+      operations: thanktank/operations
+    writers: [tt-prod-api, tt-prod-worker, tt-prod-portal-api, tt-prod-document-generator]
+    guard: {argv: [task, delivery:writer-guard]}
+    infrastructure: [{argv: [task, delivery:infrastructure]}]
+    migrate: {argv: [task, delivery:migration-guard]}
+    migration_jobs: [tt-prod-migrate]
+    rollout: [{argv: [task, delivery:rollout]}]
+    applications:
+      tt-prod-api: backend
+      tt-prod-worker: backend
+      tt-prod-portal-api: api
+      tt-prod-document-generator: document-generator
+      tt-prod-portal: portal
+      tt-prod-angular: angular
+    verification_jobs: [tt-prod-verify]
+    verify: [{argv: [task, delivery:verify]}]
+    browser: [{argv: [task, delivery:browser]}]
+    docs:
+      internal:
+        name: thanktank-docs-internal
+        resource_group: thanktank-docs-platform
+        artifact: docs/internal
+        policy: docs/sites/internal/staticwebapp.config.json
+        access: internal
+        validate: {argv: [task, delivery:docs-check, --, internal]}
+        verify: {argv: [task, delivery:docs-verify, --, internal]}
+      public:
+        name: thanktank-docs-external
+        resource_group: thanktank-docs-platform
+        artifact: docs/external
+        policy: docs/sites/external/staticwebapp.config.json
+        access: public
+        validate: {argv: [task, delivery:docs-check, --, external]}
+        verify: {argv: [task, delivery:docs-verify, --, external]}
