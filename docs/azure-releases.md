@@ -2,11 +2,10 @@
 
 `deliver release` prepares, checks and deploys a retained release through Azure
 CLI. It needs no Delivery Boy service, hosted CI runner or Azure DevOps build
-record. This is an opt-in source-checkout feature; the published 0.2.0 package
-does not contain it. Install the implementation commit supplied with the change:
+record. This opt-in feature is available starting in version 0.3.0:
 
 ```sh
-cargo install --locked --path /path/to/deliveryboy --force
+cargo install deliveryboy --version 0.3.0 --locked --force
 deliver release --help
 ```
 
