@@ -155,7 +155,8 @@ fn repo() -> PathBuf {
     let root = evidence::workspace().unwrap();
     git(&root, &["init"]).unwrap();
     git(&root, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
-    git(&root, &["remote", "add", "origin", root.to_str().unwrap()]).unwrap();
+    // A relative self-remote also works with Windows verbatim workspace paths.
+    git(&root, &["remote", "add", "origin", "."]).unwrap();
     git(&root, &["config", "user.name", "Test"]).unwrap();
     git(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
     fs::write(root.join(".gitignore"), "output/\n").unwrap();
@@ -432,11 +433,11 @@ fn no_acceptance_when_durable_acceptance_write_fails() {
 #[test]
 fn internal_docs_require_exact_reader_policy() {
     let root = evidence::workspace().unwrap();
-    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("docs/internal")).unwrap();
     let site = config::Site {
         name: "internal".into(),
         resource_group: "docs".into(),
-        artifact: "docs".into(),
+        artifact: "docs/internal".into(),
         policy: "policy.json".into(),
         access: config::Access::Internal,
         validate: command(),
@@ -444,10 +445,18 @@ fn internal_docs_require_exact_reader_policy() {
     };
     let policy = json!({"routes":[{"route":"/*","allowedRoles":["internal-reader"]}]});
     evidence::write(&root.join("policy.json"), &policy).unwrap();
-    evidence::write(&root.join("docs/staticwebapp.config.json"), &policy).unwrap();
+    evidence::write(
+        &root.join("docs/internal/staticwebapp.config.json"),
+        &policy,
+    )
+    .unwrap();
     azure::site_policy(&site, &root, &root).unwrap();
     let public = json!({"routes":[{"route":"/*","allowedRoles":["anonymous"]}]});
-    evidence::write(&root.join("docs/staticwebapp.config.json"), &public).unwrap();
+    evidence::write(
+        &root.join("docs/internal/staticwebapp.config.json"),
+        &public,
+    )
+    .unwrap();
     assert!(azure::site_policy(&site, &root, &root).is_err());
     evidence::write(&root.join("policy.json"), &public).unwrap();
     assert!(azure::site_policy(&site, &root, &root).is_err());

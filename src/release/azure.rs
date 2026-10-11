@@ -551,8 +551,9 @@ impl Provider for Azure<'_> {
 }
 /// Policy bytes come from the pinned checkout. Application content/access checks remain required.
 pub fn site_policy(site: &Site, root: &Path, artifacts: &Path) -> Result<()> {
-    let artifact =
-        super::config::contained(artifacts, &site.artifact.join("staticwebapp.config.json"))?;
+    // Validate the portable config path before joining native path separators.
+    let directory = super::config::contained(artifacts, &site.artifact)?;
+    let artifact = super::config::contained(&directory, Path::new("staticwebapp.config.json"))?;
     ensure!(
         fs::read(&artifact)? == fs::read(super::config::contained(root, &site.policy)?)?,
         "documentation access policy changed"
