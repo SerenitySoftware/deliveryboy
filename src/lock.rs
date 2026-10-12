@@ -244,12 +244,15 @@ fn parse_ownership(output: &str, marker: &str) -> Ownership {
 /// Rewrite `started_epoch` in the owner file, if the file still names `deploy`.
 /// Read whole, rewritten whole: a concurrent acquire that reads mid-write sees
 /// either the old stamp, the new one, or none — and none is "do not take over".
+/// A lock directory with no owner file names nobody; it is left alone rather
+/// than reported as another run's or given a stamp with no owner.
 fn refresh_script(dir: &str, deploy: &str, sudo: &str, marker: &str) -> String {
     format!(
         "L={l}; N={n}; D={d}\n\
          if [ ! -d \"$L\" ]; then printf '%s GONE\\n' \"$N\"; exit 0; fi\n\
          HELD=$({sudo}cat \"$L/owner\" 2>/dev/null || true)\n\
          OWNED=$(printf '%s\\n' \"$HELD\" | sed -n 's/^deploy=//p' | head -1)\n\
+         if [ -z \"$OWNED\" ]; then printf '%s REFRESHED none\\n' \"$N\"; exit 0; fi\n\
          if [ \"$OWNED\" != \"$D\" ]; then printf '%s OTHER %s\\n' \"$N\" \"$OWNED\"; exit 0; fi\n\
          NOW=$(date -u +%s)\n\
          printf '%s\\n' \"$HELD\" | awk -v now=\"$NOW\" \
@@ -742,6 +745,21 @@ mod tests {
             "{text}"
         );
         assert_eq!(epoch_in(&theirs), "1000");
+
+        // A lock with no owner file names nobody: not ours to stamp, not
+        // another run's to report.
+        std::fs::remove_file(theirs.join("owner")).unwrap();
+        let text = sh(&refresh_script(
+            &theirs.to_string_lossy(),
+            "d1",
+            "",
+            "__M__",
+        ));
+        assert_eq!(parse_ownership(&text, "__M__"), Ownership::Ours, "{text}");
+        assert!(
+            !theirs.join("owner").exists(),
+            "a refresh must never write an owner file"
+        );
 
         // And a lock that is gone says so rather than inventing one.
         let _ = std::fs::remove_dir_all(&theirs);
