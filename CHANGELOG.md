@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A failed `verify:` can always be unwound, whatever `keep_releases` says.
+  The `files`/`hugo` prune ran before the service's checks and kept the
+  newest N by name with no regard for the release `.deliver-previous`
+  names, so with `keep_releases: 1` — or after `rollback --to` had landed
+  on the oldest retained release — it deleted the only directory the undo
+  could go back to, one step before the check that needed it, and the
+  failed release stayed live. The prune is now a cleanup step (after
+  verify, skipped on failure) and always spares the live release and the
+  one the marker names. `keep_releases` still means N releases by name.
+
+- A rollback that fails is reported as one. The deploy summary counted only
+  undos that succeeded, so a failed undo printed "no reversible step had
+  run, so nothing needed rolling back" while the target sat on the failed
+  release. It now reads `rollback FAILED for N step(s) — resolve by hand;
+  `deliver status` says where each service stands`.
+
 ## 0.3.0 — 2026-10-10
 
 ### Added

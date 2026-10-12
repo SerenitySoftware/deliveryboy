@@ -291,14 +291,30 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         );
     }
 
-    steps.push(PlannedStep::ssh(
-        format!("prune old releases (keep {keep})"),
-        format!(
-            "cd {releases} && ls -1d */ 2>/dev/null | sort -r | tail -n +{} | \
-             xargs -r {sudo}rm -rf; echo \"kept newest {keep}\"",
-            keep + 1
-        ),
-    ));
+    // Prune as a *cleanup* step, so it runs after the service's `verify:`
+    // checks and is skipped when the release fails — and never deletes what
+    // the activate undo needs. As an ordinary step it ran before `verify:`,
+    // so with `keep_releases: 1` (or after a `rollback --to` had landed on
+    // the oldest retained release) it removed the directory
+    // `.deliver-previous` names one step before the check that would need
+    // it, and a failed verify left the failed release live. "Keep N" still
+    // means the newest N by name; the live release and the one the marker
+    // names are spared on top of that, never counted against it.
+    steps.push(
+        PlannedStep::ssh(
+            format!("prune old releases (keep {keep})"),
+            format!(
+                "cd {releases} && \
+                 LIVE=$(basename \"$({sudo}readlink -f {live} 2>/dev/null || echo /)\"); \
+                 PREV=$(basename \"$({sudo}cat {prev_marker} 2>/dev/null || echo /)\"); \
+                 ls -1d */ 2>/dev/null | sed 's:/$::' | sort -r | tail -n +{} | \
+                 awk -v live=\"$LIVE\" -v prev=\"$PREV\" '$0 != live && $0 != prev' | \
+                 xargs -r {sudo}rm -rf; echo \"kept newest {keep}\"",
+                keep + 1
+            ),
+        )
+        .into_cleanup(),
+    );
 
     Ok(steps)
 }

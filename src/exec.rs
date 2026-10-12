@@ -22,6 +22,10 @@ use std::process::Command;
 pub struct Outcome {
     pub ok: bool,
     pub rolled_back: usize,
+    /// Undo commands that ran and did not succeed. Counted apart from
+    /// `rolled_back` so a failed unwind is never summarised as "nothing
+    /// needed rolling back".
+    pub rollback_failed: usize,
     pub failed_step: Option<String>,
     /// The run stopped because the operator pressed Ctrl-C.
     pub interrupted: bool,
@@ -34,6 +38,7 @@ impl Outcome {
         Outcome {
             ok: true,
             rolled_back: 0,
+            rollback_failed: 0,
             failed_step: None,
             interrupted: false,
             abandoned: false,
@@ -44,6 +49,7 @@ impl Outcome {
         Outcome {
             ok: false,
             rolled_back: unwound.done,
+            rollback_failed: unwound.failed,
             failed_step: Some(failed_step),
             interrupted,
             abandoned: unwound.abandoned,
@@ -163,6 +169,8 @@ fn write_file(path: &str, _mode: u32, content: &str) -> Result<bool> {
 #[derive(Default)]
 struct Unwound {
     done: usize,
+    /// Undos that ran and failed (or could not be run at all).
+    failed: usize,
     abandoned: bool,
 }
 
@@ -189,8 +197,14 @@ fn unwind(pending: Vec<Undo>) -> Unwound {
         }
         match result {
             Ok(true) => unwound.done += 1,
-            Ok(false) => eprintln!("  ✗ rollback failed for: {label} — resolve by hand"),
-            Err(e) => eprintln!("  ✗ rollback error for {label}: {}", scrub(&e.to_string())),
+            Ok(false) => {
+                unwound.failed += 1;
+                eprintln!("  ✗ rollback failed for: {label} — resolve by hand");
+            }
+            Err(e) => {
+                unwound.failed += 1;
+                eprintln!("  ✗ rollback error for {label}: {}", scrub(&e.to_string()));
+            }
         }
     }
     unwound
@@ -582,6 +596,27 @@ mod tests {
             !dir.join("undo-1").exists(),
             "the unwind stopped at the second Ctrl-C"
         );
+    }
+
+    #[test]
+    fn a_failing_undo_is_counted_as_failed_not_as_nothing_to_undo() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("undo-fails");
+        let (plan, targets) = local_plan(vec![
+            PlannedStep::ssh("swap", "true").with_rollback("false"),
+            PlannedStep::ssh("also", format!("touch {}", at(&dir, "changed")))
+                .with_rollback(format!("rm {}", at(&dir, "changed"))),
+            PlannedStep::ssh("check", "false"),
+        ]);
+        let outcome = execute(&plan, &targets, false).unwrap();
+        assert!(!outcome.ok);
+        assert_eq!(outcome.failed_step.as_deref(), Some("check"));
+        assert_eq!(outcome.rolled_back, 1, "the undo that worked is counted");
+        assert_eq!(
+            outcome.rollback_failed, 1,
+            "the undo that failed is counted apart"
+        );
+        assert!(!dir.join("changed").exists(), "the working undo still ran");
     }
 
     #[test]

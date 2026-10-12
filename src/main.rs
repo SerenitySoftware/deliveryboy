@@ -1532,6 +1532,20 @@ fn cmd_deploy(
                 "rollback abandoned after {} step(s) — `deliver status` says where each service stands.",
                 outcome.rolled_back
             ));
+        } else if outcome.rollback_failed > 0 {
+            // An undo that ran and failed is not "nothing to undo": the
+            // target may still be on the release that just failed.
+            if outcome.rolled_back > 0 {
+                ui::note(format!(
+                    "rolled back {} step(s), but rollback FAILED for {} step(s) — resolve by hand; `deliver status` says where each service stands.",
+                    outcome.rolled_back, outcome.rollback_failed
+                ));
+            } else {
+                ui::note(format!(
+                    "rollback FAILED for {} step(s) — resolve by hand; `deliver status` says where each service stands.",
+                    outcome.rollback_failed
+                ));
+            }
         } else if outcome.rolled_back > 0 {
             ui::note(format!(
                 "rolled back {} step(s) — the target is back on its previous release.",

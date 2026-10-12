@@ -5969,6 +5969,212 @@ services:
     assert!(live_rows[0].contains("(rollback)"), "{shown}");
 }
 
+#[test]
+fn pruning_waits_for_verify_and_spares_the_live_and_previous_releases() {
+    let dir = hugo_site_repo("rel-prune-cleanup");
+    let out = run_in(&dir, &["plan", "--json"]);
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let steps = plan[0]["steps"].as_array().unwrap();
+    let prune = steps
+        .iter()
+        .find(|s| {
+            s["label"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("prune old releases")
+        })
+        .expect("no prune step");
+    // A cleanup step runs after the service's `verify:` checks and is skipped
+    // when the release fails — so the prune can no longer delete the release
+    // an unwind is about to need, one step before the check that needs it.
+    assert_eq!(prune["cleanup"], serde_json::Value::Bool(true), "{prune}");
+    let command = prune["kind"]["Ssh"]["command"].as_str().unwrap_or("");
+    assert!(
+        command.contains(".deliver-previous"),
+        "the prune must spare the release the marker names: {command}"
+    );
+    assert!(
+        command.contains("readlink -f /var/universal/demo/web"),
+        "the prune must spare the live release: {command}"
+    );
+}
+
+/// `keep_releases: 1` is the sharpest case: the outgoing release is never
+/// among the newest one by name, so a prune that ran before `verify:` deleted
+/// the only directory the activate undo could go back to, and a failed verify
+/// left the failed release live while the summary said nothing needed undoing.
+#[cfg(unix)]
+#[test]
+fn a_failed_verify_with_keep_releases_one_still_unwinds_to_the_previous_release() {
+    if !mv_can_replace_a_symlink() {
+        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
+        return;
+    }
+    let dir = tmpdir("prune-keep-one");
+    let root = dir.join("live");
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dir.join("site/index.html"), "one\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), "live/\nfail-verify\n").unwrap();
+    let fail = dir.join("fail-verify");
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: prune
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web, keep_releases: 1}}
+    verify: [{{remote_command: "test ! -e {}"}}]
+"#,
+            root.display(),
+            fail.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    let deploy = |version: &str| {
+        let out = deliver()
+            .current_dir(&dir)
+            .args(["deploy", "-y", "--version", version])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (out.status.success(), output_text(&out))
+    };
+    let retained = || -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root.join("releases"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let (ok, text) = deploy("1.0.0");
+    assert!(ok, "{text}");
+    let first = live_release_of(&root);
+
+    std::fs::write(dir.join("site/index.html"), "two\n").unwrap();
+    commit_all(&dir, "two");
+    std::fs::write(&fail, "").unwrap();
+    let (ok, text) = deploy("2.0.0");
+    assert!(!ok, "verify was meant to fail:\n{text}");
+    // The undo had something to go back to, and said so.
+    assert_eq!(live_release_of(&root), first, "{text}");
+    assert!(text.contains("rolled back 1 step(s)"), "{text}");
+    assert!(
+        !text.contains("nothing needed rolling back"),
+        "the summary must not claim nothing was undone: {text}"
+    );
+    // A failed release prunes nothing: both directories are still there.
+    let second = retained()
+        .into_iter()
+        .find(|n| *n != first)
+        .expect("the failed release directory is kept as evidence");
+
+    // A good release prunes to the newest one — and still spares the release
+    // the marker now names, which is what the next unwind would need.
+    std::fs::remove_file(&fail).unwrap();
+    std::fs::write(dir.join("site/index.html"), "three\n").unwrap();
+    commit_all(&dir, "three");
+    let (ok, text) = deploy("3.0.0");
+    assert!(ok, "{text}");
+    let third = live_release_of(&root);
+    assert!(text.contains("kept newest 1"), "{text}");
+    let mut expected = vec![first.clone(), third.clone()];
+    expected.sort();
+    assert_eq!(
+        retained(),
+        expected,
+        "the failed release {second} goes, the live and previous releases stay\n{text}"
+    );
+    let marker = std::fs::read_to_string(root.join("releases/.deliver-previous")).unwrap();
+    assert!(marker.trim().ends_with(&first), "{marker}");
+}
+
+/// An undo that runs and fails is not "nothing to undo". The summary used to
+/// print the same line for both, because it only counted successes — so an
+/// operator whose target was left on the failed release read that nothing had
+/// needed rolling back.
+#[cfg(unix)]
+#[test]
+fn a_failed_undo_is_reported_as_failed_not_as_nothing_to_undo() {
+    if !mv_can_replace_a_symlink() {
+        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
+        return;
+    }
+    let dir = tmpdir("undo-failed-summary");
+    let root = dir.join("live");
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dir.join("site/index.html"), "one\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), "live/\nfail-verify\n").unwrap();
+    let fail = dir.join("fail-verify");
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: undo
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+    verify: [{{remote_command: "test ! -e {}"}}]
+"#,
+            root.display(),
+            fail.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    let deploy = |version: &str| {
+        let out = deliver()
+            .current_dir(&dir)
+            .args(["deploy", "-y", "--version", version])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (out.status.success(), output_text(&out))
+    };
+    let (ok, text) = deploy("1.0.0");
+    assert!(ok, "{text}");
+    let first = live_release_of(&root);
+    // Someone removed the live release directory by hand: the symlink
+    // dangles, so the undo of the next deploy has nothing to point back at.
+    std::fs::remove_dir_all(root.join("releases").join(&first)).unwrap();
+
+    std::fs::write(dir.join("site/index.html"), "two\n").unwrap();
+    commit_all(&dir, "two");
+    std::fs::write(&fail, "").unwrap();
+    let (ok, text) = deploy("2.0.0");
+    assert!(!ok, "verify was meant to fail:\n{text}");
+    assert!(text.contains("cannot roll back web"), "{text}");
+    assert!(
+        text.contains("rollback FAILED for 1 step(s)"),
+        "a failed undo must be named: {text}"
+    );
+    assert!(
+        text.contains("`deliver status` says where each service stands"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("nothing needed rolling back"),
+        "the summary must not claim nothing was undone: {text}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn an_unwound_compose_deploy_is_followed_by_a_rollback_row_for_the_release_it_restored() {
