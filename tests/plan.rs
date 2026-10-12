@@ -6058,10 +6058,16 @@ services:
         names
     };
 
+    // Deploy ids are UTC stamps to the second plus a sha, and the prune keeps
+    // the newest by *name* — so two deploys inside one second would be ordered
+    // by their shas. A real release never lands twice a second; this test can.
+    let next_second = || std::thread::sleep(std::time::Duration::from_millis(1100));
+
     let (ok, text) = deploy("1.0.0");
     assert!(ok, "{text}");
     let first = live_release_of(&root);
 
+    next_second();
     std::fs::write(dir.join("site/index.html"), "two\n").unwrap();
     commit_all(&dir, "two");
     std::fs::write(&fail, "").unwrap();
@@ -6082,6 +6088,7 @@ services:
 
     // A good release prunes to the newest one — and still spares the release
     // the marker now names, which is what the next unwind would need.
+    next_second();
     std::fs::remove_file(&fail).unwrap();
     std::fs::write(dir.join("site/index.html"), "three\n").unwrap();
     commit_all(&dir, "three");
