@@ -64,7 +64,7 @@ targets:
       key: ~/.ssh/example.pem
 ```
 
-A target is also the unit `deliver deploy` and `deliver rollback` lock, so two runs never change it at once. An abandoned lock is taken over after an hour; `lock: stale_after` sets that window in seconds, and `0` means a lock is never taken over automatically.
+A target is also the unit `deliver deploy` and `deliver rollback` lock, so two runs never change it at once. An abandoned lock is taken over after an hour; `lock: stale_after` sets that window in seconds, and `0` means a lock is never taken over automatically. A running release refreshes its lock before every step and every soak round, so a release that outlives the window is not taken over while it is still running — a single step that runs longer than the window on its own is the one case that can still be. A lock that was taken over anyway is left in place when the first run finishes, and that run says so.
 
 ```yaml
 targets:

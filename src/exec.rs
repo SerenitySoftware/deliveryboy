@@ -218,10 +218,14 @@ fn interrupted_at(label: &str, undoable: Vec<Undo>) -> Outcome {
     Outcome::failed(format!("interrupted at {label}"), unwind(undoable), true)
 }
 
+/// `lock` is the deploy lock this run holds, refreshed before every step and
+/// soak round so a long release is not taken over as abandoned while it runs;
+/// `None` when nothing is held (a dry run, `verify`).
 pub fn execute(
     plan: &[ServicePlan],
     targets: &BTreeMap<String, Target>,
     dry_run: bool,
+    lock: Option<&crate::lock::Guard>,
 ) -> Result<Outcome> {
     // A dry run runs nothing, so Ctrl-C keeps its default meaning there.
     let _armed = (!dry_run).then(interrupt::arm);
@@ -252,6 +256,9 @@ pub fn execute(
                 scrub(&step.label),
                 step.type_name()
             );
+            if let Some(lock) = lock {
+                lock.refresh();
+            }
             let ok = run_step(step, target, &sp.host, dry_run)?;
             if ok {
                 if let Some(undo) = &step.rollback {
@@ -308,7 +315,7 @@ pub fn execute(
 
     // Every service is live; the undo stack is still whole, so a check that
     // stops passing inside the window unwinds exactly as one that never passed.
-    if let Some(failed) = soak(plan, targets, dry_run)? {
+    if let Some(failed) = soak(plan, targets, dry_run, lock)? {
         if interrupted() {
             return Ok(interrupted_at(&failed, undoable));
         }
@@ -347,6 +354,7 @@ fn soak(
     plan: &[ServicePlan],
     targets: &BTreeMap<String, Target>,
     dry_run: bool,
+    lock: Option<&crate::lock::Guard>,
 ) -> Result<Option<String>> {
     let soaking: Vec<(&ServicePlan, &Soak)> = plan
         .iter()
@@ -384,6 +392,11 @@ fn soak(
         }
         let (sp, soak) = soaking[i];
         let target = &targets[&sp.target];
+        // A soak window is exactly the long, quiet stretch a stale lock is
+        // measured over: keep the lock fresh for every round.
+        if let Some(lock) = lock {
+            lock.refresh();
+        }
         for check in &soak.checks {
             let passed = run_step(check, target, &sp.host, false)?;
             if interrupt::count() > 0 {
@@ -554,7 +567,7 @@ mod tests {
             PlannedStep::ssh("later", format!("touch {}", at(&dir, "later"))),
         ]);
         let (done, watcher) = press_when(vec![dir.join("started")]);
-        let outcome = execute(&plan, &targets, false).unwrap();
+        let outcome = execute(&plan, &targets, false, None).unwrap();
         done.store(true, Ordering::SeqCst);
         watcher.join().unwrap();
 
@@ -585,7 +598,7 @@ mod tests {
             ),
         ]);
         let (done, watcher) = press_when(vec![dir.join("started"), dir.join("undo-2")]);
-        let outcome = execute(&plan, &targets, false).unwrap();
+        let outcome = execute(&plan, &targets, false, None).unwrap();
         done.store(true, Ordering::SeqCst);
         watcher.join().unwrap();
 
@@ -608,7 +621,7 @@ mod tests {
                 .with_rollback(format!("rm {}", at(&dir, "changed"))),
             PlannedStep::ssh("check", "false"),
         ]);
-        let outcome = execute(&plan, &targets, false).unwrap();
+        let outcome = execute(&plan, &targets, false, None).unwrap();
         assert!(!outcome.ok);
         assert_eq!(outcome.failed_step.as_deref(), Some("check"));
         assert_eq!(outcome.rolled_back, 1, "the undo that worked is counted");
@@ -625,8 +638,8 @@ mod tests {
         let (plan, targets) = local_plan(vec![PlannedStep::ssh("x", "true")]);
         interrupt::raise();
         // A count left over from elsewhere means nothing to a dry run…
-        assert!(execute(&plan, &targets, true).unwrap().ok);
+        assert!(execute(&plan, &targets, true, None).unwrap().ok);
         // …while a real run starts from zero.
-        assert!(execute(&plan, &targets, false).unwrap().ok);
+        assert!(execute(&plan, &targets, false, None).unwrap().ok);
     }
 }

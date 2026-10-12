@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- A release that runs longer than `lock.stale_after` keeps its lock. Staleness
+  was the age of a stamp written once at acquire, so an hour-long release — a
+  notarization wait, a slow `docker build`, a long `soak:` — was taken over as
+  abandoned while it was still live, and its exit then removed the other run's
+  lock without a word. The lock is now refreshed before every step and every
+  soak round, and a run releases only a lock that still names its own deploy
+  id, saying so when another run has taken it over. A single step longer than
+  the window can still be taken over.
+
 - A failed `verify:` can always be unwound, whatever `keep_releases` says.
   The `files`/`hugo` prune ran before the service's checks and kept the
   newest N by name with no regard for the release `.deliver-previous`

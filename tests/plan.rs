@@ -7570,6 +7570,126 @@ services:
     );
 }
 
+/// Staleness is the age of `started_epoch`, and nothing used to rewrite it,
+/// so a release that ran longer than `lock.stale_after` was "abandoned" by
+/// definition while it was still live. The lock is now refreshed before every
+/// step: after a step long enough to matter, the stamp has moved.
+#[test]
+fn a_running_release_keeps_its_lock_fresh() {
+    let dir = tmpdir("lock-refresh");
+    let dest = dir.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dir.join(".gitignore"), "dest*\nowner-at-*\n").unwrap();
+    let owner = lock_dir(&dir).join("owner");
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: local}}
+targets:
+  local: {{method: local, dir: {dest}, lock: {{stale_after: 2}}}}
+services:
+  ship:
+    deployer: commands
+    config:
+      steps:
+        - command: "cp {owner} {dir}/owner-at-1"
+        - command: "sleep 2"
+        - command: "cp {owner} {dir}/owner-at-3"
+"#,
+            dest = dest.display(),
+            owner = owner.display(),
+            dir = dir.display(),
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "2.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    let epoch = |name: &str| -> u64 {
+        std::fs::read_to_string(dir.join(name))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("started_epoch="))
+            .expect("owner file carries a stamp")
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let (at_first, at_third) = (epoch("owner-at-1"), epoch("owner-at-3"));
+    assert!(
+        at_third >= at_first + 2,
+        "the stamp was not refreshed before step 3: {at_first} → {at_third}\n{text}"
+    );
+    assert!(
+        !lock_dir(&dir).exists(),
+        "the lock was still released:\n{text}"
+    );
+}
+
+/// A lock another run took over as stale belongs to that run now. Releasing
+/// it at the end of the first run used to leave the second run deploying
+/// unlocked, without a word from either.
+#[test]
+fn a_lock_taken_over_during_the_release_is_left_in_place() {
+    let dir = tmpdir("lock-taken-over");
+    let dest = dir.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dir.join(".gitignore"), "dest*\n").unwrap();
+    let owner = lock_dir(&dir).join("owner");
+    // The step stands in for the other run: it overwrites the owner file the
+    // way a stale takeover does, naming its own deploy id.
+    std::fs::write(
+        dir.join("takeover.sh"),
+        format!(
+            "printf 'owner=someone@otherbox\\npid=4242\\nservices=ship\\nrelease=v9.9.9\\n\
+             deploy=20260101-fff9999\\nstarted_at=2026-01-01T00:00:00Z\\nstarted_epoch=%s\\n' \
+             \"$(date -u +%s)\" > {}\n",
+            owner.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: local}}
+targets:
+  local: {{method: local, dir: {}}}
+services:
+  ship:
+    deployer: commands
+    config:
+      steps:
+        - command: "sh takeover.sh"
+"#,
+            dest.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "2.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    let held = std::fs::read_to_string(&owner).unwrap_or_default();
+    assert!(
+        held.contains("deploy=20260101-fff9999"),
+        "the other run's lock was removed from under it:\n{held}\n{text}"
+    );
+    assert!(
+        text.contains("is now held by another run (deploy 20260101-fff9999)"),
+        "{text}"
+    );
+    assert!(text.contains("Left in place"), "{text}");
+}
+
 #[test]
 fn a_rollback_contends_for_the_same_lock_as_a_deploy() {
     let dir = local_deploy_repo("lock-rollback");

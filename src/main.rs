@@ -1400,13 +1400,13 @@ fn cmd_deploy(
     // Serialize against every other run touching these targets. Taken here,
     // after the last human window and immediately before the first mutating
     // step, so the lock is never held while someone reads a diff — and released
-    // by `_lock`'s `Drop` on every path out of this function, including the
+    // by `held`'s `Drop` on every path out of this function, including the
     // rollback unwind inside `exec::execute`.
     //
     // A dry run and `verify` mutate nothing, so neither takes the lock: gating
     // a read-only preview on a colleague's release would answer "what would
     // this do?" with "wait".
-    let _lock = if verify_only || dry_run {
+    let held = if verify_only || dry_run {
         lock::Guard::empty()
     } else {
         ui::phase("Deploy lock");
@@ -1441,7 +1441,7 @@ fn cmd_deploy(
     }
     let (release_plan, after_tag_plan): (Vec<_>, Vec<_>) =
         plan.into_iter().partition(|service| !service.after_tag);
-    let outcome = exec::execute(&release_plan, &config.targets, dry_run)?;
+    let outcome = exec::execute(&release_plan, &config.targets, dry_run, Some(&held))?;
 
     if outcome.ok {
         // Tag what shipped, if configured. Only after success, and never on a
@@ -1483,7 +1483,7 @@ fn cmd_deploy(
             } else {
                 "After tag"
             });
-            let finalized = exec::execute(&after_tag_plan, &config.targets, dry_run)?;
+            let finalized = exec::execute(&after_tag_plan, &config.targets, dry_run, Some(&held))?;
             if !finalized.ok {
                 ui::phase("Failed");
                 ui::note(if finalized.interrupted {

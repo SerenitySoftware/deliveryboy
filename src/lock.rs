@@ -26,6 +26,14 @@
 //!   Ctrl-C, which kills the process outright — that is why a lock also goes
 //!   stale (see [`Target::lock_stale_after`]), and it is the reason the stale
 //!   window exists rather than a nicety.
+//! * **A live run keeps its lock fresh, and only releases its own.** Staleness
+//!   is the age of `started_epoch`, so a release that simply runs longer than
+//!   the window — a notarization wait, a slow `docker build`, a long `soak:` —
+//!   would be "abandoned" by definition while it was still live. [`Guard::refresh`]
+//!   rewrites that stamp before every step and every soak round, and
+//!   [`Guard::release`] gives the lock back only while the owner file still
+//!   names this run's deploy id: a lock that was taken over anyway belongs to
+//!   the run that took it, and removing it would leave *that* run unlocked.
 //!
 //! The lock lives *beside* the target directory, at `<target.dir>.deliver-lock`,
 //! not inside it. For a `files` service that serves the release root, `dir` is
@@ -179,11 +187,114 @@ impl Blocked {
     }
 }
 
+/// One lock this run holds.
+struct Held {
+    target: Target,
+    host: String,
+    dir: String,
+    /// When this run last wrote `started_epoch` — at acquire, then at each
+    /// refresh — so refreshes can be throttled without a second clock read.
+    refreshed: std::cell::Cell<std::time::Instant>,
+    /// The lock was found held by another run. Said once, not every step.
+    lost: std::cell::Cell<bool>,
+}
+
 /// The locks this run holds. Releasing is the whole point of the type: it
 /// happens in `Drop`, so no caller has to remember it on its error path.
 pub struct Guard {
-    held: Vec<(Target, String, String)>,
+    held: Vec<Held>,
+    /// This run's deploy id, which the owner file records: a lock is only
+    /// refreshed or released while the file still names it.
+    deploy: String,
     released: bool,
+}
+
+/// What the target said when asked to refresh or release a lock.
+#[derive(Debug, PartialEq)]
+enum Ownership {
+    /// The owner file named this run; the request was carried out.
+    Ours,
+    /// Another run's deploy id is in the owner file; nothing was touched.
+    Other(String),
+    /// There is no lock directory any more.
+    Gone,
+    /// The target gave no usable answer.
+    Unknown,
+}
+
+fn parse_ownership(output: &str, marker: &str) -> Ownership {
+    for line in output.lines() {
+        let Some(rest) = line.strip_prefix(marker) else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest == "RELEASED" || rest.starts_with("REFRESHED") {
+            return Ownership::Ours;
+        }
+        if rest == "GONE" {
+            return Ownership::Gone;
+        }
+        if let Some(id) = rest.strip_prefix("OTHER") {
+            return Ownership::Other(id.trim().to_string());
+        }
+    }
+    Ownership::Unknown
+}
+
+/// Rewrite `started_epoch` in the owner file, if the file still names `deploy`.
+/// Read whole, rewritten whole: a concurrent acquire that reads mid-write sees
+/// either the old stamp, the new one, or none — and none is "do not take over".
+fn refresh_script(dir: &str, deploy: &str, sudo: &str, marker: &str) -> String {
+    format!(
+        "L={l}; N={n}; D={d}\n\
+         if [ ! -d \"$L\" ]; then printf '%s GONE\\n' \"$N\"; exit 0; fi\n\
+         HELD=$({sudo}cat \"$L/owner\" 2>/dev/null || true)\n\
+         OWNED=$(printf '%s\\n' \"$HELD\" | sed -n 's/^deploy=//p' | head -1)\n\
+         if [ \"$OWNED\" != \"$D\" ]; then printf '%s OTHER %s\\n' \"$N\" \"$OWNED\"; exit 0; fi\n\
+         NOW=$(date -u +%s)\n\
+         printf '%s\\n' \"$HELD\" | awk -v now=\"$NOW\" \
+           '/^started_epoch=/{{print \"started_epoch=\" now; seen=1; next}} {{print}} \
+            END{{if (!seen) print \"started_epoch=\" now}}' \
+           | {sudo}tee \"$L/owner\" >/dev/null\n\
+         printf '%s REFRESHED %s\\n' \"$N\" \"$NOW\"\n",
+        l = shell_quote(dir),
+        n = shell_quote(marker),
+        d = shell_quote(deploy),
+    )
+}
+
+/// Remove the lock, if the owner file still names `deploy` (or names nobody —
+/// a lock with no owner file is a torn write of ours, not someone else's).
+/// `rmdir`, never `rm -rf`: a path built from config should not be able to
+/// take a tree with it, and a lock dir holding anything but our own owner file
+/// is not ours to delete.
+fn release_script(dir: &str, deploy: &str, sudo: &str, marker: &str) -> String {
+    format!(
+        "L={l}; N={n}; D={d}\n\
+         if [ ! -d \"$L\" ]; then printf '%s GONE\\n' \"$N\"; exit 0; fi\n\
+         OWNED=$({sudo}sed -n 's/^deploy=//p' \"$L/owner\" 2>/dev/null | head -1)\n\
+         if [ -n \"$OWNED\" ] && [ \"$OWNED\" != \"$D\" ]; then \
+           printf '%s OTHER %s\\n' \"$N\" \"$OWNED\"; exit 0; fi\n\
+         {sudo}rm -f \"$L/owner\" 2>/dev/null; {sudo}rmdir \"$L\" 2>/dev/null\n\
+         if [ ! -d \"$L\" ]; then printf '%s RELEASED\\n' \"$N\"; fi\n",
+        l = shell_quote(dir),
+        n = shell_quote(marker),
+        d = shell_quote(deploy),
+    )
+}
+
+/// The line printed when a lock turned out to belong to someone else.
+fn taken_over_note(host: &str, dir: &str, by: &Ownership) -> String {
+    let who = match by {
+        Ownership::Other(id) if !id.is_empty() => format!("another run (deploy {id})"),
+        Ownership::Other(_) => "another run".to_string(),
+        _ => "nobody — it is gone".to_string(),
+    };
+    format!(
+        "the deploy lock at {host}:{dir} is now held by {who}: it was taken over as \
+         abandoned while this release was still running. Left in place. Raise \
+         `lock.stale_after` on the target if releases run this long."
+    )
 }
 
 impl Guard {
@@ -191,7 +302,47 @@ impl Guard {
     pub fn empty() -> Self {
         Self {
             held: Vec::new(),
+            deploy: String::new(),
             released: true,
+        }
+    }
+
+    /// Rewrite `started_epoch` on every lock this run holds, so a release that
+    /// outlives `lock.stale_after` is not taken over while it is live. Called
+    /// before every step and every soak round; best-effort, so a refresh that
+    /// cannot be made prints nothing and the lock is exactly as stale as it
+    /// was. Throttled per lock to the smaller of ten seconds and a quarter of
+    /// the stale window — a plan is mostly sub-second steps and each refresh is
+    /// a round trip to the target. A single step longer than the window can
+    /// still be taken over: nothing runs between a step's start and its end.
+    pub fn refresh(&self) {
+        if self.released {
+            return;
+        }
+        for held in &self.held {
+            let stale_after = held.target.lock_stale_after();
+            if stale_after == 0 {
+                continue; // never taken over, so there is nothing to keep fresh
+            }
+            let throttle = std::time::Duration::from_millis((stale_after * 1000 / 4).min(10_000));
+            if held.refreshed.get().elapsed() < throttle {
+                continue;
+            }
+            held.refreshed.set(std::time::Instant::now());
+            let marker = nonce();
+            let script = refresh_script(&held.dir, &self.deploy, sudo_for(&held.target), &marker);
+            let answer = match capture(&held.target, &held.host, &script) {
+                Ok(out) => parse_ownership(&out, &marker),
+                Err(_) => Ownership::Unknown,
+            };
+            match answer {
+                Ownership::Ours | Ownership::Unknown => {}
+                other => {
+                    if !held.lost.replace(true) {
+                        crate::ui::note(taken_over_note(&held.host, &held.dir, &other));
+                    }
+                }
+            }
         }
     }
 
@@ -201,27 +352,32 @@ impl Guard {
             return;
         }
         self.released = true;
-        for (target, host, dir) in std::mem::take(&mut self.held) {
-            let sudo = sudo_for(&target);
+        for held in std::mem::take(&mut self.held) {
+            let Held {
+                target,
+                host,
+                dir,
+                lost,
+                ..
+            } = held;
             let marker = nonce();
-            let quoted = shell_quote(&dir);
-            // `rmdir`, never `rm -rf`: a path built from config should not be
-            // able to take a tree with it, and a lock dir holding anything but
-            // our own owner file is not ours to delete.
-            let script = format!(
-                "{sudo}rm -f {quoted}/owner 2>/dev/null; \
-                 {sudo}rmdir {quoted} 2>/dev/null; \
-                 if [ ! -d {quoted} ]; then printf '%s RELEASED\\n' {n}; fi",
-                n = shell_quote(&marker),
-            );
-            let freed = capture(&target, &host, &script)
-                .map(|out| out.contains(&format!("{marker} RELEASED")))
-                .unwrap_or(false);
-            if !freed {
-                crate::ui::note(format!(
+            let script = release_script(&dir, &self.deploy, sudo_for(&target), &marker);
+            let answer = match capture(&target, &host, &script) {
+                Ok(out) => parse_ownership(&out, &marker),
+                Err(_) => Ownership::Unknown,
+            };
+            match answer {
+                Ownership::Ours => {}
+                Ownership::Unknown => crate::ui::note(format!(
                     "could not release the deploy lock at {host}:{dir} — \
                      remove it by hand, or wait for it to go stale."
-                ));
+                )),
+                // Not ours any more. Say so once: the refresh may already have.
+                other => {
+                    if !lost.get() {
+                        crate::ui::note(taken_over_note(&host, &dir, &other));
+                    }
+                }
             }
         }
     }
@@ -361,6 +517,7 @@ pub fn acquire(
     }
     let mut guard = Guard {
         held: Vec::new(),
+        deploy: id.deploy.clone(),
         released: false,
     };
     for (target_name, host) in pairs {
@@ -383,7 +540,13 @@ pub fn acquire(
         };
         match answer {
             Answer::Acquired { took_over } => {
-                guard.held.push((target.clone(), host.clone(), dir.clone()));
+                guard.held.push(Held {
+                    target: target.clone(),
+                    host: host.clone(),
+                    dir: dir.clone(),
+                    refreshed: std::cell::Cell::new(std::time::Instant::now()),
+                    lost: std::cell::Cell::new(false),
+                });
                 if took_over {
                     crate::ui::note(format!(
                         "took over an abandoned lock on {host}:{dir} \
@@ -513,6 +676,126 @@ mod tests {
             "the value was not stored verbatim:\n{owner}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sh(script: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn held_lock(name: &str, deploy: &str, epoch: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("deliver-lock-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("owner"),
+            format!(
+                "owner=jo@laptop\npid=1\nservices=web\nrelease=v1\ndeploy={deploy}\n\
+                 started_at=2026-01-01T00:00:00Z\nstarted_epoch={epoch}\n"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn epoch_in(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("owner"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("started_epoch=").map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_refresh_rewrites_only_the_stamp_and_only_on_our_own_lock() {
+        let dir = held_lock("refresh-ours", "d1", "1000");
+        let text = sh(&refresh_script(&dir.to_string_lossy(), "d1", "", "__M__"));
+        assert_eq!(parse_ownership(&text, "__M__"), Ownership::Ours, "{text}");
+        let epoch: u64 = epoch_in(&dir).parse().unwrap();
+        assert!(
+            epoch > 1_700_000_000,
+            "stamp was not rewritten to now: {epoch}"
+        );
+        let owner = std::fs::read_to_string(dir.join("owner")).unwrap();
+        assert!(
+            owner.contains("owner=jo@laptop\n"),
+            "the rest survived:\n{owner}"
+        );
+        assert!(owner.contains("deploy=d1\n"), "{owner}");
+        assert_eq!(owner.matches("started_epoch=").count(), 1, "{owner}");
+
+        // Someone else's lock is left exactly as it was.
+        let theirs = held_lock("refresh-theirs", "d2", "1000");
+        let text = sh(&refresh_script(
+            &theirs.to_string_lossy(),
+            "d1",
+            "",
+            "__M__",
+        ));
+        assert_eq!(
+            parse_ownership(&text, "__M__"),
+            Ownership::Other("d2".into()),
+            "{text}"
+        );
+        assert_eq!(epoch_in(&theirs), "1000");
+
+        // And a lock that is gone says so rather than inventing one.
+        let _ = std::fs::remove_dir_all(&theirs);
+        let text = sh(&refresh_script(
+            &theirs.to_string_lossy(),
+            "d1",
+            "",
+            "__M__",
+        ));
+        assert_eq!(parse_ownership(&text, "__M__"), Ownership::Gone, "{text}");
+        assert!(!theirs.exists(), "a refresh must never create a lock");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_release_gives_back_only_the_lock_this_run_still_holds() {
+        let ours = held_lock("release-ours", "d1", "1000");
+        let text = sh(&release_script(&ours.to_string_lossy(), "d1", "", "__M__"));
+        assert_eq!(parse_ownership(&text, "__M__"), Ownership::Ours, "{text}");
+        assert!(!ours.exists(), "our lock was released");
+
+        let theirs = held_lock("release-theirs", "d2", "1000");
+        let text = sh(&release_script(
+            &theirs.to_string_lossy(),
+            "d1",
+            "",
+            "__M__",
+        ));
+        assert_eq!(
+            parse_ownership(&text, "__M__"),
+            Ownership::Other("d2".into()),
+            "{text}"
+        );
+        assert!(
+            theirs.join("owner").exists(),
+            "a lock another run took over is theirs to release"
+        );
+        let _ = std::fs::remove_dir_all(&theirs);
+
+        let text = sh(&release_script(&ours.to_string_lossy(), "d1", "", "__M__"));
+        assert_eq!(parse_ownership(&text, "__M__"), Ownership::Gone, "{text}");
+    }
+
+    #[test]
+    fn silence_on_release_is_unknown_not_released() {
+        assert_eq!(parse_ownership("", "__M__"), Ownership::Unknown);
+        assert_eq!(
+            parse_ownership("__M__ RELEASED\n", "__M__"),
+            Ownership::Ours
+        );
+        assert_eq!(
+            parse_ownership("__M__ REFRESHED 1758463331\n", "__M__"),
+            Ownership::Ours
+        );
     }
 
     #[test]
