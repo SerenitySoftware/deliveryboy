@@ -7574,6 +7574,11 @@ services:
 /// so a release that ran longer than `lock.stale_after` was "abandoned" by
 /// definition while it was still live. The lock is now refreshed before every
 /// step: after a step long enough to matter, the stamp has moved.
+///
+/// A real local deploy, so `#[cfg(unix)]` like the others: the repo-local
+/// paths in the config and the step commands are not shell-safe on Windows
+/// (the open 2026-09-30 item).
+#[cfg(unix)]
 #[test]
 fn a_running_release_keeps_its_lock_fresh() {
     let dir = tmpdir("lock-refresh");
@@ -7634,6 +7639,11 @@ services:
 /// A lock another run took over as stale belongs to that run now. Releasing
 /// it at the end of the first run used to leave the second run deploying
 /// unlocked, without a word from either.
+///
+/// A real local deploy, so `#[cfg(unix)]` like the others: the repo-local
+/// paths in the config and the step commands are not shell-safe on Windows
+/// (the open 2026-09-30 item).
+#[cfg(unix)]
 #[test]
 fn a_lock_taken_over_during_the_release_is_left_in_place() {
     let dir = tmpdir("lock-taken-over");
