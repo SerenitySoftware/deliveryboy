@@ -5,6 +5,8 @@ struct Fake {
     objects: RefCell<BTreeMap<String, Vec<u8>>>,
     calls: RefCell<Vec<String>>,
     fail: RefCell<Option<String>>,
+    /// A call during which the operator presses Ctrl-C; the call still completes.
+    press: RefCell<Option<String>>,
 }
 impl Fake {
     fn new() -> Self {
@@ -12,10 +14,14 @@ impl Fake {
             objects: RefCell::new(BTreeMap::new()),
             calls: RefCell::new(Vec::new()),
             fail: RefCell::new(None),
+            press: RefCell::new(None),
         }
     }
     fn call(&self, name: &str) -> Result<()> {
         self.calls.borrow_mut().push(name.into());
+        if self.press.borrow().as_deref() == Some(name) {
+            crate::interrupt::raise();
+        }
         ensure!(
             self.fail.borrow().as_deref() != Some(name),
             "injected failure: {name}"
@@ -100,6 +106,24 @@ impl Provider for Fake {
     fn publish_site(&self, _: &config::Site, _: &Path) -> Result<()> {
         self.call("site")
     }
+}
+/// `deploy` arms the process-wide interrupt count, so it takes turns with
+/// every other test that arms or raises it.
+fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str) -> Result<()> {
+    let _turn = crate::interrupt::SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    super::deploy(session, provider, id, digest)
+}
+fn failed_event(p: &Fake) -> Value {
+    p.objects
+        .borrow()
+        .iter()
+        .filter(|(k, _)| k.contains("/events/"))
+        .map(|(_, v)| serde_json::from_slice::<Value>(v).unwrap())
+        .find(|e| e["status"] == "failed" && e["phase"] == "deployment")
+        .expect("a failed deployment event")["details"]
+        .clone()
 }
 fn command() -> config::Command {
     config::Command {
@@ -276,6 +300,71 @@ fn migration_failure_holds_writers_retains_lock_and_never_accepts() {
         .objects
         .borrow()
         .contains_key("accepted/sample/dev/r1.json"));
+}
+#[test]
+fn publish_failure_leaves_writers_untouched_and_keeps_leases() {
+    let cfg = cfg();
+    let root = repo();
+    let p = Fake::new();
+    let hash = checked(&cfg, &root, &p);
+    *p.fail.borrow_mut() = Some("publish".into());
+    assert!(deploy(&session(&cfg, &root), &p, "r1", &hash).is_err());
+    let calls = p.calls.borrow().clone();
+    assert!(!calls.iter().any(|c| c == "hold"), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.starts_with("release:")));
+    let event = failed_event(&p);
+    assert_eq!(event["writers"], "untouched");
+    assert_eq!(event["writers_held"], false);
+    assert_eq!(event["locks_retained"], true);
+}
+#[test]
+fn infrastructure_failure_leaves_writers_untouched() {
+    let mut cfg = cfg();
+    cfg.targets.get_mut("dev").unwrap().infrastructure = vec![config::Command {
+        argv: vec!["git".into(), "invalid-command".into()],
+        platforms: vec![],
+    }];
+    let root = repo();
+    let p = Fake::new();
+    let hash = checked(&cfg, &root, &p);
+    assert!(deploy(&session(&cfg, &root), &p, "r1", &hash).is_err());
+    let calls = p.calls.borrow().clone();
+    assert!(calls.iter().any(|c| c == "publish"));
+    assert!(!calls.iter().any(|c| c == "hold"), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.starts_with("release:")));
+    assert_eq!(failed_event(&p)["writers"], "untouched");
+}
+#[test]
+fn ctrl_c_before_writers_stop_fails_without_holding_them() {
+    let cfg = cfg();
+    let root = repo();
+    let p = Fake::new();
+    let hash = checked(&cfg, &root, &p);
+    *p.press.borrow_mut() = Some("publish".into());
+    let error = deploy(&session(&cfg, &root), &p, "r1", &hash).unwrap_err();
+    assert!(error.to_string().contains("interrupted"), "{error:#}");
+    let calls = p.calls.borrow().clone();
+    assert!(!calls.iter().any(|c| c == "hold"), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.starts_with("job:")));
+    let event = failed_event(&p);
+    assert_eq!(event["writers"], "untouched");
+    assert_eq!(event["interrupted"], true);
+}
+#[test]
+fn ctrl_c_after_writers_stop_keeps_them_held() {
+    let cfg = cfg();
+    let root = repo();
+    let p = Fake::new();
+    let hash = checked(&cfg, &root, &p);
+    *p.press.borrow_mut() = Some("hold".into());
+    assert!(deploy(&session(&cfg, &root), &p, "r1", &hash).is_err());
+    let calls = p.calls.borrow().clone();
+    assert_eq!(calls.iter().filter(|c| *c == "hold").count(), 2);
+    assert!(!calls.iter().any(|c| c == "verify-apps"));
+    assert!(!calls.iter().any(|c| c.starts_with("release:")));
+    let event = failed_event(&p);
+    assert_eq!(event["writers"], "held");
+    assert_eq!(event["interrupted"], true);
 }
 #[test]
 fn verify_failure_does_not_restore_old_code() {

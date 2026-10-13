@@ -4,6 +4,7 @@ mod config;
 mod evidence;
 mod runner;
 
+use crate::interrupt;
 use anyhow::{ensure, Context, Result};
 use azure::{Azure, Provider};
 use clap::Subcommand;
@@ -630,6 +631,11 @@ impl<'a> Locks<'a> {
         }
         Ok(locks)
     }
+    /// Renew between phases, and stop there if Ctrl-C was pressed.
+    fn checkpoint(&self) -> Result<()> {
+        ensure!(interrupt::count() == 0, "interrupted (Ctrl-C)");
+        self.renew()
+    }
     fn renew(&self) -> Result<()> {
         for (name, lease) in &self.leases {
             self.provider.renew(name, lease)?;
@@ -678,7 +684,14 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
         locks.release()?;
         return Err(error);
     }
+    // Ctrl-C is a failure like any other from here on: the child it also
+    // reaches dies, and `checkpoint` stops at the next phase boundary.
+    let _armed = interrupt::arm();
+    // `mutated`: images may have been pushed and the release ID is spent.
+    // `writers_stopping`: writers were told to stop, so a failure must keep
+    // them stopped. Before that, the running release is still serving.
     let mut mutated = false;
+    let mut writers_stopping = false;
     let mut database_started = false;
     let operation = (|| -> Result<()> {
         // One deployment attempt per release ID, including failed attempts.
@@ -724,7 +737,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
             &format!("{}/recovery-before.json", session.prefix(id)),
             &snapshot,
         )?;
-        locks.renew()?;
+        locks.checkpoint()?;
         session.assert_source(&manifest.commit)?;
         evidence::verify(&directory, &manifest.files)?;
         session.event(
@@ -744,7 +757,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
         session.context(&manifest, digest, &images, true)?;
         runner = session.runner_for(&directory, &context);
         for (index, spec) in session.target.infrastructure.iter().enumerate() {
-            locks.renew()?;
+            locks.checkpoint()?;
             run_hook(
                 session,
                 provider,
@@ -754,7 +767,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
                 spec,
             )?;
         }
-        locks.renew()?;
+        locks.checkpoint()?;
         session.event(
             provider,
             id,
@@ -762,6 +775,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
             "stop-writers",
             json!({"database_rollback_automatic":false}),
         )?;
+        writers_stopping = true;
         provider.hold_writers()?;
         run_hook(
             session,
@@ -777,7 +791,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
             &provider.snapshot()?,
         )?;
         if session.target.migrate.is_some() || !session.target.migration_jobs.is_empty() {
-            locks.renew()?;
+            locks.checkpoint()?;
             session.event(
                 provider,
                 id,
@@ -790,7 +804,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
                 run_hook(session, provider, id, &runner, "migrate", migrate)?;
             }
             for job in &session.target.migration_jobs {
-                locks.renew()?;
+                locks.checkpoint()?;
                 provider.job(job, &images, &|record| {
                     session.event(provider, id, "running", "azure-job", record.clone())
                 })?;
@@ -799,7 +813,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
             session.retain_evidence(provider, id, "database")?;
         }
         for (index, spec) in session.target.rollout.iter().enumerate() {
-            locks.renew()?;
+            locks.checkpoint()?;
             run_hook(
                 session,
                 provider,
@@ -815,7 +829,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
             &provider.verify_apps(&images)?,
         )?;
         for job in &session.target.verification_jobs {
-            locks.renew()?;
+            locks.checkpoint()?;
             provider.job(job, &images, &|record| {
                 session.event(provider, id, "running", "azure-job", record.clone())
             })?;
@@ -832,7 +846,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
             ("browser", &session.target.browser),
         ] {
             for (index, spec) in commands.iter().enumerate() {
-                locks.renew()?;
+                locks.checkpoint()?;
                 run_hook(
                     session,
                     provider,
@@ -844,7 +858,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
             }
         }
         for (name, site) in &session.target.docs {
-            locks.renew()?;
+            locks.checkpoint()?;
             evidence::verify(&directory, &manifest.files)?;
             azure::site_policy(site, session.root, &directory)?;
             session.event(
@@ -864,7 +878,7 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
                 &site.verify,
             )?;
         }
-        locks.renew()?;
+        locks.checkpoint()?;
         session.assert_source(&manifest.commit)?;
         evidence::verify(&directory, &manifest.files)?;
         session.retain_evidence(provider, id, "accepted")?;
@@ -881,11 +895,21 @@ fn deploy(session: &Session<'_>, provider: &dyn Provider, id: &str, digest: &str
         Err(error) => {
             if mutated {
                 // No old image or database undo is ever attempted. Keep locks for recovery.
-                let lease_ok = locks.renew().is_ok();
-                let held = lease_ok && provider.hold_writers().is_ok();
+                let interrupted = interrupt::count() > 0;
+                let held =
+                    writers_stopping && locks.renew().is_ok() && provider.hold_writers().is_ok();
+                let writers = match (writers_stopping, held) {
+                    (false, _) => "untouched",
+                    (true, true) => "held",
+                    (true, false) => "hold-failed",
+                };
                 let evidence_ok = session.retain_evidence(provider, id, "failure").is_ok();
-                let retained=session.event(provider,id,"failed","deployment",json!({"manifest_sha256":digest,"database_started":database_started,"writers_held":held,"evidence_retained":evidence_ok,"locks_retained":true,"automatic_rollback":false})).is_ok();
-                eprintln!("Deployment failed. Writers held: {held}. Failure receipt saved: {retained}. Locks retained. Recovery files: {}. An operator must inspect jobs/schema compatibility before releasing leases or starting code.",session.work.display());
+                let retained=session.event(provider,id,"failed","deployment",json!({"manifest_sha256":digest,"database_started":database_started,"writers":writers,"writers_held":held,"interrupted":interrupted,"evidence_retained":evidence_ok,"locks_retained":true,"automatic_rollback":false})).is_ok();
+                if writers_stopping {
+                    eprintln!("Deployment failed. Writers held: {held}. Failure receipt saved: {retained}. Locks retained. Recovery files: {}. An operator must inspect jobs/schema compatibility before releasing leases or starting code.",session.work.display());
+                } else {
+                    eprintln!("Deployment failed before writers were stopped. writers: untouched — the running release is unchanged. Failure receipt saved: {retained}. Locks retained; this release ID is spent. Recovery files: {}. Inspect pushed images and any infrastructure hook that ran before releasing leases.",session.work.display());
+                }
             } else {
                 let _ = session.event(
                     provider,

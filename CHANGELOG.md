@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- A `deliver release deploy` that fails before it stops writers leaves them
+  running. Any failure after image publishing began deactivated every
+  `writers:` app, so a dropped `docker push`, an expired registry login or a
+  refused `infrastructure` hook took production offline on the old,
+  still-valid release. Writers are now held only once the `stop-writers`
+  phase has begun; an earlier failure still records a `failed` event, keeps
+  the leases and spends the release ID, and says `writers: untouched — the
+  running release is unchanged`. Ctrl-C during `release deploy` now takes the
+  same failure path instead of killing the process with nothing recorded.
+
 - A release that runs longer than `lock.stale_after` keeps its lock. Staleness
   was the age of a stamp written once at acquire, so an hour-long release — a
   notarization wait, a slow `docker build`, a long `soak:` — was taken over as

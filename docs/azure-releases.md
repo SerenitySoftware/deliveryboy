@@ -190,9 +190,12 @@ Changelogs use Git subjects since the last accepted release (full history for
 the first); `--ticket https://...` adds optional links. Failed/prepared runs never
 advance that baseline. V1 does not enrich notes from Azure Boards or PR APIs.
 
-A deployment ID permits one attempt. On a failure after mutation begins, the CLI
-attempts to stop all writers, retains failure/evidence records, and keeps every
-lease. It reports when writer shutdown or evidence upload fails. It never reverses
+A deployment ID permits one attempt. A failure while publishing images or running
+`infrastructure` hooks leaves writers untouched — the running release keeps
+serving — and still records the failure and keeps every lease. From the
+`stop-writers` phase on, a failure makes the CLI attempt to stop all writers,
+retain failure/evidence records, and keep every lease. Ctrl-C counts as a failure
+at whichever phase it lands in. It reports when writer shutdown or evidence upload fails. It never reverses
 SQL, automatically reactivates old code, or rolls back docs. Image/application
 changes may be reversible after a schema compatibility review; database changes
 need the application's forward-fix or restore procedure.

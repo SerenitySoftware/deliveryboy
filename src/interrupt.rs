@@ -67,10 +67,14 @@ impl Drop for Armed {
 }
 
 /// Stand-in for the keypress in tests.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub fn raise() {
     record();
 }
+
+/// The count is process-wide; tests that arm it or press Ctrl-C take turns.
+#[cfg(test)]
+pub static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(unix)]
 mod sys {

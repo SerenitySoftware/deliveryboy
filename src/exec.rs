@@ -502,10 +502,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    // The interrupt count is process-wide; these tests take turns with it.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    use std::sync::Arc;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("deliver-exec-{name}-{}", std::process::id()));
@@ -555,7 +552,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_unwinds_what_already_changed_and_runs_nothing_after() {
-        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = interrupt::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("interrupt");
         let (plan, targets) = local_plan(vec![
             PlannedStep::ssh("swap", format!("touch {}", at(&dir, "swapped")))
@@ -585,7 +582,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_during_the_unwind_abandons_it() {
-        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = interrupt::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("abandon");
         let (plan, targets) = local_plan(vec![
             PlannedStep::ssh("first", "true")
@@ -613,7 +610,7 @@ mod tests {
 
     #[test]
     fn a_failing_undo_is_counted_as_failed_not_as_nothing_to_undo() {
-        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = interrupt::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("undo-fails");
         let (plan, targets) = local_plan(vec![
             PlannedStep::ssh("swap", "true").with_rollback("false"),
@@ -634,7 +631,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_is_not_armed() {
-        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _turn = interrupt::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (plan, targets) = local_plan(vec![PlannedStep::ssh("x", "true")]);
         interrupt::raise();
         // A count left over from elsewhere means nothing to a dry run…
