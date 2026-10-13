@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- A `macos-app` release that fails its own verification no longer stays
+  published. The deployer had no undo, so a failed check printed "nothing to
+  roll back" while the appcast every Sparkle client polls already advertised
+  the build, and `deliver rollback` on a macOS-only config said nothing was
+  rollback-able. The live `appcast.xml` is now copied to
+  `.deliver/macos-appcast/` on the target before publishing, and the undo puts
+  it back — or removes the feed when there was none. DMGs stay published, and
+  a client that already updated keeps the build.
 - A `deliver release deploy` that fails before it stops writers leaves them
   running. Any failure after image publishing began deactivated every
   `writers:` app, so a dropped `docker push`, an expired registry login or a
@@ -13,6 +21,7 @@
   the leases and spends the release ID, and says `writers: untouched — the
   running release is unchanged`. Ctrl-C during `release deploy` now takes the
   same failure path instead of killing the process with nothing recorded.
+||||||| parent of d66e251 (fix(macos-app): restore the live appcast when a release is undone)
 
 - A release that runs longer than `lock.stale_after` keeps its lock. Staleness
   was the age of a stamp written once at acquire, so an hour-long release — a

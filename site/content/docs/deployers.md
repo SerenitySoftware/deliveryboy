@@ -47,6 +47,8 @@ Build, sign, notarize, and publish a macOS app and Sparkle appcast. Delivery Boy
 
 This deployer needs the Apple signing and notarization tools on a macOS release host. Review its plan for the archive, appcast, and publish paths before the first live release.
 
+Before publishing, it copies the live `appcast.xml` to `.deliver/macos-appcast/` under the target directory. A failed verify, Ctrl-C, or `deliver rollback` puts that feed back (or removes the feed when there was none), so clients stop updating into the build. Published DMGs stay in place, and a client that already updated keeps the new build.
+
 ## `commands`
 
 Run explicit local and SSH steps when a built-in deployer does not cover a small project-specific need.

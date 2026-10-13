@@ -1804,6 +1804,76 @@ fn macos_app_requires_an_ed_key_source() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("EdDSA private key"));
 }
 
+/// Run one planned shell command the way a `method: local` step does.
+#[cfg(target_os = "macos")]
+fn sh(command: &str) -> bool {
+    std::process::Command::new("sh")
+        .args(["-c", command])
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_app_snapshots_the_live_appcast_and_its_undo_restores_it() {
+    let dir = macos_repo("macos-undo");
+    let site = dir.join("site");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "production: {host: box.example.md, user: root, dir: /var/universal/demo}",
+        &format!("production: {{method: local, dir: {}}}", site.display()),
+    );
+    std::fs::write(&cfg, body).unwrap();
+    let out = run_in(&dir, &["plan", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let steps = plan[0]["steps"].as_array().unwrap();
+    let at = |prefix: &str| {
+        steps
+            .iter()
+            .position(|s| s["label"].as_str().unwrap_or("").starts_with(prefix))
+            .unwrap_or_else(|| panic!("no step {prefix}"))
+    };
+    // Taken before the publish overwrites the feed, so an unwind gets it back.
+    assert!(at("snapshot live appcast") < at("publish "));
+    let snapshot = &steps[at("snapshot live appcast")];
+    let take = snapshot["kind"]["Ssh"]["command"].as_str().unwrap();
+    let undo = snapshot["rollback"].as_str().expect("snapshot has no undo");
+
+    let feed = site.join("downloads/mac/appcast.xml");
+    std::fs::create_dir_all(feed.parent().unwrap()).unwrap();
+    std::fs::write(&feed, "<rss>1.0.0 build 7</rss>").unwrap();
+    assert!(sh(take));
+    std::fs::write(&feed, "<rss>bad build 8</rss>").unwrap();
+    assert!(sh(undo));
+    assert_eq!(
+        std::fs::read_to_string(&feed).unwrap(),
+        "<rss>1.0.0 build 7</rss>"
+    );
+    // The snapshot sits outside the public download directory.
+    assert!(!site.join("downloads/mac/appcast.prev.xml").exists());
+
+    // A first release had no feed before it: the undo removes the new one.
+    std::fs::remove_file(&feed).unwrap();
+    assert!(sh(take));
+    std::fs::write(&feed, "<rss>first build</rss>").unwrap();
+    assert!(sh(undo));
+    assert!(!feed.exists());
+
+    // `deliver rollback` now has something to do for a macOS-only config.
+    let out = run_in(&dir, &["rollback", "--dry-run"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("nothing in this config is rollback-able"),
+        "{text}"
+    );
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn macos_app_fails_fast_off_macos() {

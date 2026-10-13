@@ -330,6 +330,31 @@ Sparkle orders updates by this number, so clients would never see the update\" >
             owner.split(':').nth(1).unwrap_or("root")
         ),
     ));
+    // The feed is the one file every Sparkle client polls, and the publish below
+    // overwrites it. Keep the live one on the target, outside the download URL,
+    // so a failed verify — or a later `deliver rollback` — puts it back and stops
+    // clients updating into this build. With no feed before, the undo removes
+    // the new one. DMGs are not undone: they are additive, and a rollback cannot
+    // downgrade a client that already took the update.
+    let snapshot = format!("{root}/.deliver/macos-appcast/{remote_subdir}");
+    steps.push(
+        PlannedStep::ssh(
+            format!("snapshot live appcast → {snapshot}"),
+            format!(
+                "{sudo}install -d -m 750 {snapshot} && \
+                 if [ -f {dest}/appcast.xml ]; then \
+                   {sudo}cp -p {dest}/appcast.xml {snapshot}/appcast.prev.xml && {sudo}rm -f {snapshot}/appcast.none; \
+                 else {sudo}rm -f {snapshot}/appcast.prev.xml && {sudo}touch {snapshot}/appcast.none; fi"
+            ),
+        )
+        .with_rollback(format!(
+            "if [ -f {snapshot}/appcast.prev.xml ]; then \
+               {sudo}cp -p {snapshot}/appcast.prev.xml {dest}/.appcast.xml.rb && \
+               {sudo}mv -f {dest}/.appcast.xml.rb {dest}/appcast.xml; \
+             elif [ -f {snapshot}/appcast.none ]; then {sudo}rm -f {dest}/appcast.xml; \
+             else echo 'macos-app: no appcast snapshot under {snapshot} to restore' >&2; exit 1; fi"
+        )),
+    );
     // Additive on purpose: previously published DMGs must stay downloadable, or
     // older clients lose their update path.
     let mut publish_names = vec![dmg_name.clone()];
