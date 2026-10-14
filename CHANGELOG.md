@@ -21,7 +21,6 @@
   the leases and spends the release ID, and says `writers: untouched — the
   running release is unchanged`. Ctrl-C during `release deploy` now takes the
   same failure path instead of killing the process with nothing recorded.
-||||||| parent of d66e251 (fix(macos-app): restore the live appcast when a release is undone)
 
 - A release that runs longer than `lock.stale_after` keeps its lock. Staleness
   was the age of a stamp written once at acquire, so an hour-long release — a
