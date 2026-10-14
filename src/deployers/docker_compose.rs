@@ -32,7 +32,7 @@
 //!       command: curl -fsS http://localhost:8000/healthz
 //! ```
 
-use super::{cfg_bool, cfg_str, LogSource, PlanContext, PlannedStep, ReleaseState};
+use super::{cfg_bool, cfg_str, ComposeProject, LogSource, PlanContext, PlannedStep, ReleaseState};
 use crate::remote::shell_quote;
 use crate::secrets::Resolver;
 use anyhow::{bail, Context, Result};
@@ -277,6 +277,30 @@ pub fn input_files(cfg: &Value) -> Vec<String> {
     let mut files = compose_files(cfg);
     files.extend(string_list(cfg.get("include")));
     files
+}
+
+/// Where each input lands under the target's root, mirroring the ship steps:
+/// a Compose file and the `.env` by their own name, an `include:` at its
+/// repo-relative path.
+fn compose_project(
+    cfg: &Value,
+    project: &str,
+    files: &[String],
+    env: Option<(String, String)>,
+) -> ComposeProject {
+    let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let mut layout: Vec<(String, String)> =
+        files.iter().map(|f| (f.clone(), basename(f))).collect();
+    layout.extend(string_list(cfg.get("include")).into_iter().map(|p| {
+        let dest = p.trim_end_matches('/').to_string();
+        (p, dest)
+    }));
+    ComposeProject {
+        project: project.to_string(),
+        files: files.to_vec(),
+        layout,
+        env: env.map(|(path, contents)| (basename(&path), contents)),
+    }
 }
 
 pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
@@ -599,7 +623,8 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     }
 
     let resolver = ctx.resolver();
-    if let Some((env_path, contents)) = render_env(cfg, ctx, resolver)? {
+    let rendered_env = render_env(cfg, ctx, resolver)?;
+    if let Some((env_path, contents)) = rendered_env.clone() {
         let local = format!("{}/{env_path}", ctx.work_dir());
         // Written locally at 0600, shipped with permissions preserved: the values
         // never appear in a command line, plan output, or shell history.
@@ -767,7 +792,9 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // A custom command is the operator's own; what it runs is theirs to know.
     let start = match custom_up {
         Some(_) => start,
-        None => start.needs_remote(&["docker", "docker compose"]),
+        None => start
+            .needs_remote(&["docker", "docker compose"])
+            .brings_up(compose_project(cfg, &project, &files, rendered_env)),
     };
     // Once the previous release is back up, say so in the history: the restored
     // deploy is the row just above this one's.

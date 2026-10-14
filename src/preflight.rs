@@ -6,12 +6,12 @@
 //! one-at-a-time.
 
 use crate::config::{Config, DnsCheck, Target};
-use crate::deployers::StepKind;
+use crate::deployers::{ComposeProject, StepKind};
 use crate::plan::ServicePlan;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 pub struct Report {
     pub problems: Vec<String>,
@@ -200,6 +200,153 @@ fn input_files(config: &Config, repo_root: &Path) -> Vec<(String, bool)> {
     checks
 }
 
+/// `docker compose` is a plugin, so `docker` on the path proves nothing.
+fn have_compose() -> bool {
+    Command::new("docker")
+        .args(["compose", "version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn run_docker(dir: &Path, args: &[String]) -> std::io::Result<Output> {
+    Command::new("docker")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents.as_bytes())
+}
+
+/// Have `docker compose config --quiet` parse, merge and interpolate the
+/// project exactly as the target's root will hold it — the Compose files and
+/// includes where the ship steps put them, and the rendered `.env`, which a
+/// service's `env_file:` needs and a clean checkout does not have. It needs no
+/// daemon and touches nothing remote. The scratch copy, `.env` included, is
+/// removed before this returns.
+fn compose_config(
+    project: &ComposeProject,
+    repo_root: &Path,
+    scratch: &Path,
+    run: &dyn Fn(&Path, &[String]) -> std::io::Result<Output>,
+) -> ComposeVerdict {
+    let _ = std::fs::remove_dir_all(scratch);
+    // Compose names files by absolute path; the scratch copy's means nothing
+    // to the operator, the root-relative one does. Both spellings, longest
+    // first: on macOS the temp dir is a symlink into `/private`.
+    let mut prefixes = vec![format!("{}/", scratch.display())];
+    let result = (|| {
+        std::fs::create_dir_all(scratch)
+            .map_err(|e| format!("cannot create {}: {e}", scratch.display()))?;
+        if let Ok(real) = scratch.canonicalize() {
+            prefixes.push(format!("{}/", real.display()));
+        }
+        prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
+        for (src, dest) in &project.layout {
+            copy_tree(&repo_root.join(src), &scratch.join(dest))
+                .map_err(|e| format!("cannot copy {src} to validate it: {e}"))?;
+        }
+        if let Some((path, contents)) = &project.env {
+            write_secret_file(&scratch.join(path), contents)
+                .map_err(|e| format!("cannot render {path} to validate it: {e}"))?;
+        }
+        let mut args = vec!["compose".to_string()];
+        for file in &project.files {
+            args.extend(["-f".to_string(), file.clone()]);
+        }
+        args.extend(
+            ["-p", &project.project, "config", "--quiet"]
+                .iter()
+                .map(|a| a.to_string()),
+        );
+        run(scratch, &args).map_err(|e| format!("cannot run docker compose: {e}"))
+    })();
+    let _ = std::fs::remove_dir_all(scratch);
+    let output = match result {
+        Ok(output) => output,
+        Err(why) => return ComposeVerdict::Unchecked(why),
+    };
+
+    // Values are scrubbed in case a parse error quotes a line of `.env`.
+    let tidy = |line: &str| {
+        let mut line = line.to_string();
+        for prefix in &prefixes {
+            line = line.replace(prefix.as_str(), "");
+        }
+        crate::secrets::redact::scrub(line.trim())
+    };
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.contains("level=warning") {
+            let msg = line
+                .split_once("msg=\"")
+                .map(|(_, rest)| rest.strip_suffix('"').unwrap_or(rest).replace("\\\"", "\""))
+                .unwrap_or_else(|| line.to_string());
+            warnings.push(tidy(&msg));
+        } else {
+            errors.push(tidy(line));
+        }
+    }
+    if output.status.success() {
+        return ComposeVerdict::Valid(warnings);
+    }
+    let why = if errors.is_empty() {
+        format!("exited {}", output.status)
+    } else {
+        errors.join("; ")
+    };
+    // An `env_file:` this deploy does not render may be kept on the target by
+    // hand; it is missing here, not necessarily there, so say so and go on.
+    if project.env.is_none() && why.starts_with("env file ") && why.contains(" not found") {
+        return ComposeVerdict::Unchecked(format!(
+            "{why} — this deploy does not render it, so it must already be on the target"
+        ));
+    }
+    ComposeVerdict::Invalid(why)
+}
+
+enum ComposeVerdict {
+    /// Parsed and merged; Compose's warnings (an unset `${VAR}` is one).
+    Valid(Vec<String>),
+    /// Could not be checked here, and that is not the project's fault.
+    Unchecked(String),
+    /// Compose refused it, and the target's `docker compose` would too.
+    Invalid(String),
+}
+
 /// SSH must work without a prompt, or the deploy stalls mid-flight. Uses the
 /// target's configured login method (identity file, jump host, options).
 fn ssh_reachable(target: &Target, host: &str) -> Result<(), String> {
@@ -367,6 +514,54 @@ pub fn run(
         }
     }
 
+    // 2b. each Compose project parses and merges. A file that exists but does
+    // not would otherwise get as far as `start services`, after the live
+    // config is overwritten — and that step's undo runs the same broken file.
+    let mut seen = BTreeSet::new();
+    let projects: Vec<(&str, &ComposeProject)> = plan
+        .iter()
+        .flat_map(|sp| {
+            sp.steps
+                .iter()
+                .filter_map(move |s| s.compose_project.as_ref().map(|c| (sp.service.as_str(), c)))
+        })
+        .filter(|(service, _)| seen.insert(*service))
+        .collect();
+    if !projects.is_empty() {
+        if have_compose() {
+            for (service, project) in projects {
+                // A missing input is already a problem above; validating
+                // without it would only say so again, less clearly.
+                if project
+                    .layout
+                    .iter()
+                    .any(|(src, _)| !repo_root.join(src).exists())
+                {
+                    continue;
+                }
+                let scratch = std::env::temp_dir()
+                    .join(format!("deliver-compose-{}-{service}", std::process::id()));
+                match compose_config(project, repo_root, &scratch, &run_docker) {
+                    ComposeVerdict::Valid(lines) => {
+                        checked.push(format!("{service}: Compose project validates"));
+                        warnings.extend(lines.into_iter().map(|l| format!("{service}: {l}")));
+                    }
+                    ComposeVerdict::Unchecked(why) => warnings.push(format!(
+                        "{service}: Compose project not validated locally: {why}"
+                    )),
+                    ComposeVerdict::Invalid(why) => problems.push(format!(
+                        "{service}: docker compose config rejects the project: {why}"
+                    )),
+                }
+            }
+        } else {
+            warnings.push(
+                "Compose project not validated: `docker compose` is not installed locally"
+                    .to_string(),
+            );
+        }
+    }
+
     // 3. remote reachability (skipped for --dry-run / plan)
     if check_remote {
         let remote_tools = remote_tools_needed(plan);
@@ -453,6 +648,173 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compose_repo(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("deliver-pf-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("deploy")).unwrap();
+        std::fs::create_dir_all(dir.join("conf/rules")).unwrap();
+        std::fs::write(dir.join("deploy/compose.yml"), "services: {}\n").unwrap();
+        std::fs::write(dir.join("conf/rules/a.yml"), "groups: []\n").unwrap();
+        dir
+    }
+
+    fn project(env: Option<(&str, &str)>) -> ComposeProject {
+        ComposeProject {
+            project: "demo".into(),
+            files: vec!["deploy/compose.yml".into()],
+            layout: vec![
+                ("deploy/compose.yml".into(), "compose.yml".into()),
+                ("conf/rules".into(), "conf/rules".into()),
+            ],
+            env: env.map(|(p, c)| (p.to_string(), c.to_string())),
+        }
+    }
+
+    fn exited(code: i32, stderr: &str) -> Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        };
+        Output {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn compose_is_validated_in_the_layout_the_target_root_will_hold() {
+        let repo = compose_repo("layout");
+        let scratch = repo.with_extension("scratch");
+        let seen = std::cell::RefCell::new(None);
+        let run = |dir: &Path, args: &[String]| {
+            // Inspect the copy while it exists: it is gone once this returns.
+            let env = std::fs::read_to_string(dir.join(".env")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(dir.join(".env"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            *seen.borrow_mut() = Some((
+                args.to_vec(),
+                dir.join("compose.yml").is_file(),
+                dir.join("conf/rules/a.yml").is_file(),
+                env,
+            ));
+            Ok(exited(0, ""))
+        };
+        let verdict = compose_config(&project(Some((".env", "A='1'\n"))), &repo, &scratch, &run);
+        assert!(matches!(verdict, ComposeVerdict::Valid(ref w) if w.is_empty()));
+        let (args, compose, include, env) = seen.into_inner().expect("compose ran");
+        assert_eq!(
+            args.join(" "),
+            "compose -f deploy/compose.yml -p demo config --quiet"
+        );
+        assert!(
+            compose,
+            "a Compose file lands at the root under its own name"
+        );
+        assert!(include, "an include keeps its repo-relative path");
+        assert_eq!(env, "A='1'\n");
+        assert!(
+            !scratch.exists(),
+            "the scratch copy and its .env are removed"
+        );
+    }
+
+    #[test]
+    fn compose_warnings_and_errors_name_files_relative_to_the_root() {
+        let repo = compose_repo("messages");
+        let scratch = repo.with_extension("scratch");
+        let s = scratch.display().to_string();
+        let warn = r#"time="x" level=warning msg="The \"TOKEN\" variable is not set. Defaulting to a blank string."
+"#;
+        let run = |_: &Path, _: &[String]| Ok(exited(0, warn));
+        match compose_config(&project(None), &repo, &scratch, &run) {
+            ComposeVerdict::Valid(w) => assert_eq!(
+                w,
+                vec!["The \"TOKEN\" variable is not set. Defaulting to a blank string."]
+            ),
+            _ => panic!("a warning is not a refusal"),
+        }
+        let bad = format!(
+            "{warn}validating {s}/compose.yml: services.app additional properties 'imag' not allowed\n"
+        );
+        let run = |_: &Path, _: &[String]| Ok(exited(1, &bad));
+        match compose_config(&project(None), &repo, &scratch, &run) {
+            ComposeVerdict::Invalid(why) => assert_eq!(
+                why,
+                "validating compose.yml: services.app additional properties 'imag' not allowed"
+            ),
+            _ => panic!("a non-zero exit is a refusal"),
+        }
+    }
+
+    #[test]
+    fn an_env_file_the_deploy_does_not_render_is_unchecked_not_refused() {
+        // Kept on the target by hand: missing here proves nothing about there.
+        let repo = compose_repo("handkept");
+        let scratch = repo.with_extension("scratch");
+        let msg = format!(
+            "env file {}/.env not found: stat {}/.env: no such file or directory\n",
+            scratch.display(),
+            scratch.display()
+        );
+        let run = |_: &Path, _: &[String]| Ok(exited(1, &msg));
+        assert!(matches!(
+            compose_config(&project(None), &repo, &scratch, &run),
+            ComposeVerdict::Unchecked(ref why) if why.starts_with("env file .env not found")
+        ));
+        // When this deploy renders it, the same message is a real refusal.
+        assert!(matches!(
+            compose_config(&project(Some((".other", "A=1\n"))), &repo, &scratch, &run),
+            ComposeVerdict::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn real_compose_refuses_a_misspelled_key_and_reads_the_rendered_env() {
+        if !have_compose() {
+            return; // CI's macOS runners have no Docker; Linux runs this.
+        }
+        let repo = compose_repo("real");
+        std::fs::write(
+            repo.join("compose.yml"),
+            "services:\n  app:\n    image: demo:latest\n    env_file: .env\n",
+        )
+        .unwrap();
+        let scratch = repo.with_extension("scratch");
+        let with_env = ComposeProject {
+            project: "demo".into(),
+            files: vec!["compose.yml".into()],
+            layout: vec![("compose.yml".into(), "compose.yml".into())],
+            env: Some((".env".into(), "A='1'\n".into())),
+        };
+        assert!(matches!(
+            compose_config(&with_env, &repo, &scratch, &run_docker),
+            ComposeVerdict::Valid(_)
+        ));
+        std::fs::write(
+            repo.join("compose.yml"),
+            "services:\n  app:\n    imag: demo:latest\n",
+        )
+        .unwrap();
+        match compose_config(&with_env, &repo, &scratch, &run_docker) {
+            ComposeVerdict::Invalid(why) => assert!(why.contains("imag"), "{why}"),
+            _ => panic!("a misspelled key must be refused"),
+        }
+    }
 
     fn local() -> Target {
         serde_yaml::from_str("{method: local, dir: .}").unwrap()

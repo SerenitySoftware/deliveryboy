@@ -55,6 +55,20 @@ pub struct LiveConfig {
     pub content: String,
 }
 
+/// A Compose project as it will sit in the target's root: what `docker compose`
+/// there is handed, and which repo file lands where. Attached by the deployer
+/// that ships it, so preflight validates the same layout instead of guessing.
+#[derive(Debug, Clone)]
+pub struct ComposeProject {
+    pub project: String,
+    /// The `-f` arguments, exactly as the deployer passes them on the target.
+    pub files: Vec<String>,
+    /// (repo-relative source, path under the root it is shipped to).
+    pub layout: Vec<(String, String)>,
+    /// The rendered env file: (path under the root, contents). Secret.
+    pub env: Option<(String, String)>,
+}
+
 /// Where a service keeps its deploy state on the target, carried alongside the
 /// step that writes it so `deliver status` / `deliver history` can read back
 /// what is live (see [`crate::readback`]).
@@ -196,6 +210,11 @@ pub struct PlannedStep {
     /// check they resolve to the target before an authorization is spent.
     #[serde(skip_serializing)]
     pub cert_domains: Vec<String>,
+    /// The Compose project this step brings up, laid out as the target will
+    /// hold it, so preflight can have `docker compose config` validate it
+    /// locally. Never serialized: it carries the rendered `.env`.
+    #[serde(skip_serializing)]
+    pub compose_project: Option<ComposeProject>,
 }
 
 impl PlannedStep {
@@ -214,6 +233,7 @@ impl PlannedStep {
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
+            compose_project: None,
         }
     }
     pub fn command_in(
@@ -235,6 +255,7 @@ impl PlannedStep {
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
+            compose_project: None,
         }
     }
     pub fn ssh(label: impl Into<String>, command: impl Into<String>) -> Self {
@@ -251,6 +272,7 @@ impl PlannedStep {
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
+            compose_project: None,
         }
     }
 
@@ -276,6 +298,7 @@ impl PlannedStep {
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
+            compose_project: None,
         }
     }
 
@@ -309,6 +332,7 @@ impl PlannedStep {
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
+            compose_project: None,
         }
     }
 
@@ -350,6 +374,12 @@ impl PlannedStep {
     pub fn needs_remote(mut self, tools: &[&str]) -> Self {
         self.remote_tools
             .extend(tools.iter().map(|tool| tool.to_string()));
+        self
+    }
+
+    /// Declare the Compose project this step brings up.
+    pub fn brings_up(mut self, project: ComposeProject) -> Self {
+        self.compose_project = Some(project);
         self
     }
 

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- Preflight validates a `docker-compose` service's project locally with
+  `docker compose config --quiet`, over a scratch copy laid out as the
+  target's root with the rendered `.env` (0600, removed afterwards). A Compose
+  file that exists but does not parse or merge used to get as far as `start
+  services` — after the live config was overwritten — and that step's undo
+  re-ran the same broken file, so the automatic rollback failed with it. It
+  now stops the run before the image is built; unset `${VAR}` interpolations
+  are warnings. Skipped with a warning when `docker compose` is not installed
+  locally, or when the project reads an env file the deploy does not render.
+
 ### Fixed
 
 - A `macos-app` release that fails its own verification no longer stays

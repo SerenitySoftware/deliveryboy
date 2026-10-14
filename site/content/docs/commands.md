@@ -76,6 +76,8 @@ Check local tools, input files, secrets, SSH access, and the tools each target m
 
 The target check is one ssh call per host, asking for the binaries the deployers declared for their steps — `docker` and `docker compose`, `nginx` and `systemctl`, `tar` for a release unpack, `curl` for an on-target health check — with the sbin directories on `PATH`, where `sudo` would find them. It runs only once the host is reachable, and `--dry-run` skips it with the rest of the remote checks. Commands you wrote (`ssh:` steps, `script:`, a Compose `remote_command`) are not inspected, and neither is `certbot`, which the nginx deployer installs when it is absent.
 
+A `docker-compose` service's project is also validated locally, with no daemon and nothing remote: preflight copies the Compose files and each `include:` into a scratch directory laid out as the target's root, renders the `.env` there at `0600` when the service has an `env_file:` block, and runs `docker compose -f … -p … config --quiet` over it. A file that does not parse or merge stops the run before the image is built; an unset `${VAR}` is printed as a warning. Without `docker compose` installed locally, or when the project reads an env file this deploy does not render (one kept on the target by hand), the check is skipped with a warning rather than failing the release. The scratch copy is removed once Compose has answered.
+
 That includes a service whose plan will not compile: unlike every other command, `preflight` reports it as one more finding and keeps checking, so a broken config and a missing `hugo` show up in the same run. Exit code `2` when anything is wrong.
 
 ## `deliver deploy`

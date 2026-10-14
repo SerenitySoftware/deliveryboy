@@ -3131,6 +3131,68 @@ const COMPOSE_ENV: &str = r#"      env_file:
         from_secrets: [DB_PASSWORD, API_KEY]
 "#;
 
+fn have_compose() -> bool {
+    Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn a_compose_file_that_does_not_validate_stops_the_deploy_at_preflight() {
+    // It used to get as far as `start services`, after the live config was
+    // overwritten — and that step's undo re-ran the same broken file.
+    let dir = compose_repo("compose-invalid", COMPOSE_ENV);
+    std::fs::write(
+        dir.join("docker-compose.prod.yml"),
+        "services: {app: {restrat: always}}\n",
+    )
+    .unwrap();
+    let out = run_in(&dir, &["deploy", "--dry-run", "-y", "--version", "1.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !have_compose() {
+        // CI's macOS runners have no Docker: say so, and do not block.
+        assert!(
+            text.contains("Compose project not validated: `docker compose` is not installed"),
+            "{text}"
+        );
+        return;
+    }
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("app: docker compose config rejects the project"),
+        "{text}"
+    );
+    assert!(text.contains("docker-compose.prod.yml"), "{text}");
+    assert!(text.contains("restrat"), "{text}");
+    assert!(!text.contains("▸ Shipping"), "{text}");
+
+    // The service reads `env_file: .env`, which a clean checkout lacks: the
+    // check renders it, so a good project validates.
+    std::fs::write(
+        dir.join("docker-compose.prod.yml"),
+        "services: {app: {restart: always, env_file: .env}}\n",
+    )
+    .unwrap();
+    let out = run_in(&dir, &["deploy", "--dry-run", "-y", "--version", "1.0.0"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("app: Compose project validates"), "{text}");
+    assert!(
+        !text.contains("file-key"),
+        "no secret value is printed: {text}"
+    );
+}
+
 #[test]
 fn compose_ships_the_image_as_a_tarball_by_default() {
     let dir = compose_repo("compose-tarball", "");
