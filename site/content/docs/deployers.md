@@ -41,6 +41,8 @@ Before the first file is overwritten, the live Compose files, each `include:` an
 
 Install nginx configuration safely. The managed mode can prepare Certbot, issue or expand certificates, stage the vhost, run `nginx -t`, reload, and restore the prior configuration if validation fails. Before any of that, preflight checks that each certificate name resolves to the target (see `preflight.dns` on a target).
 
+Before installing, it copies the vhost it replaces to `.deliver/nginx/<site>.previous` under the target directory (or records that there was none). A later step that fails, Ctrl-C, or `deliver rollback` puts that vhost back — or removes the new one on a first install — and reloads nginx, so the previous release is served by its own configuration.
+
 ## `macos-app`
 
 Build, sign, notarize, and publish a macOS app and Sparkle appcast. Delivery Boy calls the platform tools instead of replacing them.

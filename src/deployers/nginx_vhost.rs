@@ -542,39 +542,65 @@ fn certbot_ensure_step(cert: &CertNeed, cfg: &Value, ctx: &PlanContext) -> Plann
     .issues_cert_for(&cert.domains)
 }
 
+/// Where nginx keeps its config on the target. Only the tests point it
+/// elsewhere, so the install and undo scripts can run against a scratch tree.
+fn nginx_dir() -> String {
+    std::env::var("DELIVER_NGINX_DIR").unwrap_or_else(|_| "/etc/nginx".into())
+}
+
 /// `content` is what will land at `sites-available/<site>`: the rendered text
 /// when the vhost has a `render:` block, otherwise the conf as it sits in the
 /// repo. Passed in rather than re-derived so the diff can never disagree with
 /// what the step actually installs.
+///
+/// The vhost it replaces is kept at `.deliver/nginx/<site>.previous` (or
+/// marked `.previous.absent` on a first install), so the step's undo can put
+/// it back beside the previous release: after a later step fails, on Ctrl-C,
+/// and on `deliver rollback`.
 fn install_step(spec: &VhostSpec, ctx: &PlanContext, content: Option<&str>) -> PlannedStep {
     let sudo = ctx.sudo_prefix();
     let root = ctx.target.dir.trim_end_matches('/');
     let site = &spec.site_name;
-    let available = format!("/etc/nginx/sites-available/{site}");
-    let enabled = format!("/etc/nginx/sites-enabled/{site}");
+    let nginx = nginx_dir();
+    let available = format!("{nginx}/sites-available/{site}");
+    let enabled = format!("{nginx}/sites-enabled/{site}");
+    let previous = format!("{root}/.deliver/nginx/{site}.previous");
     let script = format!(
         "set -e; \
-         SRC={root}/{}; DEST={available}; LINK={enabled}; \
-         BAK=$(mktemp); HAD=0; \
-         if [ -f \"$DEST\" ]; then {sudo}cp \"$DEST\" \"$BAK\"; HAD=1; fi; \
+         SRC={root}/{}; DEST={available}; LINK={enabled}; P={previous}; \
+         {sudo}mkdir -p {root}/.deliver/nginx; {sudo}rm -f \"$P\" \"$P.absent\"; HAD=0; \
+         if [ -f \"$DEST\" ]; then {sudo}cp \"$DEST\" \"$P\"; HAD=1; else {sudo}touch \"$P.absent\"; fi; \
          {sudo}cp \"$SRC\" \"$DEST\"; {sudo}ln -sf \"$DEST\" \"$LINK\"; \
          if ! {sudo}nginx -t; then \
            echo 'nginx -t failed — restoring previous vhost' >&2; \
-           if [ \"$HAD\" = 1 ]; then {sudo}cp \"$BAK\" \"$DEST\"; else {sudo}rm -f \"$DEST\" \"$LINK\"; fi; \
-           {sudo}nginx -t >/dev/null 2>&1 || true; rm -f \"$BAK\"; exit 1; \
+           if [ \"$HAD\" = 1 ]; then {sudo}cp \"$P\" \"$DEST\"; else {sudo}rm -f \"$DEST\" \"$LINK\"; fi; \
+           {sudo}nginx -t >/dev/null 2>&1 || true; exit 1; \
          fi; \
          if ! {sudo}systemctl reload nginx; then \
            echo 'nginx reload failed — restoring previous vhost' >&2; \
-           if [ \"$HAD\" = 1 ]; then {sudo}cp \"$BAK\" \"$DEST\"; {sudo}nginx -t && {sudo}systemctl reload nginx || true; fi; \
-           rm -f \"$BAK\"; exit 1; \
+           if [ \"$HAD\" = 1 ]; then {sudo}cp \"$P\" \"$DEST\"; else {sudo}rm -f \"$DEST\" \"$LINK\"; fi; \
+           {sudo}nginx -t && {sudo}systemctl reload nginx || true; \
+           exit 1; \
          fi; \
-         rm -f \"$BAK\"; echo \"installed {site}\"",
+         echo \"installed {site}\"",
         spec.conf
+    );
+    // Separate commands rather than `nginx -t && reload`: under `set -e` a
+    // failure on the left of `&&` does not stop the script, and the undo
+    // would report a restore nginx never loaded.
+    let undo = format!(
+        "set -e; P={previous}; \
+         if [ -f \"$P\" ]; then {sudo}cp \"$P\" {available}; {sudo}ln -sf {available} {enabled}; \
+         elif [ -e \"$P.absent\" ]; then {sudo}rm -f {available} {enabled}; \
+         else echo 'no previous vhost recorded — cannot roll back {site}' >&2; exit 1; fi; \
+         {sudo}nginx -t; {sudo}systemctl reload nginx; \
+         echo \"restored previous vhost {site}\""
     );
     let step = PlannedStep::ssh(
         format!("install vhost {site} (validate + rollback on failure)"),
         script,
     )
+    .with_rollback(undo)
     .needs_remote(&["nginx", "systemctl"]);
     match content {
         Some(text) => step.with_live_config(&available, text),

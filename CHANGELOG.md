@@ -16,6 +16,16 @@
 
 ### Fixed
 
+- A failed deploy no longer leaves a new `nginx-vhost` serving the previous
+  release. The install step restored the old vhost only when `nginx -t` or the
+  reload itself failed, so when a later step — a `verify:` check, say — failed,
+  the automatic unwind put the app back and said "the target is back on its
+  previous release" while nginx kept the new configuration; a first install
+  whose reload failed also stayed enabled. The vhost being replaced is now kept
+  at `.deliver/nginx/<site>.previous` on the target, and the step's undo puts
+  it back (or removes a first install) and reloads nginx — after a failed
+  step, on Ctrl-C, and on `deliver rollback`, which no longer calls a
+  vhost-only config not rollback-able.
 - A `macos-app` release that fails its own verification no longer stays
   published. The deployer had no undo, so a failed check printed "nothing to
   roll back" while the appcast every Sparkle client polls already advertised

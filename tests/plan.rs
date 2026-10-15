@@ -710,6 +710,245 @@ fn http_only_vhost_needs_no_cert_step() {
 }
 
 #[test]
+fn vhost_install_keeps_the_replaced_vhost_and_carries_an_undo() {
+    let vhost = "server {\n    listen 80;\n    server_name plain.example.md;\n    root /srv;\n}\n";
+    let dir = nginx_repo("nginx-undo-plan", vhost, "      conf: nginx/site.conf\n");
+    let out = run_in(&dir, &["plan", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let install = plan[0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["label"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("install vhost")
+        })
+        .expect("no install step");
+    let previous = "/var/universal/example/.deliver/nginx/site.conf.previous";
+    let take = install["kind"]["Ssh"]["command"].as_str().unwrap();
+    let undo = install["rollback"].as_str().expect("install has no undo");
+    assert!(take.contains(previous), "{take}");
+    assert!(undo.contains(previous), "{undo}");
+    assert!(
+        undo.contains("/etc/nginx/sites-available/site.conf"),
+        "{undo}"
+    );
+
+    // A vhost-only config is no longer "nothing rollback-able".
+    let out = run_in(&dir, &["rollback", "--dry-run"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(
+        !text.contains("nothing in this config is rollback-able"),
+        "{text}"
+    );
+    assert!(text.contains("undo \"install vhost site.conf"), "{text}");
+}
+
+/// A scratch nginx for the vhost install and undo scripts: `/etc/nginx` is a
+/// directory under the test's tree, and `nginx`/`systemctl` are shims that
+/// log each call and fail while a `fail-<name>` file exists.
+#[cfg(unix)]
+struct ScratchNginx {
+    dir: std::path::PathBuf,
+    install: String,
+    undo: String,
+}
+
+#[cfg(unix)]
+impl ScratchNginx {
+    fn new(name: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir(name);
+        let (etc, bin, target) = (dir.join("etc-nginx"), dir.join("bin"), dir.join("target"));
+        for d in [
+            etc.join("sites-available"),
+            etc.join("sites-enabled"),
+            bin.clone(),
+            target.join("nginx"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for shim in ["nginx", "systemctl"] {
+            let path = bin.join(shim);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{shim} $*\" >> {log}\n[ ! -e {fail} ]\n",
+                    log = dir.join("calls.log").display(),
+                    fail = dir.join(format!("fail-{shim}")).display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("nginx")).unwrap();
+        std::fs::write(dir.join("nginx/site.conf"), "server {}\n").unwrap();
+        std::fs::write(
+            dir.join(".deliver.yml"),
+            format!(
+                r#"
+version: 1
+app: example
+defaults: {{target: production}}
+targets:
+  production: {{method: local, dir: {}}}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config:
+      conf: nginx/site.conf
+"#,
+                target.display()
+            ),
+        )
+        .unwrap();
+        let out = deliver()
+            .current_dir(&dir)
+            .env("DELIVER_NGINX_DIR", &etc)
+            .args(["plan", "--json"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plan: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let install = plan[0]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| {
+                s["label"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("install vhost")
+            })
+            .expect("no install step")
+            .clone();
+        ScratchNginx {
+            install: install["kind"]["Ssh"]["command"].as_str().unwrap().into(),
+            undo: install["rollback"].as_str().unwrap().into(),
+            dir,
+        }
+    }
+
+    /// Ship `body` as the vhost this deploy installs.
+    fn ship(&self, body: &str) {
+        std::fs::write(self.dir.join("target/nginx/site.conf"), body).unwrap();
+    }
+
+    fn run(&self, script: &str) -> std::process::Output {
+        let path = format!(
+            "{}:{}",
+            self.dir.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    }
+
+    fn available(&self) -> Option<String> {
+        std::fs::read_to_string(self.dir.join("etc-nginx/sites-available/site.conf")).ok()
+    }
+
+    fn enabled(&self) -> bool {
+        self.dir
+            .join("etc-nginx/sites-enabled/site.conf")
+            .symlink_metadata()
+            .is_ok()
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.dir.join("calls.log")).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn vhost_undo_puts_back_the_vhost_a_deploy_replaced() {
+    let n = ScratchNginx::new("nginx-undo-replace");
+    std::fs::write(
+        n.dir.join("etc-nginx/sites-available/site.conf"),
+        "root /srv/v1;\n",
+    )
+    .unwrap();
+    n.ship("root /srv/v2;\n");
+    assert!(n.run(&n.install).status.success());
+    assert_eq!(n.available().as_deref(), Some("root /srv/v2;\n"));
+    assert!(n.enabled());
+
+    // A later step failed (or `deliver rollback`): the undo restores v1.
+    let out = n.run(&n.undo);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("restored previous vhost site.conf"));
+    assert_eq!(n.available().as_deref(), Some("root /srv/v1;\n"));
+    assert!(n.enabled());
+    assert!(
+        n.calls().ends_with("nginx -t\nsystemctl reload nginx\n"),
+        "{}",
+        n.calls()
+    );
+
+    // An undo whose reload is refused fails rather than claiming the restore.
+    std::fs::write(n.dir.join("fail-nginx"), "").unwrap();
+    assert!(!n.run(&n.undo).status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn vhost_undo_removes_a_first_install() {
+    let n = ScratchNginx::new("nginx-undo-first");
+    n.ship("root /srv/v1;\n");
+    assert!(n.run(&n.install).status.success());
+    assert!(n.available().is_some() && n.enabled());
+
+    let out = n.run(&n.undo);
+    assert!(out.status.success(), "{out:?}");
+    assert!(n.available().is_none());
+    assert!(!n.enabled());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_first_vhost_install_whose_reload_fails_is_removed() {
+    let n = ScratchNginx::new("nginx-undo-reload");
+    n.ship("root /srv/v1;\n");
+    std::fs::write(n.dir.join("fail-systemctl"), "").unwrap();
+    let out = n.run(&n.install);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nginx reload failed"));
+    assert!(n.available().is_none(), "the new vhost stayed installed");
+    assert!(!n.enabled(), "the new vhost stayed enabled");
+}
+
+#[cfg(unix)]
+#[test]
+fn vhost_undo_refuses_without_a_recorded_previous_vhost() {
+    let n = ScratchNginx::new("nginx-undo-none");
+    let out = n.run(&n.undo);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("no previous vhost recorded — cannot roll back site.conf"));
+}
+
+#[test]
 fn script_strategy_still_supported() {
     let dir = nginx_repo(
         "nginx-script",
