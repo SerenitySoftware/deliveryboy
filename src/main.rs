@@ -1899,14 +1899,12 @@ fn cmd_rollback(explicit: ConfigArgs<'_>, only: &[String], how: RollbackRun) -> 
         .filter(|r| names.contains(&r.service.as_str()))
         .collect();
     ui::phase("Reading the target");
-    let backs: Vec<rollback::StepBack> = if requests.is_empty() {
+    let statuses = if requests.is_empty() {
         Vec::new()
     } else {
         readback::read(requests, &config.targets)
-            .iter()
-            .map(rollback::step_back)
-            .collect()
     };
+    let backs: Vec<rollback::StepBack> = statuses.iter().map(rollback::step_back).collect();
     let mut restored: Vec<(String, String, Option<rollback::StepBack>)> = Vec::new();
     for sp in &reversible {
         match backs.iter().find(|b| b.service == sp.service) {
@@ -1928,6 +1926,23 @@ fn cmd_rollback(explicit: ConfigArgs<'_>, only: &[String], how: RollbackRun) -> 
         }
     }
     restored.dedup_by(|a, b| a.0 == b.0);
+
+    // One service with nowhere to go refuses the whole run, dry or not, while
+    // the target is untouched — as `--to` does, so a rollback never half-lands.
+    let refusals: Vec<(String, String)> = statuses
+        .iter()
+        .filter_map(|status| {
+            rollback::nothing_to_roll_back(status).map(|why| (status.service.clone(), why))
+        })
+        .collect();
+    if !refusals.is_empty() {
+        ui::phase("Failed");
+        for (service, why) in &refusals {
+            ui::fail(format!("{service}: {why}"));
+        }
+        ui::note("nothing was changed on the target.");
+        return Ok(1);
+    }
 
     if how.dry_run {
         ui::phase("Dry run (nothing will be executed)");

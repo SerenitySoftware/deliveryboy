@@ -6340,6 +6340,122 @@ services:
     assert!(live_rows[0].contains("(rollback)"), "{shown}");
 }
 
+/// A first release whose `verify:` fails has nothing to go back to. The undo
+/// used to refuse — "rollback FAILED … resolve by hand" — and leave the failed
+/// release live and recorded as a normal deploy.
+#[cfg(unix)]
+#[test]
+fn a_first_files_release_that_fails_verify_is_taken_down_and_recorded() {
+    if !mv_can_replace_a_symlink() {
+        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
+        return;
+    }
+    let dir = tmpdir("unwind-first-files");
+    let root = dir.join("live");
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dir.join("site/index.html"), "one\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), "live/\n").unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: unwind
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+    verify: [{{remote_command: "test -e {}/missing.html"}}]
+"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    let out = deliver()
+        .current_dir(&dir)
+        .args(["deploy", "-y", "--version", "1.0.0"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = output_text(&out);
+    assert!(!out.status.success(), "verify was meant to fail:\n{text}");
+    assert!(
+        text.contains("first release: removed web — nothing is served"),
+        "{text}"
+    );
+    assert!(!text.contains("rollback FAILED"), "{text}");
+    assert!(
+        std::fs::symlink_metadata(root.join("web")).is_err(),
+        "the failed first release is still live:\n{text}"
+    );
+
+    let history = std::fs::read_to_string(root.join(".deliver/history.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = history.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 2, "{history}\n{text}");
+    assert_eq!(rows[1][1], "none", "{history}");
+    assert_eq!(rows[1].get(5), Some(&"rollback"), "{history}");
+
+    let out = deliver().current_dir(&dir).arg("status").output().unwrap();
+    let shown = output_text(&out);
+    assert!(shown.contains("nothing deployed yet"), "{shown}");
+
+    let out = deliver()
+        .current_dir(&dir)
+        .args(["rollback", "--dry-run"])
+        .output()
+        .unwrap();
+    let shown = output_text(&out);
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains("web: nothing to roll back to — this is the first release"),
+        "{shown}"
+    );
+    assert!(!shown.contains("would roll back"), "{shown}");
+}
+
+/// One deploy and nothing before it: `.deliver-previous` is empty, so the
+/// undo has no release to swap to. The rollback is refused up front — dry run
+/// included — rather than offered and then failing, or taking the site down.
+#[cfg(unix)]
+#[test]
+fn a_rollback_of_the_first_release_is_refused_before_anything_runs() {
+    let dir = tmpdir("rollback-first-release");
+    let root = dir.join("live");
+    std::fs::create_dir_all(root.join("releases/20260101-0900-aaa1111")).unwrap();
+    std::fs::create_dir_all(root.join(".deliver")).unwrap();
+    std::fs::write(
+        root.join(".deliver/history.tsv"),
+        "1\t20260101-0900-aaa1111\tv0.1.0\taaa1111deadbeef00\t2026-01-01T09:00:00Z\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("releases/.deliver-previous"), "\n").unwrap();
+    std::os::unix::fs::symlink(
+        root.join("releases/20260101-0900-aaa1111"),
+        root.join("web"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi\n").unwrap();
+    let cfg = files_config(&dir, &root);
+    for args in [&["--dry-run"][..], &["-y"][..]] {
+        let (code, text) = rollback_with(&dir, &cfg, args, "");
+        assert_eq!(code, Some(1), "{args:?}\n{text}");
+        assert!(
+            text.contains("web: nothing to roll back to — this is the first release"),
+            "{text}"
+        );
+        assert!(text.contains("nothing was changed on the target"), "{text}");
+        assert!(!text.contains("would roll back"), "{text}");
+        assert_eq!(live_release_of(&root), "20260101-0900-aaa1111", "{text}");
+    }
+}
+
 #[test]
 fn pruning_waits_for_verify_and_spares_the_live_and_previous_releases() {
     let dir = hugo_site_repo("rel-prune-cleanup");
@@ -6569,7 +6685,7 @@ fn an_unwound_compose_deploy_is_followed_by_a_rollback_row_for_the_release_it_re
     .unwrap();
     std::fs::write(
         dir.join(".gitignore"),
-        "live/\nbin/\nfail-health\nfail-verify\n",
+        "live/\nbin/\nfail-health\nfail-verify\ndocker.log\n",
     )
     .unwrap();
     commit_all(&dir, "verify");
@@ -6604,6 +6720,141 @@ fn a_compose_failure_before_the_record_step_adds_no_history_row() {
     assert!(!ok, "the health check was meant to fail:\n{text}");
     let history = std::fs::read_to_string(live.join(".deliver/history.tsv")).unwrap();
     assert_eq!(history.lines().count(), 1, "{history}\n{text}");
+}
+
+/// The docker stub's log: one line per invocation.
+#[cfg(unix)]
+fn docker_calls(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("docker.log")).unwrap_or_default()
+}
+
+/// A first Compose release that fails `verify:` had no `:rollback` image and
+/// no config to go back to, so the undo refused and the failed stack stayed
+/// up. Now it is brought down, the config it shipped is taken off, and the
+/// history says nothing is live.
+#[cfg(unix)]
+#[test]
+fn a_first_compose_release_that_fails_verify_is_brought_down_and_recorded() {
+    let (dir, live, path) = compose_snapshot_repo("unwind-first-compose");
+    let fail = dir.join("fail-verify");
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            "{cfg}    verify: [{{remote_command: \"test ! -e {}\"}}]\n",
+            fail.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".gitignore"),
+        "live/\nbin/\nfail-health\nfail-verify\ndocker.log\n",
+    )
+    .unwrap();
+    commit_all(&dir, "verify");
+    std::fs::write(&fail, "").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(!ok, "verify was meant to fail:\n{text}");
+    assert!(
+        text.contains("first release: nothing was running"),
+        "{text}"
+    );
+    assert!(text.contains("first release: brought snap down"), "{text}");
+    assert!(!text.contains("rollback FAILED"), "{text}");
+    let calls = docker_calls(&dir);
+    assert!(
+        calls.lines().any(|l| l.ends_with("down --remove-orphans")),
+        "{calls}\n{text}"
+    );
+    assert!(!live.join("docker-compose.yml").exists(), "{text}");
+    assert!(!live.join(".env").exists(), "{text}");
+
+    let history = std::fs::read_to_string(live.join(".deliver/history.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = history.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(rows.len(), 2, "{history}\n{text}");
+    assert_eq!(rows[1][1], "none", "{history}");
+    assert_eq!(rows[1].get(5), Some(&"rollback"), "{history}");
+
+    let (_, shown) = deliver_with_path(&dir, &path, &["status"]);
+    assert!(shown.contains("nothing deployed yet"), "{shown}");
+    let (ok, shown) = deliver_with_path(&dir, &path, &["rollback", "--dry-run"]);
+    assert!(!ok, "{shown}");
+    assert!(
+        shown.contains("stack: nothing to roll back to — this is the first release"),
+        "{shown}"
+    );
+
+    // The target is as it was, so the next deploy is a first release again,
+    // and once it passes it is live.
+    std::fs::remove_file(&fail).unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("first release: nothing was running"),
+        "{text}"
+    );
+    let (_, shown) = deliver_with_path(&dir, &path, &["status"]);
+    assert!(!shown.contains("nothing deployed yet"), "{shown}");
+}
+
+/// A health check fails before the record step, so there is no row to
+/// unwind — but the stack still comes down.
+#[cfg(unix)]
+#[test]
+fn a_first_compose_release_that_fails_health_is_brought_down_without_a_row() {
+    let (dir, live, path) = compose_snapshot_repo("unwind-first-compose-health");
+    std::fs::write(dir.join("fail-health"), "").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(!ok, "the health check was meant to fail:\n{text}");
+    assert!(text.contains("first release: brought snap down"), "{text}");
+    assert!(
+        docker_calls(&dir)
+            .lines()
+            .any(|l| l.ends_with("down --remove-orphans")),
+        "{text}"
+    );
+    assert!(!live.join("docker-compose.yml").exists(), "{text}");
+    assert!(!live.join(".deliver/history.tsv").exists(), "{text}");
+}
+
+/// A second release over a live one keeps the image/config undo: no marker,
+/// no `down`.
+#[cfg(unix)]
+#[test]
+fn a_compose_release_over_a_live_one_is_not_a_first_release() {
+    let (dir, _live, path) = compose_snapshot_repo("unwind-second-compose");
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(ok, "{text}");
+    change_release(&dir);
+    commit_all(&dir, "two");
+    std::fs::write(dir.join("fail-health"), "").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+    assert!(!ok, "{text}");
+    assert!(!text.contains("first release"), "{text}");
+    assert!(
+        text.contains("rolled back to the previous config"),
+        "{text}"
+    );
+    assert!(
+        !docker_calls(&dir).contains(" down "),
+        "{}",
+        docker_calls(&dir)
+    );
+}
+
+#[test]
+fn the_first_release_undos_are_in_the_plan() {
+    let dir = compose_repo("first-release-plan", "");
+    let out = run_in(&dir, &["plan", "--json"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("touch \\\"$S/.first\\\""), "{text}");
+    assert!(text.contains("[ -e \\\"$S/.first\\\" ]"), "{text}");
+    assert!(text.contains("down --remove-orphans"), "{text}");
+
+    let dir = hugo_site_repo("first-release-plan-files");
+    let out = run_in(&dir, &["plan", "--json"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("first release: removed web"), "{text}");
 }
 
 #[test]
@@ -8084,6 +8335,15 @@ fn a_rollback_contends_for_the_same_lock_as_a_deploy() {
         cfg.replace("{src: payload.txt}", "{src: site, remote_subdir: web}"),
     )
     .unwrap();
+    // And a release before the live one, or the rollback is refused as having
+    // nowhere to go before it reaches the lock.
+    let releases = dir.join("dest/releases");
+    std::fs::create_dir_all(releases.join("20260101-0900-aaa1111")).unwrap();
+    std::fs::write(
+        releases.join(".deliver-previous"),
+        format!("{}\n", releases.join("20260101-0900-aaa1111").display()),
+    )
+    .unwrap();
     git_init_tagged(&dir, "v1.0.0");
     hold_lock(&dir, 90);
 
@@ -9168,13 +9428,17 @@ fn compose_snapshot_repo(name: &str) -> (std::path::PathBuf, std::path::PathBuf,
     std::fs::write(
         &stub,
         format!(
-            "#!/bin/sh\ncase \"$*\" in *' exec '*) test ! -e {}/fail-health;; *) exit 0;; esac\n",
+            "#!/bin/sh\necho \"$*\" >> {0}/docker.log\ncase \"$*\" in *' exec '*) test ! -e {0}/fail-health;; *) exit 0;; esac\n",
             dir.display()
         ),
     )
     .unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(dir.join(".gitignore"), "live/\nbin/\nfail-health\n").unwrap();
+    std::fs::write(
+        dir.join(".gitignore"),
+        "live/\nbin/\nfail-health\ndocker.log\n",
+    )
+    .unwrap();
     std::fs::write(
         dir.join("docker-compose.yml"),
         "services:\n  web:\n    image: nginx:1.25\n",

@@ -175,7 +175,10 @@ is left alone, and a deployer that keeps no release directories (`docker-compose
 replaces containers in place) is told to use plain `deliver rollback`. If any
 selected service cannot be satisfied, nothing is changed anywhere — so a
 multi-service rollback never half-lands. Narrow the run with `--service NAME`
-when only one app should move.
+when only one app should move. A plain `deliver rollback` of a service whose
+first release is the only one on the target is refused the same way, dry run
+included — `nothing to roll back to — this is the first release` — since there
+is no earlier release to go to.
 
 Before it acts, every rollback prints both ends for each service —
 `web: live 20260202-1000-bbb2222 (v0.2.0) → back to 20260101-0900-aaa1111 (v0.1.0)` —

@@ -16,6 +16,17 @@
 
 ### Fixed
 
+- A first release of a `files`/`hugo` or `docker-compose` service whose checks
+  fail is now taken down instead of left live. The undo looked for a previous
+  release, found none, and failed — "rollback FAILED … resolve by hand" — while
+  the failed release kept serving and `deliver status` called it live. Now the
+  `files` undo removes the live symlink and a Compose first release (one with
+  no Compose file on the target before it) is brought down with
+  `docker compose down --remove-orphans` and its shipped config removed; both
+  append a `none` rollback row, and `deliver status` says "nothing deployed
+  yet". `deliver rollback`, dry run included, refuses a service with nothing
+  before its live release: `nothing to roll back to — this is the first
+  release`.
 - A failed deploy no longer leaves a new `nginx-vhost` serving the previous
   release. The install step restored the old vhost only when `nginx -t` or the
   reload itself failed, so when a later step — a `verify:` check, say — failed,

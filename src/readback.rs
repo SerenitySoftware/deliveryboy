@@ -99,11 +99,16 @@ impl Status {
     /// A symlink is the authority: it is what the web server actually follows.
     /// Without one — Compose, which has no symlink — the newest history row is
     /// the best available answer, and [`Status::live_is_recorded`] says which
-    /// of the two the caller is looking at.
+    /// of the two the caller is looking at — unless that row is the unwind of
+    /// a first release, after which nothing is up.
     pub fn live_deploy_id(&self) -> Option<String> {
         match &self.live {
             Live::Release { path } => Some(basename(path).to_string()),
-            Live::NotApplicable => self.history.first().map(|d| d.deploy_id.clone()),
+            Live::NotApplicable => self
+                .history
+                .first()
+                .map(|d| d.deploy_id.clone())
+                .filter(|id| id != crate::rollback::NOTHING_LIVE),
             _ => None,
         }
     }

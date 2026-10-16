@@ -311,6 +311,25 @@ pub fn landed(swap: &Swap, status: &Status) -> StepBack {
     }
 }
 
+/// Why a plain `deliver rollback` of this service would have nowhere to go,
+/// when it would: the target answered and records no release before the one
+/// that is up. Its undo could only fail, or — for a first release — take the
+/// service down, which is not what "roll back" asks for; either way the run
+/// is refused before anything is touched.
+pub fn nothing_to_roll_back(status: &Status) -> Option<String> {
+    if !status.reachable || step_back(status).to.is_some() {
+        return None;
+    }
+    let deploys = status.history.iter().filter(|d| !d.rollback).count();
+    Some(if deploys == 0 {
+        "nothing to roll back to — nothing is deployed yet".to_string()
+    } else if deploys == 1 {
+        "nothing to roll back to — this is the first release".to_string()
+    } else {
+        "nothing to roll back to — no previous release recorded on the target".to_string()
+    })
+}
+
 /// `web: live 20260202-bbb2222 (v0.2.0) → back to 20260130-aaa1111 (v0.1.9)`
 pub fn describe_step_back(back: &StepBack) -> String {
     let end = |id: Option<&String>, release: Option<&String>| match (id, release) {
@@ -370,6 +389,11 @@ pub fn record_command(
         sha = shell_quote(sha),
     )
 }
+
+/// The deploy id an unwind records when it took a first release down: there
+/// was no release before it, so what is live afterwards is nothing. The
+/// read-back treats a newest row naming it as "nothing deployed".
+pub const NOTHING_LIVE: &str = "none";
 
 /// Shell that records an automatic unwind in `history.tsv`.
 ///
@@ -442,6 +466,27 @@ mod tests {
 
     fn no_targets() -> BTreeMap<String, Target> {
         BTreeMap::new()
+    }
+
+    #[test]
+    fn a_first_release_has_nothing_to_roll_back_to() {
+        let mut first = status();
+        first.history.truncate(1);
+        first.previous = None;
+        assert_eq!(
+            nothing_to_roll_back(&first).as_deref(),
+            Some("nothing to roll back to — this is the first release")
+        );
+        first.history.clear();
+        assert!(nothing_to_roll_back(&first)
+            .unwrap()
+            .contains("nothing is deployed yet"));
+        first.reachable = false;
+        assert_eq!(nothing_to_roll_back(&first), None);
+
+        let mut stepped = status();
+        stepped.previous = Some("/var/app/releases/20260101-aaa".into());
+        assert_eq!(nothing_to_roll_back(&stepped), None);
     }
 
     #[test]

@@ -227,11 +227,24 @@ fn shipped_config(cfg: &Value, files: &[String]) -> Vec<String> {
     paths
 }
 
+/// The marker a snapshot carries when the target had no live Compose file:
+/// nothing was running from this root before the deploy, so the undo brings
+/// the stack down instead of looking for a previous release that never was.
+const FIRST_MARKER: &str = ".first";
+
 /// Copy the live config aside before the deploy overwrites it. A path the
 /// target does not have yet is skipped: there is nothing to put back. Two
 /// deploys of one commit inside a second share an id, so a taken one gets a
-/// suffix that still sorts after it.
-fn snapshot_command(root: &str, sudo: &str, id: &str, paths: &[String]) -> String {
+/// suffix that still sorts after it. With no live Compose file (`compose_file`,
+/// the first `-f`) this is a first release and the snapshot gets
+/// [`FIRST_MARKER`].
+fn snapshot_command(
+    root: &str,
+    sudo: &str,
+    id: &str,
+    paths: &[String],
+    compose_file: &str,
+) -> String {
     let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
     format!(
         "set -e; cd {root}; S={SNAPSHOTS}/{id}; \
@@ -239,8 +252,11 @@ fn snapshot_command(root: &str, sudo: &str, id: &str, paths: &[String]) -> Strin
          {sudo}mkdir -p \"$S\"; N=0; \
          for p in {list}; do if [ -e \"$p\" ]; then \
            {sudo}mkdir -p \"$S/$(dirname \"$p\")\"; {sudo}cp -Rp \"$p\" \"$S/$p\"; N=$((N+1)); fi; \
-         done; echo \"saved $N live config path(s) to $S\"",
-        list = quoted.join(" ")
+         done; echo \"saved $N live config path(s) to $S\"; \
+         if [ ! -e {compose_file} ]; then {sudo}touch \"$S/{FIRST_MARKER}\"; \
+           echo 'first release: nothing was running from {root} before it'; fi",
+        list = quoted.join(" "),
+        compose_file = shell_quote(compose_file),
     )
 }
 
@@ -575,7 +591,14 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     steps.push(
         PlannedStep::ssh(
             format!("snapshot live config → {SNAPSHOTS}/{}", ctx.version.id),
-            snapshot_command(&root, sudo, &ctx.version.id, &config_paths),
+            snapshot_command(
+                &root,
+                sudo,
+                &ctx.version.id,
+                &config_paths,
+                // Shipped to the root under its own name, as `shipped_config` has it.
+                files[0].rsplit('/').next().unwrap_or(&files[0]),
+            ),
         )
         .with_rollback(format!(
             "{restore}; if [ -n \"$S\" ]; then {sudo}rm -rf \"$S\"; fi"
@@ -813,7 +836,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // the project is running whatever its Compose file pins.
     // The config goes back first, so the previous image comes up under the
     // files and `.env` it was released with.
-    steps.push(if builds && shipped_images.len() > 1 {
+    let undo = if builds && shipped_images.len() > 1 {
         // Every image goes back or none does: a mix of the previous and the
         // new images is neither release, so it is never brought up as one.
         let names = image_names.join(" ");
@@ -821,7 +844,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             .iter()
             .map(|(name, t)| format!("{sudo}docker tag {name}:rollback {t}; "))
             .collect();
-        start.with_rollback(format!(
+        format!(
             "{restore}; set -e; cd {root}; MISSING=; \
                  for i in {names}; do \
                    {sudo}docker image inspect \"$i:rollback\" >/dev/null 2>&1 || MISSING=\"$MISSING $i\"; \
@@ -831,27 +854,52 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                    echo 'rolled back to the previous images ({})'; \
                  else echo \"no rollback image recorded for:$MISSING\" >&2; exit 1; fi; {unwind_record}",
             image_names.join(", ")
-        ))
+        )
     } else if builds {
-        start.with_rollback(format!(
+        format!(
             "{restore}; set -e; cd {root}; \
                  if {sudo}docker image inspect {0}:rollback >/dev/null 2>&1; then \
                    {sudo}docker tag {0}:rollback {tag}; {sudo}{compose} up -d --remove-orphans; \
                    echo 'rolled back to the previous image'; \
                  else echo 'no rollback image recorded' >&2; exit 1; fi; {unwind_record}",
             image_name
-        ))
+        )
     } else {
         // A pull-only project's release *is* its config: the files pin the
         // images, so restoring them and coming back up is the whole undo.
-        start.with_rollback(format!(
+        format!(
             "{restore}; set -e; cd {root}; \
                  if [ -n \"$RESTORED\" ]; then {sudo}{compose} up -d --remove-orphans; \
                    echo 'rolled back to the previous config'; \
                  else echo 'no image was shipped and no config snapshot was recorded — \
                    nothing to restore' >&2; exit 1; fi; {unwind_record}"
-        ))
-    });
+        )
+    };
+    // A first release has nothing to go back to: the snapshot this deploy took
+    // carries the first-release marker, and the undo takes the stack down and
+    // removes the config the deploy shipped where none was before, so the
+    // target is as it was and the next deploy is a first release again. Only
+    // this run's own snapshot counts — two deploys inside one second sort by
+    // sha, not by age — so `deliver rollback`, whose fresh plan has an id no
+    // snapshot carries, always takes the ordinary undo.
+    let shipped: Vec<String> = config_paths.iter().map(|p| shell_quote(p)).collect();
+    let first_record = crate::rollback::unwind_record_command(
+        &history,
+        &ctx.version.id,
+        &format!("echo {}", crate::rollback::NOTHING_LIVE),
+        sudo,
+    );
+    steps.push(start.with_rollback(format!(
+        "cd {root}; S=; for d in {SNAPSHOTS}/{id} {SNAPSHOTS}/{id}-*; do [ -d \"$d\" ] && S=$d; done; \
+         if [ -n \"$S\" ] && [ -e \"$S/{FIRST_MARKER}\" ]; then \
+           set -e; {sudo}{compose} down --remove-orphans; \
+           for p in {shipped}; do [ -e \"$S/$p\" ] || {sudo}rm -rf \"$p\"; done; \
+           echo 'first release: brought {project} down — nothing is served until a release passes its checks'; \
+           {first_record}; \
+         else {undo}; fi",
+        shipped = shipped.join(" "),
+        id = ctx.version.id,
+    )));
 
     // --- health --------------------------------------------------------------
     if let Some(health) = cfg.get("health") {

@@ -221,22 +221,32 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
          {sudo}mv -Tf {live}.new {live}; \
          echo \"activated {stamp} (previous: ${{PREV:-none}})\""
     );
-    // Undo: point the symlink back at whatever was live before.
+    // Undo: point the symlink back at whatever was live before. An empty
+    // marker is the activate step saying nothing was live — a first release —
+    // so going back means serving nothing, not refusing and leaving the failed
+    // release up. The history row then names `none`, which the read-back
+    // takes as "nothing deployed".
+    let history = format!("{state}/.deliver/history.tsv");
     let undo = format!(
         "set -e; \
          PREV=$({sudo}cat {prev_marker} 2>/dev/null || true); \
          if [ -n \"$PREV\" ] && [ -d \"$PREV\" ]; then \
            {sudo}ln -sfn \"$PREV\" {live}.rb; {sudo}mv -Tf {live}.rb {live}; \
-           echo \"rolled back {subdir} → $PREV\"; \
+           echo \"rolled back {subdir} → $PREV\"; {record}; \
+         elif [ -z \"$PREV\" ] && {sudo}test -f {prev_marker}; then \
+           {sudo}rm -f {live}; \
+           echo 'first release: removed {subdir} — nothing is served until a release passes its checks'; {first}; \
          else \
            echo 'no previous release recorded — cannot roll back {subdir}' >&2; exit 1; \
-         fi; {record}",
-        record = crate::rollback::unwind_record_command(
-            &format!("{state}/.deliver/history.tsv"),
+         fi",
+        record =
+            crate::rollback::unwind_record_command(&history, &stamp, "basename \"$PREV\"", sudo),
+        first = crate::rollback::unwind_record_command(
+            &history,
             &stamp,
-            "basename \"$PREV\"",
-            sudo,
-        )
+            &format!("echo {}", crate::rollback::NOTHING_LIVE),
+            sudo
+        ),
     );
     steps.push(
         PlannedStep::ssh(
