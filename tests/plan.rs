@@ -9879,3 +9879,63 @@ fn an_unknown_dns_mode_is_refused() {
     let out = run_in(&dir, &["validate"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// A target that runs its steps under a `sudo` that wants a password used to
+/// pass preflight and then fail at the deploy lock with "a deploy is already
+/// running" by "an unidentified run". Preflight now says what is wrong.
+#[cfg(unix)]
+#[test]
+fn preflight_names_a_sudo_that_needs_a_password() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmpdir("preflight-sudo-password");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sudo = bin.join("sudo");
+    std::fs::write(
+        &sudo,
+        "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("payload.txt"), "hi\n").unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: local}}
+targets:
+  local: {{method: local, sudo: true, dir: {}}}
+services:
+  ship:
+    deployer: files
+    config: {{src: payload.txt}}
+"#,
+            dir.join("dest").display()
+        ),
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = deliver()
+        .current_dir(&dir)
+        .env("PATH", path)
+        .arg("preflight")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("sudo needs a password on the local target"),
+        "{text}"
+    );
+    assert!(text.contains("sudo: false"), "{text}");
+}

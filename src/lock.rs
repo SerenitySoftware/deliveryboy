@@ -398,6 +398,38 @@ pub enum Taken {
     Held(Guard),
     /// Someone else has one of them. Anything already taken has been given back.
     Busy(Box<Blocked>),
+    /// The lock could not be created on a target at all. Every mutating step
+    /// runs under the same prefix and would fail the same way one step later,
+    /// so this aborts rather than continuing as `Unknown` does.
+    Failed(Box<Unlockable>),
+}
+
+/// A target where the lock directory could not be created.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unlockable {
+    pub target: String,
+    pub host: String,
+    pub dir: String,
+    pub reason: String,
+    pub sudo: bool,
+}
+
+impl Unlockable {
+    /// What failed, and — when `sudo` is the likely cause — what to change.
+    pub fn render(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "could not create the deploy lock on {} [{}]:{} — {}",
+            self.target, self.host, self.dir, self.reason
+        )];
+        if self.sudo {
+            lines.push(
+                "every step runs under sudo on this target: set `sudo: false` on it for a \
+                 root login, or install sudo and allow it without a password"
+                    .to_string(),
+            );
+        }
+        lines
+    }
 }
 
 fn sudo_for(target: &Target) -> &'static str {
@@ -414,6 +446,9 @@ enum Answer {
         took_over: bool,
     },
     Busy(Holder),
+    /// The lock directory could not be created and does not exist — not
+    /// contention. `sudo` missing or wanting a password is the usual cause.
+    Failed(String),
     /// Could not be determined — not evidence of a concurrent deploy.
     Unknown(String),
 }
@@ -437,7 +472,14 @@ fn acquire_script(
     format!(
         "L={l}; N={n}; NOW=$(date -u +%s); TOOK=fresh\n\
          {sudo}mkdir -p \"$(dirname \"$L\")\" 2>/dev/null || true\n\
-         if {sudo}mkdir \"$L\" 2>/dev/null; then :; else\n\
+         if {sudo}mkdir \"$L\" 2>/dev/null; then :\n\
+         elif ! {sudo}test -d \"$L\" && ERR=$({sudo}mkdir \"$L\" 2>&1); then :\n\
+         elif ! {sudo}test -d \"$L\"; then\n\
+           printf '%s ERROR\\n' \"$N\"\n\
+           printf '%s\\n' \"$ERR\"\n\
+           printf '%s END\\n' \"$N\"\n\
+           exit 0\n\
+         else\n\
            HELD=$({sudo}cat \"$L/owner\" 2>/dev/null || true)\n\
            AGE=$(printf '%s\\n' \"$HELD\" | sed -n 's/^started_epoch=//p' | head -1)\n\
            BREAK={force}\n\
@@ -477,6 +519,22 @@ fn parse_answer(output: &str, marker: &str) -> Answer {
         return Answer::Acquired {
             took_over: rest.trim() == "stale",
         };
+    }
+    let error = format!("{marker} ERROR");
+    if let Some(start) = output.find(&error) {
+        let body = &output[start + error.len()..];
+        let body = body.split(&format!("{marker} END")).next().unwrap_or("");
+        let reason = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Answer::Failed(if reason.is_empty() {
+            "mkdir failed".into()
+        } else {
+            reason
+        });
     }
     let busy = format!("{marker} BUSY");
     let Some(start) = output.find(&busy) else {
@@ -569,6 +627,15 @@ pub fn acquire(
                     holder,
                 }));
             }
+            Answer::Failed(reason) => {
+                return Taken::Failed(Box::new(Unlockable {
+                    target: target_name,
+                    host,
+                    dir,
+                    reason,
+                    sudo: target.uses_sudo(),
+                }));
+            }
             // Not evidence of a concurrent deploy — see the module note.
             Answer::Unknown(why) => {
                 crate::ui::note(format!(
@@ -640,6 +707,88 @@ mod tests {
         };
         assert_eq!(holder, Holder::default());
         assert_eq!(holder.describe_owner(), "an unidentified run");
+    }
+
+    /// A failed `mkdir` with no lock directory behind it is not contention.
+    /// It used to read as `BUSY` with an empty owner — "a deploy is already
+    /// running … an unidentified run" — on a box that simply had no `sudo`.
+    #[test]
+    fn an_error_answer_is_a_failure_not_a_holder() {
+        let out = "__M__ ERROR\nsh: sudo: command not found\n__M__ END\n";
+        let Answer::Failed(reason) = parse_answer(out, "__M__") else {
+            panic!("expected a failure");
+        };
+        assert_eq!(reason, "sh: sudo: command not found");
+        let lines = Unlockable {
+            target: "box".into(),
+            host: "h".into(),
+            dir: "/d.deliver-lock".into(),
+            reason,
+            sudo: true,
+        }
+        .render();
+        assert!(!lines.join("\n").contains("already running"), "{lines:?}");
+        assert!(
+            lines[0].contains("could not create the deploy lock"),
+            "{lines:?}"
+        );
+        assert!(lines.join("\n").contains("sudo: false"), "{lines:?}");
+    }
+
+    /// The script itself, with a `sudo` prefix that does not exist: it reports
+    /// the failure, with force and without, and never claims a holder.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_sudo_is_reported_as_a_failure_by_the_script() {
+        let dir = std::env::temp_dir().join(format!("deliver-lock-nosudo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("app.deliver-lock");
+        let id = Identity {
+            owner: "jo@laptop".into(),
+            pid: 1,
+            services: "web".into(),
+            release: "v1".into(),
+            deploy: "d".into(),
+        };
+        for force in [false, true] {
+            let script = acquire_script(
+                &lock.to_string_lossy(),
+                &id,
+                "deliver-no-such-sudo ",
+                3600,
+                force,
+                "__M__",
+            );
+            let out = sh(&script);
+            let Answer::Failed(reason) = parse_answer(&out, "__M__") else {
+                panic!("expected a failure (force={force}):\n{out}");
+            };
+            assert!(reason.contains("deliver-no-such-sudo"), "{reason}");
+            assert!(!lock.exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lock directory that exists is still contention, whatever `mkdir`
+    /// said — the failure path must not swallow a real holder.
+    #[test]
+    fn an_existing_lock_is_still_busy_not_a_failure() {
+        let dir = held_lock("still-busy", "d-other", "1");
+        let id = Identity {
+            owner: "me@laptop".into(),
+            pid: 2,
+            services: "web".into(),
+            release: "v2".into(),
+            deploy: "d-mine".into(),
+        };
+        let script = acquire_script(&dir.to_string_lossy(), &id, "", 0, false, "__M__");
+        let out = sh(&script);
+        assert!(
+            matches!(parse_answer(&out, "__M__"), Answer::Busy(_)),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

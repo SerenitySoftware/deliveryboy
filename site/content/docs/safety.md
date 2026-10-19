@@ -69,7 +69,15 @@ The lock is a directory beside the target directory, so it is never carried away
 
 A lock older than an hour is treated as abandoned and taken over, because a run that dies outright — a killed process, a closed laptop, a dropped connection — cannot give its lock back, and a lock nobody can release would be worse than one that is briefly too generous. Set `lock: {stale_after: 7200}` on a target whose releases run longer, or `0` to require `--force` instead. Age is measured from the last step the run started, not from when it began: the lock is refreshed before every step and every soak round, and a run only ever releases a lock that still names its own deploy id, so a lock taken over as stale is left with the run that took it.
 
-A lock that cannot be taken at all — no route to the host, a directory the release account cannot create — prints a line and the deploy continues. That is not evidence another release is running, and it is deliberately not treated as such.
+A lock whose state cannot be read — no route to the host, a shell that never answered — prints a line and the deploy continues. That is not evidence another release is running, and it is deliberately not treated as such. A lock directory the target refuses to create is different: every step runs under the same account and `sudo` prefix and would fail the same way one step later, so the deploy stops there and names the cause instead of a holder:
+
+```
+▸ Deploy lock
+    ✗ could not create the deploy lock on production [box.example.com]:/var/universal/demo.deliver-lock — sh: sudo: command not found
+    ✗ every step runs under sudo on this target: set `sudo: false` on it for a root login, or install sudo and allow it without a password
+```
+
+`deliver preflight` checks the same thing earlier: on a target that uses `sudo` (every remote target, unless `sudo: false`), a missing `sudo` or one that asks for a password is a preflight failure.
 
 ## Secrets
 

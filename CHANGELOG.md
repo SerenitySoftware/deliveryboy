@@ -16,6 +16,14 @@
 
 ### Fixed
 
+- A deploy lock that could not be created is no longer reported as "a deploy
+  is already running" by "an unidentified run". On a target without `sudo`, or
+  where `sudo` wants a password, the failed `mkdir` used to read as
+  contention, and `--force` repeated it. The deploy now stops with
+  `could not create the deploy lock on <target> [<host>]:<dir> — <error>` and
+  the fix (`sudo: false` for a root login, or a passwordless `sudo`), and
+  preflight catches the same case earlier: `sudo is not installed` or `sudo
+  needs a password` on a target that uses it.
 - `deliver verify` runs on an untagged commit. It resolved a release like
   `deploy --yes`, so on a feature branch, after pulling untagged work, or after
   a `--version` deploy with tagging off it said "tag the commit" and ran no

@@ -1479,6 +1479,14 @@ fn cmd_deploy(
                 ui::note("nothing was built, shipped, or changed.");
                 return Ok(2);
             }
+            lock::Taken::Failed(unlockable) => {
+                ui::phase("Aborted");
+                for line in unlockable.render() {
+                    ui::fail(line);
+                }
+                ui::note("nothing was built, shipped, or changed.");
+                return Ok(2);
+            }
         }
     };
 
@@ -1789,6 +1797,14 @@ fn take_deploy_lock(
             ui::note(
                 "wait for that run to finish, or re-run with --force to take the lock anyway.",
             );
+            ui::note("nothing on the target was changed.");
+            Err(2)
+        }
+        lock::Taken::Failed(unlockable) => {
+            ui::phase("Aborted");
+            for line in unlockable.render() {
+                ui::fail(line);
+            }
             ui::note("nothing on the target was changed.");
             Err(2)
         }

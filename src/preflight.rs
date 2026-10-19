@@ -147,6 +147,49 @@ fn missing_remote_tools(
     }
 }
 
+/// Prints `missing` when there is no `sudo` and `password` when it would ask
+/// for one, and nothing otherwise. Only those two: a host whose sudoers allows
+/// just the commands the deploy runs refuses `true` and still deploys fine.
+fn sudo_probe_script(sudo: &str) -> String {
+    let q = crate::remote::shell_quote(sudo);
+    format!(
+        "PATH=\"$PATH:/usr/local/sbin:/usr/sbin:/sbin\"; \
+         command -v {q} >/dev/null 2>&1 || {{ echo missing; exit 0; }}; \
+         {q} -n true 2>&1 >/dev/null | grep -qi 'password is required' && echo password; true"
+    )
+}
+
+/// Whether the `sudo` every step runs under will work, for a target that uses
+/// it. Without it the first mutating step fails — the deploy lock, before the
+/// lock learned to say why — and nothing in the output names `sudo`.
+fn sudo_problem(target: &Target, host: &str) -> Option<String> {
+    let script = sudo_probe_script("sudo");
+    let output = if target.is_local() {
+        Command::new("sh").arg("-c").arg(&script).output()
+    } else {
+        Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+            .args(target.ssh_args())
+            .arg(format!("{}@{host}", target.ssh.user))
+            .arg(&script)
+            .stderr(Stdio::null())
+            .output()
+    };
+    let answer = String::from_utf8_lossy(&output.ok()?.stdout)
+        .trim()
+        .to_string();
+    let why = match answer.as_str() {
+        "missing" => "sudo is not installed",
+        "password" => "sudo needs a password",
+        _ => return None,
+    };
+    Some(format!(
+        "{why} on {}, and every step on this target runs under it — set `sudo: false` \
+         on the target for a root login, or allow sudo without a password",
+        where_on(target, host)
+    ))
+}
+
 /// How a report line names the machine a remote check ran on.
 fn where_on(target: &Target, host: &str) -> String {
     if target.is_local() {
@@ -589,6 +632,11 @@ pub fn run(
                     }
                 }
                 // 4. the target's own tooling — only once we know we can ask.
+                if target.uses_sudo() {
+                    if let Some(problem) = sudo_problem(target, &host) {
+                        problems.push(problem);
+                    }
+                }
                 let Some(tools) = remote_tools.get(&(target_name.clone(), host.clone())) else {
                     continue;
                 };
@@ -916,5 +964,22 @@ mod tests {
         let script = probe_script(&tools(&["nginx"]));
         assert!(script.starts_with("PATH=\"$PATH:/usr/local/sbin:/usr/sbin:/sbin\""));
         assert!(script.contains("command -v 'nginx'"), "{script}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sudo_probe_names_a_missing_sudo_and_nothing_else() {
+        let run = |sudo: &str| {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(sudo_probe_script(sudo))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run("deliver-no-such-sudo"), "missing");
+        // A sudo that refuses `true` for any other reason — sudoers allowing
+        // only the deploy's own commands — is not flagged (`env -n` errors).
+        assert_eq!(run("env"), "");
     }
 }
