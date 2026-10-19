@@ -2960,11 +2960,64 @@ fn deploy_yes_on_an_untagged_head_fails_instead_of_passing() {
     );
 }
 
-/// `verify` takes the same path, so on an untagged commit it ran no checks and
-/// still exited 0 — reporting a live release as good without looking at it.
+/// A local `files` repo with one verify check, for `deliver verify`.
+fn verify_repo(name: &str) -> std::path::PathBuf {
+    let dir = local_deploy_repo(name);
+    let config = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        config.replace(
+            "    config: {src: payload.txt}\n",
+            "    config: {src: payload.txt}\n    verify: [{remote_command: \"true\"}]\n",
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+fn tags_on_head(dir: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["tag", "--points-at", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `verify` ships nothing, so it needs no release of its own. On an untagged
+/// commit — a feature branch, a pull of untagged work — it refused with "tag
+/// the commit" and ran none of the checks; it now checks what is live, and
+/// the release it reports is the one the target's live symlink points at.
+#[cfg(unix)]
 #[test]
-fn verify_on_an_untagged_head_does_not_report_success() {
-    let dir = local_deploy_repo("verify-untagged");
+fn verify_on_an_untagged_head_checks_the_live_release() {
+    let dir = tmpdir("verify-untagged");
+    // Live is the *older* release, so the answer cannot come from HEAD or from
+    // the newest history row.
+    let root = deployed_fixture(&dir, Some("20260101-0900-aaa1111"));
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: readback
+versioning:
+  tag: {{enabled: true}}
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+services:
+  web:
+    deployer: files
+    config: {{src: site, remote_subdir: web}}
+    verify: [{{remote_command: "test -L {}/web"}}]
+"#,
+            root.display(),
+            root.display()
+        ),
+    )
+    .unwrap();
     git_init_tagged(&dir, "tmp");
     std::process::Command::new("git")
         .arg("-C")
@@ -2979,8 +3032,127 @@ fn verify_on_an_untagged_head_does_not_report_success() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(out.status.code(), Some(2), "{text}");
-    assert!(!text.contains("Verifying"), "{text}");
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!text.contains("no release to deploy"), "{text}");
+    assert!(text.contains("Verifying"), "{text}");
+    assert!(
+        text.contains("live release:   v0.1.0 (read from the target)"),
+        "{text}"
+    );
+    assert!(text.contains("verify complete"), "{text}");
+    assert!(text.contains("release:        v0.1.0"), "{text}");
+    // `tag.enabled` is on and the release is v0.1.0 — but verify shipped
+    // nothing, so it must not tag HEAD with it.
+    assert_eq!(tags_on_head(&dir), "", "{text}");
+}
+
+/// `verify` ran the post-success tag step like a deploy, so on a tagged HEAD
+/// whose tag was never pushed, checking the live release pushed the tag — a
+/// tag is supposed to mean "this shipped", and verify ships nothing.
+#[test]
+fn verify_never_creates_or_pushes_a_tag() {
+    let dir = verify_repo("verify-no-push");
+    let remote = tmpdir("verify-no-push-remote");
+    let config = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        config.replace(
+            "tag: {enabled: true}",
+            "tag: {enabled: true, push: true, remote: origin}",
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    for args in [
+        vec!["init", "-q", "--bare", remote.to_str().unwrap()],
+        vec![
+            "-C",
+            dir.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().unwrap(),
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .output()
+            .unwrap();
+    }
+
+    let out = run_in(&dir, &["verify"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!text.contains("tag:"), "{text}");
+    let pushed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&remote)
+        .args(["tag", "--list"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&pushed.stdout).trim(), "", "{text}");
+}
+
+/// With nothing recorded on the target (this `files` service keeps no release
+/// layout) the checks still run; the release they see is HEAD's own, which is
+/// `untagged` here.
+#[test]
+fn verify_with_nothing_recorded_runs_its_checks_as_untagged() {
+    let dir = verify_repo("verify-unrecorded");
+    git_init_tagged(&dir, "tmp");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["tag", "-d", "tmp"])
+        .output()
+        .unwrap();
+
+    let out = run_in(&dir, &["verify"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("Verifying"), "{text}");
+    assert!(
+        text.contains("none recorded on the target — checking as untagged"),
+        "{text}"
+    );
+    assert_eq!(tags_on_head(&dir), "", "{text}");
+}
+
+/// A failing check still fails `verify` on an untagged commit — running the
+/// checks is the point, not reporting success.
+#[test]
+fn verify_on_an_untagged_head_still_fails_a_failing_check() {
+    let dir = verify_repo("verify-untagged-fails");
+    let config = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        config.replace("remote_command: \"true\"", "remote_command: \"false\""),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "tmp");
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["tag", "-d", "tmp"])
+        .output()
+        .unwrap();
+
+    let out = run_in(&dir, &["verify"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("Verifying"), "{text}");
 }
 
 #[test]

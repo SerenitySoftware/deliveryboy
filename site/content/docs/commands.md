@@ -153,7 +153,7 @@ The command it runs is printed before it runs, and the read is read-only.
 
 Run only the checks from the selected services.
 
-It resolves the release the way `deploy --yes` does, so with `versioning.from: tag` (the default) it needs a tag on `HEAD` or `--version`. Without one it runs no checks and exits `2`, as does `deploy --yes`, rather than reporting success for work it did not do.
+It checks what is live, so it needs no release of its own: it runs on any commit, tagged or not. The release it reports — and the one deployer-generated checks are built for — is read from the target (`live release:   v1.4.0 (read from the target)`); when the target records none, or services disagree, it is `HEAD`'s own, which is `untagged` on an untagged commit. It never creates or pushes a tag, and it exits `1` when a check fails.
 
 ## `deliver rollback`
 

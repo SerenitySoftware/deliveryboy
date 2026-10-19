@@ -16,6 +16,13 @@
 
 ### Fixed
 
+- `deliver verify` runs on an untagged commit. It resolved a release like
+  `deploy --yes`, so on a feature branch, after pulling untagged work, or after
+  a `--version` deploy with tagging off it said "tag the commit" and ran no
+  checks. It now reads the live release from the target and reports it, falling
+  back to `HEAD`'s own (`untagged`). It also no longer runs the post-success
+  tag step: on a tagged `HEAD` with `tag.push`, checking the live release used
+  to push the tag. Its summary says "verify complete", not "deploy complete".
 - A first release of a `files`/`hugo` or `docker-compose` service whose checks
   fail is now taken down instead of left live. The undo looked for a previous
   release, found none, and failed — "rollback FAILED … resolve by hand" — while

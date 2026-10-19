@@ -33,7 +33,8 @@ pub struct DeployVersion {
     /// tagged: an untagged commit has no release number, and inventing one
     /// (a sha, a counter) produces a "version" nothing else agrees with.
     pub release: Option<String>,
-    /// Where `release` came from: "tag" | "commit" | "commit-count".
+    /// Where `release` came from: "tag" | "commit" | "commit-count", "argument"
+    /// (`--version` or the prompt), or "live" (`verify`, read from the target).
     pub release_source: &'static str,
     pub git: GitInfo,
 }

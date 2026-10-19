@@ -793,6 +793,58 @@ fn resolve_release(
     )))
 }
 
+/// The release `deliver verify` checks: the one live on the target.
+///
+/// `verify` never ships, so a tag on HEAD is beside the point — it runs on a
+/// feature branch, after pulling an untagged commit, or after a deploy that
+/// used `--version` without tagging. `{version}` in its checks means what the
+/// target records as live; when the target records nothing (a deployer with no
+/// read-back) or services disagree, HEAD's own release stands, which is
+/// `untagged` on an untagged commit.
+fn live_release(
+    config: &config::Config,
+    only: &[String],
+    root: &Path,
+    v: version::DeployVersion,
+) -> Result<version::DeployVersion> {
+    let requests = readback::collect(&plan::build(config, only, root, &v)?);
+    let statuses = if requests.is_empty() {
+        Vec::new()
+    } else {
+        readback::read(requests, &config.targets)
+    };
+    let mut live: Vec<String> = statuses
+        .iter()
+        .filter_map(readback::Status::live_deploy)
+        .map(|d| d.release.clone())
+        .filter(|r| !r.is_empty() && r != "untagged")
+        .collect();
+    live.sort();
+    live.dedup();
+    match live.as_slice() {
+        [] => {
+            ui::detail(format!(
+                "live release:   none recorded on the target — checking as {}",
+                v.release_display()
+            ));
+            Ok(v)
+        }
+        [one] => {
+            ui::detail(format!("live release:   {one} (read from the target)"));
+            let release = one.clone();
+            Ok(v.with_release(release, "live"))
+        }
+        several => {
+            ui::detail(format!(
+                "live release:   services disagree ({}) — checking as {}",
+                several.join(", "),
+                v.release_display()
+            ));
+            Ok(v)
+        }
+    }
+}
+
 fn cmd_secrets(explicit: ConfigArgs<'_>, action: &Option<SecretsAction>) -> Result<i32> {
     ui::banner();
     let (config, _path) = load_announced(explicit)?;
@@ -1325,21 +1377,20 @@ fn cmd_deploy(
 
     let v = version_announced(&config, &root);
     let tag_cfg = config.versioning.as_ref().and_then(|r| r.tag.as_ref());
-    let Some(v) = resolve_release(
-        &root,
-        v,
-        tag_cfg,
-        assume_yes || verify_only,
-        version_arg,
-        dry_run,
-    )?
-    else {
-        // Without a prompt there is nobody to have declined: `--yes` and
-        // `verify` stopping here is a failed release guard, not a cancel, and
-        // a CI job must not go green having shipped or checked nothing.
-        if assume_yes || verify_only {
+    // `verify` ships nothing, so it needs no release of its own: it checks
+    // whatever is live, on any commit, tagged or not.
+    let resolved = if verify_only {
+        Some(live_release(&config, only, &root, v)?)
+    } else {
+        resolve_release(&root, v, tag_cfg, assume_yes, version_arg, dry_run)?
+    };
+    let Some(v) = resolved else {
+        // Without a prompt there is nobody to have declined: `--yes` stopping
+        // here is a failed release guard, not a cancel, and a CI job must not
+        // go green having shipped nothing.
+        if assume_yes {
             ui::phase("Aborted");
-            ui::note("nothing was built, shipped, checked, or changed.");
+            ui::note("nothing was built, shipped, or changed.");
             return Ok(2);
         }
         return Ok(0);
@@ -1446,9 +1497,11 @@ fn cmd_deploy(
     if outcome.ok {
         // Tag what shipped, if configured. Only after success, and never on a
         // dry run — a tag should mean "this is live".
-        let mut tag_ready = dry_run;
+        // `verify` shipped nothing, so it has nothing to tag — and the release
+        // it carries is whatever is live, which HEAD may not be.
+        let mut tag_ready = dry_run || verify_only;
         if let Some(tag_cfg) = config.versioning.as_ref().and_then(|r| r.tag.as_ref()) {
-            if tag_cfg.enabled && !dry_run {
+            if tag_cfg.enabled && !dry_run && !verify_only {
                 match version::tag_release(&root, &v, tag_cfg) {
                     Ok(tag) => {
                         let state = match (tag.created, tag.pushed) {
@@ -1508,10 +1561,10 @@ fn cmd_deploy(
         ui::phase("Done");
         ui::ok(format!(
             "{} in {}",
-            if dry_run {
-                "dry run complete"
-            } else {
-                "deploy complete"
+            match (verify_only, dry_run) {
+                (true, _) => "verify complete",
+                (_, true) => "dry run complete",
+                _ => "deploy complete",
             },
             timer.elapsed()
         ));
