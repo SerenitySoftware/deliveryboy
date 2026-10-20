@@ -202,6 +202,21 @@ fn default_port() -> u16 {
     22
 }
 
+/// A local path as `sh` must see it. A `method: local` target's steps run
+/// through `sh` with its `dir` spliced in, and `sh` reads each backslash in a
+/// Windows path (`C:\Users\…`) as an escape: `mkdir -p` and `cp` then
+/// succeed against a mangled relative path, and the deploy reports a release
+/// that never reached the target. Windows accepts forward slashes everywhere,
+/// so the path is written that way once, here, rather than quoted at every
+/// step that uses it.
+fn sh_path(path: &str, windows: bool) -> String {
+    if windows {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    }
+}
+
 /// `~` in a config path refers to the operator's home, not a literal directory.
 fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -243,6 +258,9 @@ impl Target {
                 "target '{name}': method must be 'ssh' or 'local' (got '{}')",
                 self.method
             );
+        }
+        if self.is_local() {
+            self.dir = sh_path(&self.dir, cfg!(windows));
         }
         Ok(())
     }
@@ -747,6 +765,26 @@ pub fn load(path: &Path) -> Result<Config> {
         }
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod sh_path_tests {
+    use super::sh_path;
+
+    #[test]
+    fn a_windows_path_reaches_sh_with_forward_slashes() {
+        assert_eq!(
+            sh_path(r"C:\Users\RUNNER~1\AppData\Local\Temp\dest", true),
+            "C:/Users/RUNNER~1/AppData/Local/Temp/dest"
+        );
+        assert_eq!(sh_path("C:/already/forward", true), "C:/already/forward");
+    }
+
+    #[test]
+    fn a_unix_path_is_left_exactly_as_written() {
+        // A backslash is a legal (if odd) character in a unix file name.
+        assert_eq!(sh_path(r"/srv/odd\name", false), r"/srv/odd\name");
+    }
 }
 
 #[cfg(test)]

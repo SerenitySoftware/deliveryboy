@@ -2872,6 +2872,26 @@ services:
     dir
 }
 
+/// A deploy that reports success put the file where the target says. On
+/// Windows the target `dir` is a `C:\…` path, and spliced into `sh` its
+/// backslashes were read as escapes: `mkdir -p` and `cp` succeeded against a
+/// mangled relative path inside the repo, and the deploy exited 0 with the
+/// target untouched. Not gated to unix — Windows is the case it is for.
+#[test]
+fn a_local_files_deploy_puts_the_file_in_the_target_dir() {
+    let dir = local_deploy_repo("local-lands");
+    git_init_tagged(&dir, "v1.0.0");
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "2.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dest").join("payload.txt")).ok(),
+        Some("hi\n".to_string()),
+        "the deploy succeeded but the file is not in the target dir:\n{text}"
+    );
+}
+
 #[test]
 fn untagged_head_offers_to_create_a_tag() {
     use std::io::Write;
