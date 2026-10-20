@@ -587,19 +587,26 @@ fn documentation_failure_retains_release_as_failed() {
         .borrow()
         .contains_key("accepted/sample/dev/r1.json"));
 }
+/// The fake tools are copied into place by `install`, not written by this
+/// process. Tests run on threads, and a thread that spawns a process forks
+/// while another may hold a just-written tool open for writing; the child
+/// carries that descriptor until its own exec, and running the tool in that
+/// window fails on Linux with `Text file busy` (ETXTBSY). A file written by a
+/// child process was never open in this one, so no fork here can hold it.
 #[cfg(unix)]
 fn fake_tools(root: &Path, scenario: &str) -> Runner {
-    use std::os::unix::fs::PermissionsExt;
     let bin = root.join("bin");
     fs::create_dir_all(&bin).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/azure_release_tool.py");
     for tool in ["az", "docker", "swa"] {
-        let path = bin.join(tool);
-        fs::write(
-            &path,
-            include_str!("../../tests/fixtures/azure_release_tool.py"),
-        )
-        .unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new("install")
+            .arg("-m")
+            .arg("0755")
+            .arg(&source)
+            .arg(bin.join(tool))
+            .status()
+            .unwrap();
+        assert!(status.success(), "install {tool}");
     }
     let mut runner = Runner::default();
     runner.env.insert(
