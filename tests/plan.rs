@@ -740,6 +740,24 @@ fn vhost_install_keeps_the_replaced_vhost_and_carries_an_undo() {
         undo.contains("/etc/nginx/sites-available/site.conf"),
         "{undo}"
     );
+    // Both sides of the shared-nginx window take the host-wide lock, not just
+    // this app's deploy lock.
+    let host_lock = "L='/var/lib/deliver/nginx.lock'";
+    assert!(take.starts_with(host_lock), "{take}");
+    assert!(undo.starts_with(host_lock), "{undo}");
+    let reload = plan[0]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["label"] == "verify: nginx -t, then reload")
+        .expect("no verify reload step");
+    assert!(
+        reload["kind"]["Ssh"]["command"]
+            .as_str()
+            .unwrap()
+            .starts_with(host_lock),
+        "{reload}"
+    );
 
     // A vhost-only config is no longer "nothing rollback-able".
     let out = run_in(&dir, &["rollback", "--dry-run"]);
@@ -817,6 +835,7 @@ services:
         let out = deliver()
             .current_dir(&dir)
             .env("DELIVER_NGINX_DIR", &etc)
+            .env("DELIVER_NGINX_LOCK", dir.join("nginx.lock"))
             .args(["plan", "--json"])
             .stdin(std::process::Stdio::null())
             .output()
@@ -878,6 +897,87 @@ services:
     fn calls(&self) -> String {
         std::fs::read_to_string(self.dir.join("calls.log")).unwrap_or_default()
     }
+
+    fn lock(&self) -> std::path::PathBuf {
+        self.dir.join("nginx.lock")
+    }
+
+    /// Hold the host nginx lock as another app's deploy would, stamped
+    /// `epoch` seconds.
+    fn hold_lock(&self, epoch: u64) {
+        std::fs::create_dir(self.lock()).unwrap();
+        std::fs::write(
+            self.lock().join("owner"),
+            format!("{epoch} /var/universal/other other.conf\n"),
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[cfg(unix)]
+#[test]
+fn vhost_install_waits_for_another_apps_nginx_window() {
+    let n = std::sync::Arc::new(ScratchNginx::new("nginx-host-lock-wait"));
+    n.ship("root /srv/v1;\n");
+    n.hold_lock(now_epoch());
+
+    let runner = std::sync::Arc::clone(&n);
+    let install = std::thread::spawn(move || runner.run(&runner.install));
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert!(
+        n.available().is_none(),
+        "installed while another app held the nginx lock"
+    );
+    assert!(n.calls().is_empty(), "{}", n.calls());
+
+    // The other app's reload is done: this one goes ahead.
+    std::fs::remove_file(n.lock().join("owner")).unwrap();
+    std::fs::remove_dir(n.lock()).unwrap();
+    let out = install.join().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stderr.contains("waiting for the nginx host lock (")
+            && stderr.contains("/var/universal/other other.conf"),
+        "{stderr}"
+    );
+    assert_eq!(n.available().as_deref(), Some("root /srv/v1;\n"));
+    assert!(!n.lock().exists(), "the install kept the nginx lock");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_nginx_host_lock_is_given_back_on_failure_and_a_stale_one_is_broken() {
+    let n = ScratchNginx::new("nginx-host-lock-stale");
+    n.ship("root /srv/v1;\n");
+
+    // A failed `nginx -t` exits 1 — and still releases the lock.
+    std::fs::write(n.dir.join("fail-nginx"), "").unwrap();
+    assert!(!n.run(&n.install).status.success());
+    assert!(!n.lock().exists(), "a failed install kept the nginx lock");
+    std::fs::remove_file(n.dir.join("fail-nginx")).unwrap();
+
+    // A holder that died an hour ago does not block the next app.
+    n.hold_lock(now_epoch() - 3600);
+    let out = n.run(&n.install);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("breaking stale nginx host lock"));
+    assert!(!n.lock().exists());
+
+    // The undo serializes the same way.
+    n.hold_lock(now_epoch() - 3600);
+    let out = n.run(&n.undo);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("breaking stale nginx host lock"));
+    assert!(!n.lock().exists());
 }
 
 #[cfg(unix)]

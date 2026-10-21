@@ -57,6 +57,7 @@
 //! ```
 
 use super::{cfg_bool, cfg_str, PlanContext, PlannedStep};
+use crate::remote::shell_quote;
 use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
 use std::path::Path;
@@ -537,7 +538,7 @@ fn certbot_ensure_step(cert: &CertNeed, cfg: &Value, ctx: &PlanContext) -> Plann
             "certbot: ensure {cert_name} covers [{}]",
             cert.domains.join(", ")
         ),
-        script,
+        with_nginx_lock(&script, sudo, &format!("{} {acme_site}", ctx.target.dir)),
     )
     .issues_cert_for(&cert.domains)
 }
@@ -546,6 +547,59 @@ fn certbot_ensure_step(cert: &CertNeed, cfg: &Value, ctx: &PlanContext) -> Plann
 /// elsewhere, so the install and undo scripts can run against a scratch tree.
 fn nginx_dir() -> String {
     std::env::var("DELIVER_NGINX_DIR").unwrap_or_else(|_| "/etc/nginx".into())
+}
+
+/// The host-scoped lock every step that writes, tests or reloads the shared
+/// nginx takes. The deploy lock (`lock.rs`) is per app — `<target.dir>.deliver-lock`
+/// — so two apps on one box hold two different locks and could still
+/// interleave their `sites-available` writes, `nginx -t` and reload, and one
+/// app's failed `nginx -t` would roll back while the other's edit sat in the
+/// file being tested. Only the tests point it elsewhere.
+fn nginx_lock() -> String {
+    std::env::var("DELIVER_NGINX_LOCK").unwrap_or_else(|_| "/var/lib/deliver/nginx.lock".into())
+}
+
+/// How long a step waits for another app's nginx window before failing, and
+/// the age at which a holder that never gave the lock back (a dropped ssh, a
+/// killed shell) is treated as gone. The window is one install, test and reload
+/// — or a certbot issuance — so both are minutes, not the hour a whole release
+/// gets.
+const NGINX_LOCK_WAIT_SECS: u64 = 180;
+const NGINX_LOCK_STALE_SECS: u64 = 600;
+
+/// Prefix `script` with taking the host nginx lock and release it when the
+/// shell exits, on success, on `exit 1` and on a hangup alike. `holder` is
+/// written into the lock so a waiting run can say whose window it is in.
+///
+/// Like the deploy lock, it holds back only on positive evidence: a lock
+/// directory that cannot be created at all (no such parent, no permission) is
+/// not another app's deploy, so the step says so and runs unserialized.
+fn with_nginx_lock(script: &str, sudo: &str, holder: &str) -> String {
+    let lock = shell_quote(&nginx_lock());
+    let holder = shell_quote(holder);
+    format!(
+        "L={lock}; {sudo}mkdir -p \"$(dirname \"$L\")\" 2>/dev/null || true; W=0; GOT=0; \
+         while :; do \
+           if {sudo}mkdir \"$L\" 2>/dev/null; then GOT=1; break; fi; \
+           if ! {sudo}test -d \"$L\"; then echo \"nginx host lock unavailable at $L — continuing unserialized\" >&2; break; fi; \
+           HELD=$({sudo}cat \"$L/owner\" 2>/dev/null || true); AT=${{HELD%% *}}; \
+           case \"$AT\" in ''|*[!0-9]*) AT=;; esac; \
+           if [ -n \"$AT\" ] && [ $(( $(date -u +%s) - AT )) -gt {NGINX_LOCK_STALE_SECS} ]; then \
+             echo \"breaking stale nginx host lock ($HELD)\" >&2; \
+             {sudo}rm -f \"$L/owner\"; {sudo}rmdir \"$L\" 2>/dev/null || true; continue; \
+           fi; \
+           if [ $W -ge {NGINX_LOCK_WAIT_SECS} ]; then \
+             echo \"nginx host lock still held after {NGINX_LOCK_WAIT_SECS}s (${{HELD:-unknown holder}}) — remove $L if no deploy is running\" >&2; exit 1; \
+           fi; \
+           [ $W -gt 0 ] || echo \"waiting for the nginx host lock (${{HELD:-unknown holder}})\" >&2; \
+           W=$((W + 1)); sleep 1; \
+         done; \
+         if [ $GOT = 1 ]; then \
+           trap '{sudo}rm -f \"$L/owner\"; {sudo}rmdir \"$L\" 2>/dev/null || true' EXIT; trap 'exit 130' HUP INT TERM; \
+           printf '%s %s\\n' \"$(date -u +%s)\" {holder} | {sudo}tee \"$L/owner\" >/dev/null || true; \
+         fi; \
+         {script}"
+    )
 }
 
 /// `content` is what will land at `sites-available/<site>`: the rendered text
@@ -596,11 +650,12 @@ fn install_step(spec: &VhostSpec, ctx: &PlanContext, content: Option<&str>) -> P
          {sudo}nginx -t; {sudo}systemctl reload nginx; \
          echo \"restored previous vhost {site}\""
     );
+    let holder = format!("{root} {site}");
     let step = PlannedStep::ssh(
         format!("install vhost {site} (validate + rollback on failure)"),
-        script,
+        with_nginx_lock(&script, sudo, &holder),
     )
-    .with_rollback(undo)
+    .with_rollback(with_nginx_lock(&undo, sudo, &holder))
     .needs_remote(&["nginx", "systemctl"]);
     match content {
         Some(text) => step.with_live_config(&available, text),
@@ -802,7 +857,11 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         steps.push(
             PlannedStep::ssh(
                 "verify: nginx -t, then reload".to_string(),
-                format!("set -e; {sudo}nginx -t; {sudo}systemctl reload nginx; echo 'nginx config valid and reloaded'"),
+                with_nginx_lock(
+                    &format!("set -e; {sudo}nginx -t; {sudo}systemctl reload nginx; echo 'nginx config valid and reloaded'"),
+                    sudo,
+                    &format!("{root} verify"),
+                ),
             )
             .needs_remote(&["nginx", "systemctl"]),
         );

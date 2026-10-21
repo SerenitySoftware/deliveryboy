@@ -16,6 +16,15 @@
 
 ### Fixed
 
+- Two apps deploying `nginx-vhost` services to one host no longer interleave
+  on the shared nginx. The deploy lock is per app, so their `sites-available`
+  writes, `nginx -t` and reloads could race, and one app's failed `nginx -t`
+  rolled back while the other's edit was in the file being tested. The vhost
+  install, its undo, the certbot bootstrap and the closing reload now hold a
+  host-wide lock at `/var/lib/deliver/nginx.lock` for that step only: a second
+  app waits (up to three minutes, saying whose window it is in), a holder older
+  than ten minutes is broken as stale, and a host where the lock cannot be
+  created runs the step unserialized with a warning.
 - A deploy lock that could not be created is no longer reported as "a deploy
   is already running" by "an unidentified run". On a target without `sudo`, or
   where `sudo` wants a password, the failed `mkdir` used to read as
