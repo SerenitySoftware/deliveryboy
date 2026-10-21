@@ -16,6 +16,11 @@
 
 ### Fixed
 
+- `verify:` checks `contains:` and `remote_file:` pass their text and path to
+  the shell verbatim. Both were spliced into hand-written single quotes, so a
+  `text:` with an apostrophe (`it's live`) broke the quoting and failed a good
+  release — which the deploy then unwound — and a `text:` starting with `-`
+  was read as a `grep` flag.
 - Two apps deploying `nginx-vhost` services to one host no longer interleave
   on the shared nginx. The deploy lock is per app, so their `sites-available`
   writes, `nginx -t` and reloads could race, and one app's failed `nginx -t`

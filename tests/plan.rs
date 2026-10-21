@@ -3246,6 +3246,45 @@ fn verify_with_nothing_recorded_runs_its_checks_as_untagged() {
     assert_eq!(tags_on_head(&dir), "", "{text}");
 }
 
+/// `contains:` and `remote_file:` hand their text and path to the shell as
+/// they are written. Spliced into single quotes by hand, an apostrophe ended
+/// the quoting: a good release whose page says "it's live" failed its check
+/// and was unwound, and text starting with `-` was read as a grep flag.
+#[cfg(unix)]
+#[test]
+fn verify_checks_take_quotes_and_dashes_in_their_text_literally() {
+    let dir = verify_repo("verify-quoting");
+    std::fs::write(
+        dir.join("dest/it's here.txt"),
+        "status: it's live\n--ready\n",
+    )
+    .unwrap();
+    let config = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        config.replace(
+            "verify: [{remote_command: \"true\"}]",
+            "verify:\n      - remote_file: \"it's here.txt\"\n      - contains: {remote_file: \"it's here.txt\", text: \"it's live\"}\n      - contains: {remote_file: \"it's here.txt\", text: \"--ready\"}",
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+
+    let out = run_in(&dir, &["verify"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+
+    // And a text that is not there still fails.
+    let config = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        config.replace("text: \"it's live\"", "text: \"it's down\""),
+    )
+    .unwrap();
+    let out = run_in(&dir, &["verify"]);
+    assert_eq!(out.status.code(), Some(1), "{}", output_text(&out));
+}
+
 /// A failing check still fails `verify` on an untagged commit — running the
 /// checks is the point, not reporting success.
 #[test]

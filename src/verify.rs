@@ -1,6 +1,7 @@
 //! Verification checks compiled to steps. A failed check fails the deploy.
 
 use crate::deployers::{PlanContext, PlannedStep, StepKind};
+use crate::remote::shell_quote;
 use anyhow::{bail, Result};
 use serde_yaml::Value;
 
@@ -40,7 +41,7 @@ pub fn compile(check: &Value, ctx: &PlanContext) -> Result<PlannedStep> {
         let dest = format!("{}/{}", ctx.target.dir.trim_end_matches('/'), file);
         return Ok(PlannedStep::ssh(
             format!("verify file {file}"),
-            format!("test -s '{dest}'"),
+            format!("test -s {}", shell_quote(&dest)),
         ));
     }
     if let Some(c) = check.get("contains") {
@@ -55,7 +56,8 @@ pub fn compile(check: &Value, ctx: &PlanContext) -> Result<PlannedStep> {
         let dest = format!("{}/{}", ctx.target.dir.trim_end_matches('/'), file);
         return Ok(PlannedStep::ssh(
             format!("verify {file} contains {text:?}"),
-            format!("grep -qF '{text}' '{dest}'"),
+            // `-e`, so text that starts with `-` is the pattern and not a flag.
+            format!("grep -qF -e {} {}", shell_quote(text), shell_quote(&dest)),
         ));
     }
     bail!("unknown verify check: {check:?}")
