@@ -245,7 +245,11 @@ versioning:
     - command: ./scripts/publish-release.sh {version} {work}
 ```
 
-Tags are created only after the release and its checks succeed.
+Tags are created only after the release and its checks succeed. The number is
+checked before anything ships: a `--version` or prompted number whose tag
+already sits on another commit — in this clone, or on the remote when
+`tag.push` is set — is refused up front, and the version prompt skips a taken
+number and offers the next free one, saying why.
 `after_tag` commands run only after the tag exists and a configured tag push
 succeeds. They can publish artifacts that earlier steps placed in `{work}`.
 They run only for a full deploy, not one selected with `--service`. Make these

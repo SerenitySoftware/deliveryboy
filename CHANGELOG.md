@@ -16,6 +16,18 @@
 
 ### Fixed
 
+- `deliver deploy` refuses a release number whose tag already names another
+  commit before anything ships, and the version prompt skips a taken number
+  and offers the next free one (`patch v1.0.2 (v1.0.1 is already on
+  d67382e)`). Deploying a commit older than the newest tag — a bisect, a
+  redeploy of last week's commit, a hotfix branch — was offered exactly the
+  number that was taken, shipped under it, and only then said "not tagged",
+  so the target recorded a version git maps to a different commit; with
+  `tag.push`, a tag a colleague had pushed to origin was invisible until a
+  fetch, and the deploy ended with a rejected push. The name checked is the
+  one `tag.name` renders; with `tag.push` the remote is asked once, and a
+  remote that does not answer is a warning. `deliver plan --version` reports
+  the same finding as a warning.
 - `verify:` checks `contains:` and `remote_file:` pass their text and path to
   the shell verbatim. Both were spliced into hand-written single quotes, so a
   `text:` with an apostrophe (`it's live`) broke the quoting and failed a good

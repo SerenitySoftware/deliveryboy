@@ -228,16 +228,10 @@ pub fn tag_release(
             "working tree is dirty — refusing to tag a commit that isn't what shipped".into(),
         );
     }
-    let name = cfg
-        .name
-        .clone()
-        .unwrap_or_else(|| "{release}".to_string())
-        .replace("{version}", &version.marketing_version())
-        .replace("{release}", &version.release_display())
-        .replace("{deploy}", &version.id)
-        .replace("{sha}", &version.git.short_sha);
+    let name = tag_name(version, Some(cfg));
 
-    // Already tagged?
+    // Already tagged? Checked up front by `check_tag`, before anything ships;
+    // this is the last line, for a tag created while the release was running.
     if let Some(existing) = git(root, &["rev-list", "-n", "1", &name]) {
         if existing != version.git.sha {
             return Err(format!(
@@ -327,6 +321,190 @@ pub fn tag_release(
     })
 }
 
+/// The tag a release gets, rendered exactly as `tag_release` renders it:
+/// the `tag.name` template (default `{release}`) over this release.
+pub fn tag_name(version: &DeployVersion, cfg: Option<&crate::config::TagConfig>) -> String {
+    cfg.and_then(|c| c.name.clone())
+        .unwrap_or_else(|| "{release}".to_string())
+        .replace("{version}", &version.marketing_version())
+        .replace("{release}", &version.release_display())
+        .replace("{deploy}", &version.id)
+        .replace("{sha}", &version.git.short_sha)
+}
+
+/// The commit a local tag points at, if the tag exists.
+pub fn tag_commit(root: &Path, name: &str) -> Option<String> {
+    git(root, &["rev-list", "-n", "1", &format!("refs/tags/{name}")])
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..7.min(sha.len())]
+}
+
+/// Where a tag of this name already sits, when that is not HEAD.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TagClash {
+    /// In this clone, on another commit.
+    Local { commit: String },
+    /// On the configured remote, on another commit, and not fetched.
+    Remote { remote: String, commit: String },
+}
+
+impl TagClash {
+    /// Why the release number cannot be used, and what to do instead.
+    pub fn refusal(&self, name: &str) -> String {
+        match self {
+            TagClash::Local { commit } => {
+                format!(
+                    "tag {name} already exists on {} — pick another version",
+                    short(commit)
+                )
+            }
+            TagClash::Remote { remote, commit } => format!(
+                "tag {name} already exists on {remote} ({}) — run git fetch --tags and pick \
+                 another version",
+                short(commit)
+            ),
+        }
+    }
+}
+
+/// What asking git about a release's tag found.
+#[derive(Debug, Default)]
+pub struct TagCheck {
+    pub clash: Option<TagClash>,
+    /// The remote could not be asked; the run goes on without that answer.
+    pub warning: Option<String>,
+}
+
+/// Ask, before anything ships, whether `name` is free to tag `head` with. A
+/// tag already on `head` is fine (`tag_release` reports it rather than
+/// recreating it). When `tag.push` is set the remote is asked once as well,
+/// since a tag a colleague pushed is invisible here until a fetch; a remote
+/// that does not answer is a warning, not a refusal.
+pub fn check_tag(
+    root: &Path,
+    name: &str,
+    head: &str,
+    cfg: Option<&crate::config::TagConfig>,
+) -> TagCheck {
+    if let Some(commit) = tag_commit(root, name) {
+        if commit != head {
+            return TagCheck {
+                clash: Some(TagClash::Local { commit }),
+                warning: None,
+            };
+        }
+    }
+    let Some(cfg) = cfg.filter(|c| c.push) else {
+        return TagCheck::default();
+    };
+    let remote = cfg.remote.clone().unwrap_or_else(|| "origin".into());
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-remote", "--tags", &remote])
+        // Both spellings: the tag itself, and the commit an annotated tag
+        // names (`^{}`), which a pattern on the bare name does not match.
+        .arg(format!("refs/tags/{name}"))
+        .arg(format!("refs/tags/{name}^{{}}"))
+        .output();
+    let out = match out {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            let why = String::from_utf8_lossy(&out.stderr);
+            return TagCheck {
+                clash: None,
+                warning: Some(format!(
+                    "could not ask {remote} whether tag {name} exists: {}",
+                    why.lines().next().unwrap_or("git ls-remote failed").trim()
+                )),
+            };
+        }
+        Err(e) => {
+            return TagCheck {
+                clash: None,
+                warning: Some(format!(
+                    "could not ask {remote} whether tag {name} exists: {e}"
+                )),
+            }
+        }
+    };
+    // An annotated tag lists twice: the tag object, then the commit it names
+    // (`refs/tags/<name>^{}`). The commit is what a release is.
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let mut tag_object = None;
+    let mut peeled = None;
+    for line in listing.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(sha), Some(r)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if r == format!("refs/tags/{name}^{{}}") {
+            peeled = Some(sha.to_string());
+        } else if r == format!("refs/tags/{name}") {
+            tag_object = Some(sha.to_string());
+        }
+    }
+    match peeled.or(tag_object) {
+        Some(commit) if commit != head => TagCheck {
+            clash: Some(TagClash::Remote { remote, commit }),
+            warning: None,
+        },
+        _ => TagCheck::default(),
+    }
+}
+
+/// One version the prompt offers: the bump kind, the bare number, and — when
+/// the first candidate of that kind was taken — why this is the one offered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Offer {
+    pub kind: &'static str,
+    pub version: String,
+    pub note: Option<String>,
+}
+
+/// Patch, minor and major bumps off `previous`, each advanced past any number
+/// whose tag already exists. `taken` answers for a bare version with the tag
+/// name and the commit it is on.
+pub fn offer_bumps(
+    previous: &SemVer,
+    taken: &dyn Fn(&str) -> Option<(String, String)>,
+) -> Vec<Offer> {
+    [
+        ("patch", Bump::Patch),
+        ("minor", Bump::Minor),
+        ("major", Bump::Major),
+    ]
+    .into_iter()
+    .map(|(kind, bump)| {
+        let mut candidate = previous.bump(bump);
+        let mut skipped: Vec<(String, String)> = Vec::new();
+        // Bounded: a project with a hundred consecutive taken numbers of one
+        // kind gets the custom option, not a hang.
+        while skipped.len() < 100 {
+            let Some(hit) = taken(&candidate) else { break };
+            skipped.push(hit);
+            // The next number of the same kind.
+            candidate = match SemVer::parse(&format!("{}{candidate}", previous.prefix)) {
+                Some(next) => next.bump(bump),
+                None => break,
+            };
+        }
+        let note = match skipped.as_slice() {
+            [] => None,
+            [(name, commit)] => Some(format!("{name} is already on {}", short(commit))),
+            [(first, _), .., (last, _)] => Some(format!("{first} … {last} are already tagged")),
+        };
+        Offer {
+            kind,
+            version: candidate,
+            note,
+        }
+    })
+    .collect()
+}
+
 /// The most recent tag reachable from HEAD (the previous release), if any.
 pub fn previous_tag(root: &Path) -> Option<String> {
     git(root, &["describe", "--tags", "--abbrev=0"])
@@ -411,5 +589,161 @@ mod version_choice_tests {
     #[test]
     fn rejects_non_versions() {
         assert!(SemVer::parse("nightly").is_none());
+    }
+}
+
+#[cfg(test)]
+mod tag_check_tests {
+    use super::{check_tag, offer_bumps, tag_commit, tag_name, SemVer, TagClash};
+    use crate::config::TagConfig;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Two commits: the first tagged `v1.0.0`; HEAD on the second, untagged.
+    fn repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("deliver-tagcheck-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "T"]);
+        std::fs::write(dir.join("a"), "a").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "one"]);
+        git(&dir, &["tag", "v1.0.0"]);
+        std::fs::write(dir.join("b"), "b").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "two"]);
+        dir
+    }
+
+    fn head(dir: &Path) -> String {
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn a_tag_on_another_commit_is_a_local_clash_and_one_on_head_is_not() {
+        let dir = repo("local");
+        let first = git(&dir, &["rev-parse", "HEAD~1"]);
+        let check = check_tag(&dir, "v1.0.0", &head(&dir), None);
+        assert_eq!(check.clash, Some(TagClash::Local { commit: first }));
+        assert!(check.warning.is_none());
+        git(&dir, &["tag", "v1.0.1"]);
+        let check = check_tag(&dir, "v1.0.1", &head(&dir), None);
+        assert_eq!(check.clash, None);
+        let check = check_tag(&dir, "v9.9.9", &head(&dir), None);
+        assert_eq!(check.clash, None);
+        assert_eq!(tag_commit(&dir, "v9.9.9"), None);
+    }
+
+    #[test]
+    fn a_tag_held_only_by_origin_is_a_remote_clash_when_pushing() {
+        let dir = repo("remote");
+        let origin = std::env::temp_dir().join("deliver-tagcheck-remote-origin");
+        let _ = std::fs::remove_dir_all(&origin);
+        git(&dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+        git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "origin", "HEAD"]);
+        let first = git(&dir, &["rev-parse", "HEAD~1"]);
+        // An annotated tag, so ls-remote lists the tag object and the peeled commit.
+        git(&dir, &["tag", "-a", "v1.0.1", "-m", "v1.0.1", &first]);
+        git(&dir, &["push", "-q", "origin", "v1.0.1"]);
+        git(&dir, &["tag", "-d", "v1.0.1"]);
+
+        let push = TagConfig {
+            enabled: true,
+            push: true,
+            ..TagConfig::default()
+        };
+        let check = check_tag(&dir, "v1.0.1", &head(&dir), Some(&push));
+        assert_eq!(
+            check.clash,
+            Some(TagClash::Remote {
+                remote: "origin".into(),
+                commit: first.clone()
+            })
+        );
+        assert!(check.clash.unwrap().refusal("v1.0.1").starts_with(&format!(
+            "tag v1.0.1 already exists on origin ({})",
+            &first[..7]
+        )));
+
+        // Without `push`, origin is not asked.
+        let local_only = TagConfig {
+            enabled: true,
+            ..TagConfig::default()
+        };
+        assert_eq!(
+            check_tag(&dir, "v1.0.1", &head(&dir), Some(&local_only)).clash,
+            None
+        );
+
+        // A remote that does not answer is a warning, and the run goes on.
+        let elsewhere = TagConfig {
+            enabled: true,
+            push: true,
+            remote: Some("nowhere".into()),
+            ..TagConfig::default()
+        };
+        let check = check_tag(&dir, "v1.0.1", &head(&dir), Some(&elsewhere));
+        assert_eq!(check.clash, None);
+        assert!(check.warning.unwrap().contains("could not ask nowhere"));
+    }
+
+    #[test]
+    fn the_name_checked_is_the_templated_one() {
+        let dir = repo("template");
+        let v = super::DeployVersion {
+            id: "20260101T000000Z-abc1234".into(),
+            release: Some("v1.0.1".into()),
+            release_source: "argument",
+            git: super::git_info(&dir),
+        };
+        let cfg = TagConfig {
+            enabled: true,
+            name: Some("release-{version}".into()),
+            ..TagConfig::default()
+        };
+        assert_eq!(tag_name(&v, Some(&cfg)), "release-1.0.1");
+        assert_eq!(tag_name(&v, None), "v1.0.1");
+    }
+
+    #[test]
+    fn offers_skip_taken_numbers_and_say_why() {
+        let previous = SemVer::parse("v1.0.0").unwrap();
+        let taken = |bare: &str| match bare {
+            "1.0.1" => Some(("v1.0.1".to_string(), "d67382e0000".to_string())),
+            "1.1.0" => Some(("v1.1.0".to_string(), "aaaaaaa0000".to_string())),
+            "1.2.0" => Some(("v1.2.0".to_string(), "bbbbbbb0000".to_string())),
+            _ => None,
+        };
+        let offers = offer_bumps(&previous, &taken);
+        assert_eq!(offers[0].version, "1.0.2");
+        assert_eq!(
+            offers[0].note.as_deref(),
+            Some("v1.0.1 is already on d67382e")
+        );
+        assert_eq!(offers[1].version, "1.3.0");
+        assert_eq!(
+            offers[1].note.as_deref(),
+            Some("v1.1.0 … v1.2.0 are already tagged")
+        );
+        assert_eq!(offers[2].version, "2.0.0");
+        assert_eq!(offers[2].note, None);
     }
 }

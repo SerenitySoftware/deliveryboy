@@ -7020,7 +7020,8 @@ fn an_unwound_compose_deploy_is_followed_by_a_rollback_row_for_the_release_it_re
     )
     .unwrap();
     commit_all(&dir, "verify");
-    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    // `v1.0.0` is on the fixture's first commit, so it is not free for HEAD.
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
     assert!(ok, "{text}");
 
     change_release(&dir);
@@ -7084,7 +7085,8 @@ fn a_first_compose_release_that_fails_verify_is_brought_down_and_recorded() {
     .unwrap();
     commit_all(&dir, "verify");
     std::fs::write(&fail, "").unwrap();
-    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    // `v1.0.0` is on the fixture's first commit, so it is not free for HEAD.
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
     assert!(!ok, "verify was meant to fail:\n{text}");
     assert!(
         text.contains("first release: nothing was running"),
@@ -10097,4 +10099,204 @@ services:
         "{text}"
     );
     assert!(text.contains("sudo: false"), "{text}");
+}
+
+// --- a release number whose tag already exists ------------------------------
+
+/// A local-target repo with three commits: the first tagged `v1.0.0`, the
+/// third tagged `v1.0.1`, and HEAD detached on the untagged second — the
+/// shape of a redeploy of an older commit, where the "next" patch is taken.
+fn repo_between_releases(name: &str) -> std::path::PathBuf {
+    let dir = local_deploy_repo(name);
+    git_init_tagged(&dir, "v1.0.0");
+    for (file, tag) in [("two.txt", None), ("three.txt", Some("v1.0.1"))] {
+        std::fs::write(dir.join(file), "x\n").unwrap();
+        let mut args = vec![vec!["add", "-A"], vec!["commit", "-qm", file]];
+        if let Some(tag) = tag {
+            args.push(vec!["tag", tag]);
+        }
+        for a in args {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&a)
+                .output()
+                .unwrap();
+        }
+    }
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["checkout", "-q", "--detach", "HEAD~1"])
+        .output()
+        .unwrap();
+    dir
+}
+
+fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `--version` naming a tag that sits on another commit is refused before
+/// preflight: nothing is shipped, and the exit code is the config-error one.
+#[test]
+fn version_of_a_taken_tag_is_refused_before_anything_ships() {
+    let dir = repo_between_releases("tag-taken-version");
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.1"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    let taken = git_stdout(&dir, &["rev-list", "-n", "1", "v1.0.1"]);
+    assert!(
+        text.contains(&format!(
+            "tag v1.0.1 already exists on {} — pick another version",
+            &taken[..7]
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("nothing was built, shipped, or changed."),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Preflight"),
+        "refused before preflight: {text}"
+    );
+    assert!(
+        !dir.join("dest").join("payload.txt").exists(),
+        "nothing should have shipped:\n{text}"
+    );
+}
+
+/// The prompt skips a bump whose tag is taken and offers the next free one,
+/// saying why on the option line.
+#[test]
+fn version_prompt_skips_a_taken_bump_and_says_why() {
+    let dir = repo_between_releases("tag-taken-prompt");
+    let out = run_in(&dir, &["deploy"]); // stdin is /dev/null: cancels after the offer
+    let text = output_text(&out);
+    let taken = git_stdout(&dir, &["rev-list", "-n", "1", "v1.0.1"]);
+    assert!(
+        text.contains(&format!(
+            "patch         v1.0.2 (v1.0.1 is already on {})",
+            &taken[..7]
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("patch         v1.0.1"), "{text}");
+    assert!(text.contains("minor         v1.1.0"), "{text}");
+}
+
+/// `deliver plan --version` is a preview, so the same finding is a warning.
+#[test]
+fn plan_with_a_taken_version_warns_and_still_plans() {
+    let dir = repo_between_releases("tag-taken-plan");
+    let out = run_in(&dir, &["plan", "--version", "1.0.1"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("tag v1.0.1 already exists on"), "{text}");
+    assert!(text.contains("Plan (nothing is executed)"), "{text}");
+}
+
+/// With `tag.push`, a tag a colleague pushed to origin that this clone never
+/// fetched is refused too — the push would be rejected after the release.
+#[test]
+fn version_of_a_tag_held_only_by_origin_is_refused_when_pushing() {
+    let dir = local_deploy_repo("tag-taken-remote");
+    git_init_tagged(&dir, "v1.0.0");
+    let first = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    std::fs::write(dir.join("two.txt"), "x\n").unwrap();
+    let origin = tmpdir("tag-taken-remote-origin");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("tag: {enabled: true}", "tag: {enabled: true, push: true}");
+    std::fs::write(&cfg, body).unwrap();
+    for args in [
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "two"],
+        vec!["init", "-q", "--bare", origin.to_str().unwrap()],
+        vec!["remote", "add", "origin", origin.to_str().unwrap()],
+        vec!["push", "-q", "origin", "HEAD"],
+        vec!["tag", "v1.0.1", first.as_str()],
+        vec!["push", "-q", "origin", "v1.0.1"],
+        vec!["tag", "-d", "v1.0.1"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(
+        !tag_exists(&dir, "v1.0.1"),
+        "the tag must exist only on origin"
+    );
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.1"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(&format!(
+            "tag v1.0.1 already exists on origin ({}) — run git fetch --tags and pick another version",
+            &first[..7]
+        )),
+        "{text}"
+    );
+    assert!(!dir.join("dest").join("payload.txt").exists(), "{text}");
+    assert!(
+        !tag_exists(&dir, "v1.0.1"),
+        "the refusal must not create a tag"
+    );
+}
+
+/// The name checked is the one `tag.name` renders, not the bare release.
+#[test]
+fn the_tag_checked_is_the_templated_name() {
+    let dir = local_deploy_repo("tag-taken-template");
+    git_init_tagged(&dir, "v1.0.0");
+    let first = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    std::fs::write(dir.join("two.txt"), "x\n").unwrap();
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "tag: {enabled: true}",
+        "tag: {enabled: true, name: 'release-{version}'}",
+    );
+    std::fs::write(&cfg, body).unwrap();
+    for args in [
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "two"],
+        vec!["tag", "release-1.0.1", first.as_str()],
+    ] {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(&args)
+            .output()
+            .unwrap();
+    }
+
+    // `v1.0.1` is free; `release-1.0.1` is what this project would tag.
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.1"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(&format!(
+            "tag release-1.0.1 already exists on {} — pick another version",
+            &first[..7]
+        )),
+        "{text}"
+    );
+    assert!(!dir.join("dest").join("payload.txt").exists(), "{text}");
 }

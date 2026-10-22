@@ -661,9 +661,14 @@ fn prompt_line(question: &str) -> Result<Option<String>> {
 }
 
 /// Offer the next version, based on the previous release. Returns the bare
-/// version (no prefix) to tag, or None to cancel.
-fn choose_version(previous: Option<&str>) -> Result<Option<String>> {
-    use version::{Bump, SemVer};
+/// version (no prefix) to tag, or None to cancel. `taken` says whether a bare
+/// version's tag already exists (its name and commit), so a number another
+/// commit already carries is skipped rather than offered.
+fn choose_version(
+    previous: Option<&str>,
+    taken: &dyn Fn(&str) -> Option<(String, String)>,
+) -> Result<Option<String>> {
+    use version::SemVer;
 
     let parsed = previous.and_then(SemVer::parse);
     match (&parsed, previous) {
@@ -674,23 +679,34 @@ fn choose_version(previous: Option<&str>) -> Result<Option<String>> {
         _ => ui::detail("HEAD has no tag, and there are no previous releases."),
     }
 
-    // Offer patch/minor/major off the previous release; otherwise a sane first cut.
-    let options: Vec<(&str, String)> = match &parsed {
-        Some(v) => vec![
-            ("patch", v.bump(Bump::Patch)),
-            ("minor", v.bump(Bump::Minor)),
-            ("major", v.bump(Bump::Major)),
-        ],
-        None => vec![("first release", "0.1.0".to_string())],
+    // Offer patch/minor/major off the previous release, each past any number
+    // whose tag is already taken; otherwise a sane first cut.
+    let options: Vec<version::Offer> = match &parsed {
+        Some(v) => version::offer_bumps(v, taken),
+        None => vec![version::Offer {
+            kind: "first release",
+            version: "0.1.0".to_string(),
+            note: None,
+        }],
     };
 
     println!();
-    for (i, (kind, next)) in options.iter().enumerate() {
+    for (i, offer) in options.iter().enumerate() {
         let prefix = parsed
             .as_ref()
             .map(|p| p.prefix.clone())
             .unwrap_or_else(|| "v".into());
-        println!("  {}) {kind:<13} {prefix}{next}", i + 1);
+        let why = offer
+            .note
+            .as_ref()
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        println!(
+            "  {}) {:<13} {prefix}{}{why}",
+            i + 1,
+            offer.kind,
+            offer.version
+        );
     }
     println!("  {}) custom", options.len() + 1);
     println!("  (blank to cancel)");
@@ -714,7 +730,48 @@ fn choose_version(previous: Option<&str>) -> Result<Option<String>> {
             .filter(|s| !s.is_empty())
             .map(|s| s.trim_start_matches('v').to_string()));
     }
-    Ok(Some(options[choice - 1].1.clone()))
+    Ok(Some(options[choice - 1].version.clone()))
+}
+
+/// What `resolve_release` decided.
+enum Resolved {
+    /// Deploy this release.
+    Release(version::DeployVersion),
+    /// A person declined, or nobody was there to choose: not an error.
+    Cancelled,
+    /// A release guard refused the number: nothing ran, and the exit is 2.
+    Refused,
+}
+
+/// The release a `--version` or a chosen number names, with the repo's tag
+/// prefix (`v`) put back the way `previous_tag` shows it.
+fn release_named(root: &Path, v: version::DeployVersion, wanted: &str) -> version::DeployVersion {
+    let prefix = version::previous_tag(root)
+        .as_deref()
+        .and_then(version::SemVer::parse)
+        .map(|parsed| parsed.prefix)
+        .unwrap_or_else(|| "v".to_string());
+    v.with_release(
+        format!("{prefix}{}", wanted.trim_start_matches('v')),
+        "argument",
+    )
+}
+
+/// Say when the tag this release would get already names another commit. A
+/// preview (`plan`, `--dry-run`) only warns; a deploy refuses (see
+/// `resolve_release`).
+fn warn_if_tag_taken(root: &Path, v: &version::DeployVersion, tag_cfg: Option<&config::TagConfig>) {
+    let name = version::tag_name(v, tag_cfg);
+    let check = version::check_tag(root, &name, &v.git.sha, tag_cfg);
+    if let Some(warning) = check.warning {
+        ui::warn(warning);
+    }
+    if let Some(clash) = check.clash {
+        ui::warn(format!(
+            "{} — a deploy with this number would be refused",
+            clash.refusal(&name)
+        ));
+    }
 }
 
 /// Resolve which release is being deployed.
@@ -729,68 +786,77 @@ fn resolve_release(
     assume_yes: bool,
     version_arg: Option<&str>,
     dry_run: bool,
-) -> Result<Option<version::DeployVersion>> {
+) -> Result<Resolved> {
     // A dry run is a preview: never prompt, never create a tag, never block.
     // With --version it shows the complete release plan; without one it shows
     // the untagged guards that a real deploy would hit.
     if dry_run {
         if let Some(wanted) = version_arg {
-            let prefix = version::previous_tag(root)
-                .as_deref()
-                .and_then(version::SemVer::parse)
-                .map(|parsed| parsed.prefix)
-                .unwrap_or_else(|| "v".to_string());
-            return Ok(Some(v.with_release(
-                format!("{prefix}{}", wanted.trim_start_matches('v')),
-                "argument",
-            )));
+            let v = release_named(root, v, wanted);
+            warn_if_tag_taken(root, &v, tag_cfg);
+            return Ok(Resolved::Release(v));
         }
-        return Ok(Some(v));
+        return Ok(Resolved::Release(v));
     }
     // `from: commit` / `commit-count` are explicit choices — nothing to resolve.
     if v.release_source != "tag" {
-        return Ok(Some(v));
+        return Ok(Resolved::Release(v));
     }
 
     // A tag on HEAD is confirmed later, by `shipping_approved`, once the
     // target has been read and the prompt can say what the release ships.
     if v.release.is_some() {
-        return Ok(Some(v));
+        return Ok(Resolved::Release(v));
     }
 
-    // No tag on HEAD — offer the next versions based on the previous release.
+    // No tag on HEAD — offer the next versions based on the previous release,
+    // skipping any number whose tag another commit already carries.
     let previous = version::previous_tag(root);
+    let taken = |bare: &str| {
+        let candidate = release_named(root, v.clone(), bare);
+        let name = version::tag_name(&candidate, tag_cfg);
+        version::tag_commit(root, &name)
+            .filter(|commit| *commit != v.git.sha)
+            .map(|commit| (name, commit))
+    };
     let wanted = match version_arg {
         Some(v) => Some(v.to_string()),
         None if assume_yes => None,
-        None => choose_version(previous.as_deref())?,
+        None => choose_version(previous.as_deref(), &taken)?,
     };
     let Some(wanted) = wanted else {
         ui::note(
             "no release to deploy — tag the commit (`git tag -a v0.4.1 -m v0.4.1`), \
              pass --version, or set versioning.from to commit/commit-count.",
         );
-        return Ok(None);
+        return Ok(Resolved::Cancelled);
     };
 
     if v.git.dirty {
         ui::note("working tree is dirty — commit before tagging a release.");
-        return Ok(None);
+        return Ok(Resolved::Cancelled);
     }
 
     // Carry the requested release through the deploy without mutating git.
     // If configured, the tag is created and pushed only after every deploy and
     // verify step succeeds, so failed releases do not leave false tags behind.
-    let prefix = previous
-        .as_deref()
-        .and_then(version::SemVer::parse)
-        .map(|parsed| parsed.prefix)
-        .unwrap_or_else(|| "v".to_string());
-    let _ = tag_cfg;
-    Ok(Some(v.with_release(
-        format!("{prefix}{}", wanted.trim_start_matches('v')),
-        "argument",
-    )))
+    let v = release_named(root, v, &wanted);
+
+    // The number must be free before anything ships: once a release is live
+    // under it, it is in the target's history, in every `{version}`, and in
+    // the artifacts it named — and `tag_release` can only say "not tagged".
+    let name = version::tag_name(&v, tag_cfg);
+    let check = version::check_tag(root, &name, &v.git.sha, tag_cfg);
+    if let Some(warning) = check.warning {
+        ui::warn(warning);
+    }
+    if let Some(clash) = check.clash {
+        ui::phase("Aborted");
+        ui::note(clash.refusal(&name));
+        ui::note("nothing was built, shipped, or changed.");
+        return Ok(Resolved::Refused);
+    }
+    Ok(Resolved::Release(v))
 }
 
 /// The release `deliver verify` checks: the one live on the target.
@@ -1220,16 +1286,13 @@ fn cmd_plan(
     let root = repo_root(&path);
     let mut v = version_announced(&config, &root);
     if let Some(wanted) = version_arg {
-        let prefix = version::previous_tag(&root)
-            .as_deref()
-            .and_then(version::SemVer::parse)
-            .map(|parsed| parsed.prefix)
-            .unwrap_or_else(|| "v".to_string());
-        v = v.with_release(
-            format!("{prefix}{}", wanted.trim_start_matches('v')),
-            "argument",
-        );
+        v = release_named(&root, v, wanted);
         ui::detail(format!("planned release: {}", v.release_display()));
+        warn_if_tag_taken(
+            &root,
+            &v,
+            config.versioning.as_ref().and_then(|r| r.tag.as_ref()),
+        );
     }
     let compiled = compile_announced(&config, only, &root, &v)?;
     if json {
@@ -1380,20 +1443,22 @@ fn cmd_deploy(
     // `verify` ships nothing, so it needs no release of its own: it checks
     // whatever is live, on any commit, tagged or not.
     let resolved = if verify_only {
-        Some(live_release(&config, only, &root, v)?)
+        Resolved::Release(live_release(&config, only, &root, v)?)
     } else {
         resolve_release(&root, v, tag_cfg, assume_yes, version_arg, dry_run)?
     };
-    let Some(v) = resolved else {
+    let v = match resolved {
+        Resolved::Release(v) => v,
+        Resolved::Refused => return Ok(2),
         // Without a prompt there is nobody to have declined: `--yes` stopping
         // here is a failed release guard, not a cancel, and a CI job must not
         // go green having shipped nothing.
-        if assume_yes {
+        Resolved::Cancelled if assume_yes => {
             ui::phase("Aborted");
             ui::note("nothing was built, shipped, or changed.");
             return Ok(2);
         }
-        return Ok(0);
+        Resolved::Cancelled => return Ok(0),
     };
     let mut plan = compile_announced(&config, only, &root, &v)?;
     // `--no-soak` for a scripted run; and `verify` always, since it checks
