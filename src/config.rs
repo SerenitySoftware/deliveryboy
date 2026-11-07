@@ -803,6 +803,31 @@ mod schema_tests {
         jsonschema::draft7::new(&schema).expect("SCHEMA is a valid draft-07 schema")
     }
 
+    #[test]
+    fn http_verification_schema_boolean_defaults() {
+        let schema: Json = serde_json::from_str(SCHEMA).unwrap();
+        for path in [
+            "/definitions/verifyCheck/properties/http",
+            "/definitions/dockerComposeConfig/properties/health",
+        ] {
+            let parent = schema.pointer(path).unwrap();
+            let field = &parent["properties"]["follow_redirects"];
+            assert!(field["type"] == "boolean" && field["default"] == false);
+            assert!(field["description"].as_str().unwrap().contains("false"));
+            let validate = jsonschema::draft7::new(parent).unwrap();
+            for value in [
+                serde_json::json!({"url": "https://example.com/health"}),
+                serde_json::json!({"url": "https://example.com/health", "follow_redirects": false}),
+                serde_json::json!({"url": "https://example.com/health", "follow_redirects": true}),
+            ] {
+                assert!(validate.is_valid(&value));
+            }
+            assert!(!validate.is_valid(&serde_json::json!({
+                "url": "https://example.com/health", "follow_redirects": "true"
+            })));
+        }
+    }
+
     fn yaml_to_json(text: &str) -> Json {
         let yaml: serde_yaml::Value = serde_yaml::from_str(text).expect("YAML");
         serde_json::to_value(yaml).expect("YAML with string keys")

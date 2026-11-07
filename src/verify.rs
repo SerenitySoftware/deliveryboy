@@ -22,6 +22,10 @@ pub fn compile(check: &Value, ctx: &PlanContext) -> Result<PlannedStep> {
                     .unwrap_or(200) as u16,
                 retries: http.get("retries").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
                 interval: http.get("interval").and_then(|v| v.as_u64()).unwrap_or(5),
+                follow_redirects: http
+                    .get("follow_redirects")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             },
             rollback: None,
             cleanup: false,
@@ -61,4 +65,29 @@ pub fn compile(check: &Value, ctx: &PlanContext) -> Result<PlannedStep> {
         ));
     }
     bail!("unknown verify check: {check:?}")
+}
+
+#[cfg(test)]
+mod http_verification_tests {
+    use super::*;
+
+    #[test]
+    fn http_verification_verify_compilation_defaults_and_opt_in() {
+        let fixture = crate::deployers::http_test_support::Context::new();
+        for (option, expected) in [
+            ("", false),
+            (", follow_redirects: false", false),
+            (", follow_redirects: true", true),
+            (", follow_redirects: invalid", false),
+        ] {
+            let check = serde_yaml::from_str(&format!(
+                "http: {{url: https://example.com/health{option}}}"
+            ))
+            .unwrap();
+            let step = compile(&check, &fixture.ctx).unwrap();
+            assert!(matches!(step.kind, StepKind::Http {
+                follow_redirects, expect_status: 200, retries: 1, interval: 5, ..
+            } if follow_redirects == expected));
+        }
+    }
 }

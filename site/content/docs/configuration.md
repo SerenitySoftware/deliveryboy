@@ -148,7 +148,31 @@ verify:
       expect_status: 200
       retries: 5
       interval: 5
+      follow_redirects: true
 ```
+
+HTTP checks compare the exact status (200 by default). `follow_redirects` defaults
+to `false`: a 301 fails an expected 200, and passes an expected 301. Set it to
+`true` to follow redirects and compare the final response instead.
+
+Compose's local `config.health.url` check accepts the same option:
+
+```yaml
+config:
+  health:
+    url: https://example.com/health
+    follow_redirects: true
+```
+
+This option applies to `verify.http` and Compose `health.url`. Compose
+`health.remote_url` and `health.command` keep their own behavior.
+
+Failed HTTP checks report the last status, expected status, a safe redirect
+destination when available, and a fixed curl failure reason when the request
+fails. These details also appear in the final failure, including check and soak
+failures. Displayed URLs omit userinfo, queries and fragments. Ambiguous URLs
+are hidden, output is bounded, and registered secrets are scrubbed. Raw curl
+stderr, headers and bodies never appear in these diagnostics.
 
 ### Soak
 
