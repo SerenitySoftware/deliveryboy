@@ -858,9 +858,15 @@ mod http_verification_tests {
                         }
                         Err(_) => break,
                     };
-                    if stream
-                        .set_read_timeout(Some(Duration::from_millis(200)))
-                        .is_err()
+                    // Windows (and BSD) sockets accepted from a non-blocking
+                    // listener stay non-blocking: reads would return
+                    // WouldBlock before curl's request arrived, the reply
+                    // would go out with the request unread and closing then
+                    // resets the connection (curl 56/23).
+                    if stream.set_nonblocking(false).is_err()
+                        || stream
+                            .set_read_timeout(Some(Duration::from_millis(200)))
+                            .is_err()
                         || stream
                             .set_write_timeout(Some(Duration::from_millis(200)))
                             .is_err()
