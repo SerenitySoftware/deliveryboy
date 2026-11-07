@@ -29,6 +29,7 @@ pub enum StepKind {
         expect_status: u16,
         retries: u32,
         interval: u64,
+        follow_redirects: bool,
     },
     /// Write a local file with an explicit mode. Used for rendered `.env`
     /// files: putting secret values in a shell command would leak them into
@@ -323,6 +324,7 @@ impl PlannedStep {
                 expect_status,
                 retries,
                 interval,
+                follow_redirects: false,
             },
             rollback: None,
             cleanup: false,
@@ -334,6 +336,17 @@ impl PlannedStep {
             cert_domains: Vec::new(),
             compose_project: None,
         }
+    }
+
+    /// Follow redirects only for a local HTTP check; all other steps ignore this.
+    pub fn with_follow_redirects(mut self, follow: bool) -> Self {
+        if let StepKind::Http {
+            follow_redirects, ..
+        } = &mut self.kind
+        {
+            *follow_redirects = follow;
+        }
+        self
     }
 
     pub fn with_rollback(mut self, rollback: impl Into<String>) -> Self {
@@ -568,4 +581,89 @@ pub fn known_deployers() -> &'static [&'static str] {
         "macos-app",
         "nginx-vhost",
     ]
+}
+
+#[cfg(test)]
+pub(crate) mod http_test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct Context {
+        pub ctx: PlanContext,
+    }
+
+    impl Context {
+        pub fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "deliver-http-config-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let ctx = PlanContext {
+                app: "fixture".into(),
+                target: serde_yaml::from_str("{method: local, dir: /fixture}").unwrap(),
+                host: "127.0.0.1".into(),
+                sudo: false,
+                secrets: std::rc::Rc::new(crate::secrets::Resolver::new(Vec::new(), &root)),
+                repo_root: root,
+                work_dir: "fixture-work".into(),
+                version: crate::version::DeployVersion {
+                    id: "fixture-release".into(),
+                    release: Some("1.0.0".into()),
+                    release_source: "argument",
+                    git: crate::version::GitInfo {
+                        sha: "0000000000000000000000000000000000000000".into(),
+                        short_sha: "0000000".into(),
+                        tag: None,
+                        branch: None,
+                        commit_count: 1,
+                        dirty: false,
+                    },
+                },
+            };
+            Self { ctx }
+        }
+    }
+    impl Drop for Context {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.ctx.repo_root);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn http_verification_macos_producers_keep_no_follow() {
+        let fixture = Context::new();
+        let cfg = serde_yaml::from_str(
+            r#"
+strategy: command
+command: echo fixture
+app: Fixture.app
+dmg: Fixture.dmg
+appcast:
+  url: https://example.com/appcast.xml
+  download_url_prefix: https://example.com/download/
+  notes: notes/{version}.html
+  notes_url: https://example.com/notes/1.0.0.html
+  ed_key_env: FIXTURE_SIGNING_KEY
+publish:
+  aliases: [latest.dmg]
+  extra: [helper.dmg]
+"#,
+        )
+        .unwrap();
+        let steps = macos_app::compile(&cfg, &fixture.ctx).unwrap();
+        let http: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match &step.kind {
+                StepKind::Http {
+                    follow_redirects, ..
+                } => Some(*follow_redirects),
+                _ => None,
+            })
+            .collect();
+        assert!(http.len() >= 6 && http.iter().all(|follow| !follow));
+    }
 }

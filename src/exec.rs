@@ -82,29 +82,195 @@ pub fn run_ssh(target: &Target, host: &str, command: &str) -> Result<bool> {
     Ok(status.success())
 }
 
-fn run_http(url: &str, expect: u16, retries: u32, interval: u64) -> Result<bool> {
+struct StepResult {
+    ok: bool,
+    failure: Option<String>,
+}
+
+impl From<bool> for StepResult {
+    fn from(ok: bool) -> Self {
+        Self { ok, failure: None }
+    }
+}
+
+const HTTP_DETAIL_LIMIT: usize = 512;
+
+fn bounded_safe(text: &str) -> String {
+    scrub(text).chars().take(HTTP_DETAIL_LIMIT).collect()
+}
+
+/// Only display an unambiguous ASCII URL subset. Never decode escapes or echo
+/// unknown syntax. Query, fragment and userinfo have no diagnostic value here.
+fn http_display_url(raw: &str) -> String {
+    let hidden = || "[URL hidden]".to_string();
+    if !raw.is_ascii() || raw.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        return hidden();
+    }
+    let base = raw.split(['?', '#']).next().unwrap_or("");
+    let (prefix, rest) = if let Some(rest) = base.strip_prefix("https://") {
+        ("https://", rest)
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        ("http://", rest)
+    } else if let Some(rest) = base.strip_prefix("//") {
+        ("//", rest)
+    } else {
+        if base.is_empty() || base.starts_with("//") {
+            return hidden();
+        }
+        return if safe_http_path(base) {
+            bounded_safe(base)
+        } else {
+            hidden()
+        };
+    };
+    let (authority, path) = rest
+        .split_once('/')
+        .map_or((rest, ""), |(a, _)| (a, &rest[a.len()..]));
+    if authority.matches('@').count() > 1 {
+        return hidden();
+    }
+    let host = authority.rsplit('@').next().unwrap_or("");
+    // Hostnames, IPv4 and bracketed IPv6, optionally with a numeric port.
+    let valid_host = if let Some(ipv6) = host.strip_prefix('[') {
+        ipv6.split_once(']').is_some_and(|(ip, port)| {
+            ip.parse::<std::net::Ipv6Addr>().is_ok() && (port.is_empty() || valid_http_port(port))
+        })
+    } else {
+        let (name, port) = host
+            .split_once(':')
+            .map_or((host, ""), |(n, _)| (n, &host[n.len()..]));
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            && (port.is_empty() || valid_http_port(port))
+    };
+    if !valid_host || !safe_http_path(path) {
+        return hidden();
+    }
+    bounded_safe(&format!("{prefix}{host}{path}"))
+}
+
+fn valid_http_port(port: &str) -> bool {
+    port.strip_prefix(':').is_some_and(|p| {
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok()
+    })
+}
+
+fn safe_http_path(path: &str) -> bool {
+    path.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/-._~".contains(&b))
+}
+
+fn step_label(step: &PlannedStep) -> String {
+    if let StepKind::Http { url, .. } = &step.kind {
+        let label = step.label.replace(url, &http_display_url(url));
+        if label.chars().any(char::is_control) {
+            return "HTTP check".into();
+        }
+        bounded_safe(&label)
+    } else {
+        scrub(&step.label)
+    }
+}
+
+fn step_detail(step: &PlannedStep) -> String {
+    match &step.kind {
+        StepKind::Http { url, .. } => http_display_url(url),
+        _ => scrub(&step.detail()),
+    }
+}
+
+fn step_failure(step: &PlannedStep, result: &StepResult) -> String {
+    match &result.failure {
+        Some(reason) => scrub(&format!("{}: {reason}", step_label(step))),
+        None => step_label(step),
+    }
+}
+
+fn http_command(url: &str, follow_redirects: bool) -> Command {
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-sS",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}\n%{redirect_url}",
+        "--max-time",
+        "20",
+    ]);
+    if follow_redirects {
+        cmd.arg("-L");
+    }
+    cmd.arg(url);
+    cmd
+}
+
+fn http_metadata(stdout: &[u8]) -> (String, Option<String>) {
+    let mut fields = stdout.splitn(2, |byte| *byte == b'\n');
+    let status = std::str::from_utf8(fields.next().unwrap_or_default())
+        .unwrap_or_default()
+        .trim();
+    let code = if status.len() == 3 && status.bytes().all(|b| b.is_ascii_digit()) {
+        status.to_string()
+    } else {
+        "unknown".into()
+    };
+    let redirect = fields.next().unwrap_or_default();
+    let destination = (!redirect.is_empty()).then(|| {
+        std::str::from_utf8(redirect)
+            .map(http_display_url)
+            .unwrap_or_else(|_| "[URL hidden]".into())
+    });
+    (code, destination)
+}
+
+/// stderr can contain arbitrary headers, URLs and server text. Use only curl's
+/// numeric exit code, never guess which portions of that text are safe.
+fn http_failure(code: &str, expect: u16, redirect: Option<&str>, exit: Option<i32>) -> String {
+    let mut text = format!("http {code} (want {expect})");
+    if exit != Some(0) {
+        let reason = match exit {
+            Some(5 | 6) => "could not resolve host",
+            Some(7) => "Failed to connect (connection failed)",
+            Some(28) => "operation timed out",
+            Some(35 | 60) => "TLS connection or certificate failed",
+            Some(47) => "too many redirects",
+            _ => "request failed",
+        };
+        text.push_str(&format!(
+            ", curl {}: {reason} [diagnostic detail hidden]",
+            exit.map_or_else(|| "unknown".into(), |n| n.to_string())
+        ));
+    }
+    if let Some(destination) = redirect {
+        text.push_str(&format!(", redirect to {destination}"));
+    }
+    bounded_safe(&text)
+}
+
+fn run_http(
+    url: &str,
+    expect: u16,
+    retries: u32,
+    interval: u64,
+    follow_redirects: bool,
+) -> Result<StepResult> {
+    let mut last = None;
     for attempt in 1..=retries.max(1) {
         // curl keeps the binary dependency-free.
-        let out = Command::new("curl")
-            .args([
-                "-sS",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "--max-time",
-                "20",
-                url,
-            ])
-            .output()?;
-        let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let out = http_command(url, follow_redirects).output()?;
+        let (code, redirect) = http_metadata(&out.stdout);
         if code == expect.to_string() {
-            return Ok(true);
+            return Ok(true.into());
         }
+        let reason = http_failure(&code, expect, redirect.as_deref(), out.status.code());
         eprintln!(
-            "     http {code} (want {expect}), attempt {attempt}/{}",
+            "     {}, attempt {attempt}/{}",
+            scrub(&reason),
             retries.max(1)
         );
+        last = Some(reason);
         if attempt < retries.max(1)
             && !interrupt::nap(std::time::Duration::from_secs(interval), || {
                 interrupt::count() > 0
@@ -113,31 +279,35 @@ fn run_http(url: &str, expect: u16, retries: u32, interval: u64) -> Result<bool>
             break;
         }
     }
-    Ok(false)
+    Ok(StepResult {
+        ok: false,
+        failure: last,
+    })
 }
 
-fn run_step(step: &PlannedStep, target: &Target, host: &str, dry_run: bool) -> Result<bool> {
+fn run_step(step: &PlannedStep, target: &Target, host: &str, dry_run: bool) -> Result<StepResult> {
     if dry_run {
         println!("        (dry-run, not executed)");
         if step.rollback.is_some() {
             println!("        (undo available if a later step fails)");
         }
-        return Ok(true);
+        return Ok(true.into());
     }
     match &step.kind {
-        StepKind::Command { command, cwd } => run_local(command, cwd.as_ref()),
-        StepKind::Ssh { command } => run_ssh(target, host, command),
+        StepKind::Command { command, cwd } => run_local(command, cwd.as_ref()).map(Into::into),
+        StepKind::Ssh { command } => run_ssh(target, host, command).map(Into::into),
         StepKind::Http {
             url,
             expect_status,
             retries,
             interval,
-        } => run_http(url, *expect_status, *retries, *interval),
+            follow_redirects,
+        } => run_http(url, *expect_status, *retries, *interval, *follow_redirects),
         StepKind::WriteFile {
             path,
             mode,
             content,
-        } => write_file(path, *mode, content),
+        } => write_file(path, *mode, content).map(Into::into),
     }
 }
 
@@ -247,23 +417,23 @@ pub fn execute(
         );
         for (i, step) in work.iter().enumerate() {
             if interrupted() {
-                return Ok(interrupted_at(&step.label, undoable));
+                return Ok(interrupted_at(&step_label(step), undoable));
             }
             println!(
                 "    {:>2}/{}. {} [{}]",
                 i + 1,
                 work.len(),
-                scrub(&step.label),
+                step_label(step),
                 step.type_name()
             );
             if let Some(lock) = lock {
                 lock.refresh();
             }
-            let ok = run_step(step, target, &sp.host, dry_run)?;
-            if ok {
+            let result = run_step(step, target, &sp.host, dry_run)?;
+            if result.ok {
                 if let Some(undo) = &step.rollback {
                     undoable.push((
-                        step.label.clone(),
+                        step_label(step),
                         undo.clone(),
                         target.clone(),
                         sp.host.clone(),
@@ -273,9 +443,9 @@ pub fn execute(
             // Whether the step finished or died with the keypress, the
             // operator asked to stop: everything that did change is undone.
             if interrupted() {
-                return Ok(interrupted_at(&step.label, undoable));
+                return Ok(interrupted_at(&step_label(step), undoable));
             }
-            if !ok {
+            if !result.ok {
                 // Leave intermediates on disk — they're the evidence.
                 if !cleanup.is_empty() {
                     println!(
@@ -284,8 +454,8 @@ pub fn execute(
                 }
                 eprintln!(
                     "\n✗ failed: {} ({})",
-                    scrub(&step.label),
-                    scrub(&step.detail())
+                    step_failure(step, &result),
+                    step_detail(step)
                 );
                 eprintln!("  stopping — later steps and services will not run.");
                 let unwound = if dry_run {
@@ -295,19 +465,19 @@ pub fn execute(
                 };
                 // Travels on into the notification payload, so it leaves here
                 // already scrubbed.
-                return Ok(Outcome::failed(scrub(&step.label), unwound, false));
+                return Ok(Outcome::failed(step_failure(step, &result), unwound, false));
             }
         }
 
         for step in &cleanup {
             if interrupted() {
-                return Ok(interrupted_at(&step.label, undoable));
+                return Ok(interrupted_at(&step_label(step), undoable));
             }
-            println!("    cleanup: {}", scrub(&step.label));
+            println!("    cleanup: {}", step_label(step));
             // Never fail a good deploy over cleanup; just say so.
             match run_step(step, target, &sp.host, dry_run) {
-                Ok(true) => {}
-                _ => eprintln!("    (cleanup did not complete: {})", scrub(&step.label)),
+                Ok(result) if result.ok => {}
+                _ => eprintln!("    (cleanup did not complete: {})", step_label(step)),
             }
         }
         println!();
@@ -400,12 +570,16 @@ fn soak(
         for check in &soak.checks {
             let passed = run_step(check, target, &sp.host, false)?;
             if interrupt::count() > 0 {
-                return Ok(Some(scrub(&format!("soak: {}", check.label))));
+                return Ok(Some(scrub(&format!("soak: {}", step_label(check)))));
             }
-            if !passed {
+            if !passed.ok {
                 // A `remote_command` check's label already is its command.
-                let detail = check.detail();
-                let detail = if check.label.ends_with(&detail) {
+                let detail = step_detail(check);
+                let already_in_label = match &check.kind {
+                    StepKind::Http { .. } => step_label(check).ends_with(&detail),
+                    _ => check.label.ends_with(&check.detail()),
+                };
+                let detail = if already_in_label {
                     String::new()
                 } else {
                     format!(" ({})", scrub(&detail))
@@ -414,13 +588,16 @@ fn soak(
                     "\n✗ soak failed at {} of {}, round {round}/{rounds}: {}{detail}",
                     Span(start.elapsed().as_secs()),
                     Span(window),
-                    scrub(&check.label),
+                    step_failure(check, &passed),
                 );
                 eprintln!(
                     "  {} passed its checks when it went live, then stopped passing.",
                     sp.service
                 );
-                return Ok(Some(scrub(&format!("soak: {}", check.label))));
+                return Ok(Some(scrub(&format!(
+                    "soak: {}",
+                    step_failure(check, &passed)
+                ))));
             }
         }
         println!(
@@ -443,14 +620,15 @@ pub fn check(plan: &[ServicePlan], targets: &BTreeMap<String, Target>) -> Result
         let target = &targets[&sp.target];
         println!("  • {} → {} [{}]", sp.service, sp.target, sp.host);
         for step in &sp.steps {
-            println!("    {} [{}]", scrub(&step.label), step.type_name());
-            if !run_step(step, target, &sp.host, false)? {
+            println!("    {} [{}]", step_label(step), step.type_name());
+            let result = run_step(step, target, &sp.host, false)?;
+            if !result.ok {
                 eprintln!(
                     "\n✗ failed: {} ({})",
-                    scrub(&step.label),
-                    scrub(&step.detail())
+                    step_failure(step, &result),
+                    step_detail(step)
                 );
-                return Ok(Some(scrub(&step.label)));
+                return Ok(Some(step_failure(step, &result)));
             }
         }
     }
@@ -638,5 +816,346 @@ mod tests {
         assert!(execute(&plan, &targets, true, None).unwrap().ok);
         // …while a real run starts from zero.
         assert!(execute(&plan, &targets, false, None).unwrap().ok);
+    }
+}
+
+#[cfg(test)]
+mod http_verification_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    // Every listener has a deadline, bounded reads and unwind-safe shutdown.
+    // Redirects are relative, so curl can only return to this numeric loopback.
+    struct Fixture {
+        url: String,
+        stop: Arc<AtomicBool>,
+        paths: Arc<Mutex<Vec<String>>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Fixture {
+        fn new(statuses: Vec<u16>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let stopping = stop.clone();
+            let requests = paths.clone();
+            let thread = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut count = 0;
+                while !stopping.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    if stream
+                        .set_read_timeout(Some(Duration::from_millis(200)))
+                        .is_err()
+                        || stream
+                            .set_write_timeout(Some(Duration::from_millis(200)))
+                            .is_err()
+                    {
+                        continue;
+                    }
+                    let mut request = Vec::new();
+                    let mut buf = [0; 512];
+                    let read_deadline = Instant::now() + Duration::from_secs(1);
+                    while request.len() < 4096 && Instant::now() < read_deadline {
+                        let remaining = (4096 - request.len()).min(buf.len());
+                        match stream.read(&mut buf[..remaining]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&request)
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    requests
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(path);
+                    let status = statuses.get(count).copied().unwrap_or(200);
+                    count += 1;
+                    let location = if status == 301 {
+                        "Location: /docs\r\n"
+                    } else {
+                        ""
+                    };
+                    let _ = write!(stream, "HTTP/1.1 {status} Test\r\n{location}Content-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            });
+            Self {
+                url,
+                stop,
+                paths,
+                thread: Some(thread),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.paths.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "deliver-http-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn plan(step: PlannedStep) -> (Vec<ServicePlan>, BTreeMap<String, Target>) {
+        let target = serde_yaml::from_str("{method: local, dir: .}").unwrap();
+        (
+            vec![ServicePlan {
+                service: "fixture".into(),
+                target: "local".into(),
+                host: "127.0.0.1".into(),
+                steps: vec![step],
+                after_tag: false,
+                soak: None,
+            }],
+            BTreeMap::from([("local".into(), target)]),
+        )
+    }
+
+    #[test]
+    fn http_verification_filters_urls_and_metadata() {
+        let sensitive = [
+            "user-marker",
+            "pass-marker",
+            "query-marker",
+            "fragment-marker",
+        ];
+        let raw = "https://user-marker:pass-marker@example.com/docs?query-marker#fragment-marker";
+        let out = http_display_url(raw);
+        assert!(out == "https://example.com/docs");
+        assert!(sensitive.iter().all(|s| !out.contains(s)));
+        for (raw, expected) in [
+            ("//example.com/docs?token", "//example.com/docs"),
+            ("/docs#token", "/docs"),
+            ("docs?token", "docs"),
+        ] {
+            assert!(http_display_url(raw) == expected);
+        }
+        let (_, redirect) = http_metadata(b"301\n/docs\r\nAuthorization: unregistered-marker");
+        assert!(redirect.as_deref() == Some("[URL hidden]"));
+        for raw in [
+            "/docs%0aAuthorization:token",
+            "https://a\\b/docs",
+            "https://a@b@c/docs",
+            "/docs\r\nCookie:token",
+            "/docs\u{1b}[31m",
+            "javascript:token",
+            "",
+            "https://[bad]/",
+        ] {
+            assert!(http_display_url(raw) == "[URL hidden]");
+        }
+        assert!(http_display_url("http://[::1]:8080/docs") == "http://[::1]:8080/docs");
+        let (code, redirect) = http_metadata(b"301\n/docs?query-marker#fragment-marker");
+        assert!(code == "301" && redirect.as_deref() == Some("/docs"));
+        for raw in [&b""[..], &b"junk\n\xff"[..], &b"200 Cookie: marker"[..]] {
+            assert!(http_metadata(raw).0 == "unknown");
+        }
+        let (code, redirect) = http_metadata(b"200\n\xff");
+        assert!(code == "200" && redirect.as_deref() == Some("[URL hidden]"));
+        let long = format!("/{}", "x".repeat(2000));
+        assert!(http_display_url(&long).chars().count() <= HTTP_DETAIL_LIMIT);
+    }
+
+    #[test]
+    fn http_verification_fixed_reasons_and_scrubbing() {
+        crate::secrets::redact::record("HTTP_PATH", "http-path-secret-8741");
+        let url = "https://user-marker:pass-marker@example.com/http-path-secret-8741?query-marker#fragment-marker";
+        let step = PlannedStep::http(format!("verify {url}"), url, 200, 1, 0);
+        let reason = http_failure("000", 200, None, Some(7));
+        assert!(reason.contains("Failed to connect") && reason.contains("curl 7"));
+        let result = StepResult {
+            ok: false,
+            failure: Some(reason),
+        };
+        let final_text = step_failure(&step, &result);
+        assert!(final_text.contains("[redacted:HTTP_PATH]") && final_text.contains("want 200"));
+        for marker in [
+            "user-marker",
+            "pass-marker",
+            "query-marker",
+            "fragment-marker",
+            "http-path-secret-8741",
+        ] {
+            assert!(!final_text.contains(marker));
+            assert!(!step_detail(&step).contains(marker));
+        }
+        // No API accepts stderr: unregistered header/body values cannot enter it.
+        for exit in [None, Some(1), Some(28), Some(47), Some(60)] {
+            let text = http_failure("000", 200, None, exit);
+            assert!(text.contains("diagnostic detail hidden"));
+        }
+        assert!(bounded_safe(&"é".repeat(2000)).chars().count() == HTTP_DETAIL_LIMIT);
+    }
+
+    #[test]
+    fn http_verification_redirect_arguments_are_opt_in() {
+        for follow in [false, true] {
+            let cmd = http_command("http://127.0.0.1/", follow);
+            let args: Vec<_> = cmd.get_args().collect();
+            assert!(args.iter().filter(|arg| **arg == "-L").count() == usize::from(follow));
+            assert!(!args.iter().any(|arg| *arg == "--location-trusted"));
+        }
+        let step = PlannedStep::http("check", "http://127.0.0.1/", 200, 1, 0);
+        assert!(matches!(
+            step.kind,
+            StepKind::Http {
+                follow_redirects: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            step.with_follow_redirects(true).kind,
+            StepKind::Http {
+                follow_redirects: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn http_verification_redirect_status_and_retry_semantics() {
+        let _turn = interrupt::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _armed = interrupt::arm();
+        for (follow, expected, ok, count) in [
+            (false, 200, false, 1),
+            (false, 301, true, 1),
+            (true, 200, true, 2),
+        ] {
+            let server = Fixture::new(vec![301, 200]);
+            let result = run_http(&server.url, expected, 1, 0, follow).unwrap();
+            assert!(result.ok == ok && server.count() == count);
+            if !ok {
+                let text = result.failure.unwrap();
+                assert!(text.contains("http 301 (want 200)") && text.contains("/docs"));
+            }
+            if follow {
+                assert!(server
+                    .paths
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last()
+                    .is_some_and(|p| p == "/docs"));
+            }
+        }
+        let server = Fixture::new(vec![503, 200]);
+        assert!(run_http(&server.url, 200, 2, 0, false).unwrap().ok);
+        assert!(server.count() == 2);
+        let server = Fixture::new(vec![503, 502]);
+        let result = run_http(&server.url, 200, 2, 0, false).unwrap();
+        assert!(!result.ok && result.failure.unwrap().contains("http 502"));
+        // A successful final response leaves no stale failure in Outcome.
+        let server = Fixture::new(vec![301, 200]);
+        let step = PlannedStep::http("probe", &server.url, 200, 1, 0).with_follow_redirects(true);
+        let (plan, targets) = plan(step);
+        // execute arms the interrupt handler itself; release this test's guard.
+        drop(_armed);
+        let outcome = execute(&plan, &targets, false, None).unwrap();
+        assert!(outcome.ok && outcome.failed_step.is_none());
+    }
+
+    #[test]
+    fn http_verification_execute_check_soak_and_dry_run() {
+        let _turn = interrupt::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let server = Fixture::new(vec![301]);
+        let url = format!("{}?query-marker#fragment-marker", server.url);
+        let step = PlannedStep::http(format!("verify {url}"), &url, 200, 1, 0);
+        let (mut plan, targets) = plan(step.clone());
+        assert!(execute(&plan, &targets, true, None).unwrap().ok);
+        assert!(server.count() == 0);
+        let scratch = Scratch::new();
+        let marker = scratch.0.join("later");
+        plan[0].steps.push(PlannedStep::write_file(
+            "later",
+            marker.to_str().unwrap(),
+            0o600,
+            "later",
+        ));
+        let outcome = execute(&plan, &targets, false, None).unwrap();
+        let text = outcome.failed_step.unwrap();
+        assert!(!outcome.ok && !marker.exists());
+        assert!(text.contains("http 301") && text.contains("/docs"));
+        for marker in ["query-marker", "fragment-marker"] {
+            assert!(
+                !text.contains(marker),
+                "HTTP diagnostic contains a sensitive fixture value"
+            );
+        }
+
+        let server = Fixture::new(vec![503, 502]);
+        plan[0].steps = vec![PlannedStep::http("probe", &server.url, 200, 1, 0)];
+        let text = check(&plan, &targets).unwrap().unwrap();
+        assert!(text.contains("probe: http 503 (want 200)"));
+        let checks = plan[0].steps.clone();
+        plan[0].steps.clear();
+        plan[0].soak = Some(Soak {
+            duration: Span(1),
+            every: Span(1),
+            checks,
+        });
+        let outcome = execute(&plan, &targets, false, None).unwrap();
+        assert!(outcome
+            .failed_step
+            .unwrap()
+            .contains("soak: probe: http 502"));
+    }
+
+    #[test]
+    fn http_verification_closed_port_reason() {
+        let _turn = interrupt::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _armed = interrupt::arm();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let result = run_http(&url, 200, 1, 0, false).unwrap();
+        assert!(!result.ok, "ephemeral port may have been reused");
+        let text = result.failure.unwrap();
+        assert!(
+            text.contains("http 000") && text.contains("curl 7"),
+            "closed-port fixture did not refuse the connection"
+        );
     }
 }

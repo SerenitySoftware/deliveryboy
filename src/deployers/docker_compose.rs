@@ -910,13 +910,16 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
                 .get("expect_status")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(200) as u16;
-            steps.push(PlannedStep::http(
-                format!("verify {url}"),
-                url.to_string(),
-                expect,
-                retries,
-                interval,
-            ));
+            steps.push(
+                PlannedStep::http(
+                    format!("verify {url}"),
+                    url.to_string(),
+                    expect,
+                    retries,
+                    interval,
+                )
+                .with_follow_redirects(cfg_bool(health, "follow_redirects", false)),
+            );
         }
         // A loopback probe on the target: tests the published port directly,
         // without depending on DNS, nginx, or TLS being right yet.
@@ -1089,5 +1092,61 @@ mod tests {
             err.contains("env_file value CERT contains a newline"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod http_verification_tests {
+    use super::*;
+    use crate::deployers::StepKind;
+
+    #[test]
+    fn http_verification_compose_local_only_and_defaults() {
+        let fixture = crate::deployers::http_test_support::Context::new();
+        std::fs::write(
+            fixture.ctx.repo_root.join("compose.yml"),
+            "services:\n  api:\n    image: example:latest\n",
+        )
+        .unwrap();
+        let mut baseline = None;
+        for (option, expected) in [
+            ("", false),
+            ("follow_redirects: false,", false),
+            ("follow_redirects: true,", true),
+            ("follow_redirects: invalid,", false),
+        ] {
+            let cfg = serde_yaml::from_str(&format!(r#"
+build: false
+files: [compose.yml]
+health: {{{option} url: https://example.com/health, remote_url: http://127.0.0.1/health, command: echo healthy}}
+"#)).unwrap();
+            let steps = compile(&cfg, &fixture.ctx).unwrap();
+            let http: Vec<_> = steps
+                .iter()
+                .filter_map(|step| match &step.kind {
+                    StepKind::Http {
+                        follow_redirects,
+                        expect_status,
+                        retries,
+                        interval,
+                        ..
+                    } => Some((*follow_redirects, *expect_status, *retries, *interval)),
+                    _ => None,
+                })
+                .collect();
+            assert!(http == vec![(expected, 200, 10, 5)]);
+            let ssh: Vec<_> = steps
+                .iter()
+                .filter_map(|step| match &step.kind {
+                    StepKind::Ssh { command } => Some(command.clone()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(prior) = &baseline {
+                assert!(prior == &ssh);
+            } else {
+                baseline = Some(ssh);
+            }
+        }
     }
 }
