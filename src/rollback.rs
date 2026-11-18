@@ -94,8 +94,8 @@ fn release_of(status: &Status, deploy_id: &str) -> Option<String> {
 /// The shell that performs one swap on the target.
 ///
 /// Deliberately the same shape as the activate step's own undo in
-/// `deployers::files`: re-read what is live, point `.deliver-previous` at it,
-/// then swap through a temporary name to replace the symlink in a
+/// `deployers::files`: re-read what is live, swap through a temporary name,
+/// then record the outgoing release in `.deliver-previous`. The swap uses a
 /// single rename and a reader (nginx) never sees a missing path.
 ///
 /// The `-d` re-check is not redundant with validation: the retained set was
