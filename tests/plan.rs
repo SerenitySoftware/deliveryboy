@@ -10546,7 +10546,14 @@ fn plan_with_a_taken_version_warns_and_still_plans() {
     let out = run_in(&dir, &["plan", "--version", "1.0.1"]);
     let text = output_text(&out);
     assert!(out.status.success(), "{text}");
-    assert!(text.contains("tag v1.0.1 already exists on"), "{text}");
+    let tagged = git_stdout(&dir, &["rev-list", "-n", "1", "v1.0.1"]);
+    assert!(
+        text.contains(&format!(
+            "tag v1.0.1 already names {} — `deliver deploy --version` releases that commit",
+            &tagged[..7]
+        )),
+        "{text}"
+    );
     assert!(text.contains("Plan (nothing is executed)"), "{text}");
 }
 

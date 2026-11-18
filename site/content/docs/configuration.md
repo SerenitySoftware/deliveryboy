@@ -270,10 +270,13 @@ versioning:
 ```
 
 Tags are created only after the release and its checks succeed. The number is
-checked before anything ships: a `--version` or prompted number whose tag
-already sits on another commit — in this clone, or on the remote when
-`tag.push` is set — is refused up front, and the version prompt skips a taken
-number and offers the next free one, saying why.
+checked before anything ships. `--version` whose tag already exists in this
+clone releases the commit that tag names (see
+[`deliver deploy`](../commands/#deliver-deploy)); one whose tag only the remote
+has — asked when `tag.push` is set — is refused until it is fetched. A number
+chosen at the version prompt is a new release of `HEAD`: one whose tag already
+sits on another commit is refused up front, and the prompt skips a taken number
+and offers the next free one, saying why.
 `after_tag` commands run only after the tag exists and a configured tag push
 succeeds. They can publish artifacts that earlier steps placed in `{work}`.
 They run only for a full deploy, not one selected with `--service`. Make these

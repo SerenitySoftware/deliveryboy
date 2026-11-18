@@ -760,19 +760,27 @@ fn release_named(root: &Path, v: version::DeployVersion, wanted: &str) -> versio
 }
 
 /// Say when the tag this release would get already names another commit. A
-/// preview (`plan`, `--dry-run`) only warns; a deploy refuses (see
-/// `resolve_release`).
+/// preview (`plan`, `--dry-run`) only warns. A deploy with `--version`
+/// releases the commit a local tag names (see `release_commit`), and refuses
+/// one only the remote has (see `resolve_release`).
 fn warn_if_tag_taken(root: &Path, v: &version::DeployVersion, tag_cfg: Option<&config::TagConfig>) {
     let name = version::tag_name(v, tag_cfg);
     let check = version::check_tag(root, &name, &v.git.sha, tag_cfg);
     if let Some(warning) = check.warning {
         ui::warn(warning);
     }
-    if let Some(clash) = check.clash {
-        ui::warn(format!(
+    match check.clash {
+        Some(version::TagClash::Local { commit }) => ui::warn(format!(
+            "tag {name} already names {} — `deliver deploy --version` releases that commit, \
+             not this plan's {}",
+            &commit[..7.min(commit.len())],
+            v.git.short_sha
+        )),
+        Some(clash) => ui::warn(format!(
             "{} — a deploy with this number would be refused",
             clash.refusal(&name)
-        ));
+        )),
+        None => {}
     }
 }
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-18
 
 ### Changed
 
@@ -17,18 +17,29 @@
   checkout, or making a worktree and linking `.env.deploy` into it by hand.
   Secrets providers (a gitignored `.env.deploy`), a relative `ssh.key` and a
   relative `method: local` target `dir` are still read from the checkout. A
-  `--version` whose tag names another commit releases that commit instead of
-  being refused; a number typed at the prompt is still a new release of HEAD
-  and is refused when taken. `versioning.branch` and `require_pushed` now ask
-  whether the release commit is on the branch and pushed, wherever the
-  checkout stands; `from: commit` and `commit-count` deploys still build the
-  working tree and keep the old checkout rules. A file the config ships has
+  `--version` whose tag names another commit releases that commit; a number
+  chosen at the prompt is a new release of HEAD and is refused when taken.
+  `versioning.branch` and `require_pushed` now ask whether the release
+  commit is on the branch and pushed, wherever the checkout stands; `from:
+  commit` and `commit-count` deploys still build the working tree and keep
+  the old checkout rules. A file the config ships has
   to be committed (or built by a step) to be in the release; preflight says
   when it is only in the checkout. `deliver clean` also forgets the clean
   copies of releases that were killed mid-run.
 
 ### Added
 
+- A failed HTTP check says why: the status it got against the one expected,
+  a redirect's destination, or curl's reason for failing, instead of only the
+  expected status. URLs lose userinfo, query and fragment, registered secrets
+  are scrubbed, and each message is bounded. `verify.http.follow_redirects`
+  and Compose `health.follow_redirects` opt in to following redirects and
+  comparing the final response (default `false`); success is still an exact
+  status match.
+- `files` and `hugo` releases to a `method: local` target on macOS activate
+  and roll back with the system `/bin/mv`; GNU coreutils is no longer needed
+  there. A live path that is not a symlink is refused before the swap. SSH
+  targets still use GNU `mv -T` on the remote host.
 - Preflight validates a `docker-compose` service's project locally with
   `docker compose config --quiet`, over a scratch copy laid out as the
   target's root with the rendered `.env` (0600, removed afterwards). A Compose
@@ -41,18 +52,24 @@
 
 ### Fixed
 
-- `deliver deploy` refuses a release number whose tag already names another
-  commit before anything ships, and the version prompt skips a taken number
-  and offers the next free one (`patch v1.0.2 (v1.0.1 is already on
-  d67382e)`). Deploying a commit older than the newest tag — a bisect, a
-  redeploy of last week's commit, a hotfix branch — was offered exactly the
-  number that was taken, shipped under it, and only then said "not tagged",
-  so the target recorded a version git maps to a different commit; with
-  `tag.push`, a tag a colleague had pushed to origin was invisible until a
-  fetch, and the deploy ended with a rejected push. The name checked is the
-  one `tag.name` renders; with `tag.push` the remote is asked once, and a
-  remote that does not answer is a warning. `deliver plan --version` reports
-  the same finding as a warning.
+- A release number can no longer ship a commit other than the one its tag
+  names. Deploying a commit older than the newest tag — a bisect, a redeploy
+  of last week's commit, a hotfix branch — was offered exactly the number
+  that was taken, shipped under it, and only then said "not tagged", so the
+  target recorded a version git maps to a different commit; with `tag.push`,
+  a tag a colleague had pushed to origin was invisible until a fetch, and the
+  deploy ended with a rejected push. The version prompt now skips a taken
+  number and offers the next free one (`patch v1.0.2 (v1.0.1 is already on
+  d67382e)`), and refuses a typed one before anything ships; `--version`
+  releases the commit its tag names (see Changed). The name checked is the
+  one `tag.name` renders; with `tag.push` the remote is asked once, a tag
+  only the remote has is refused until fetched, and a remote that does not
+  answer is a warning. `deliver plan --version` reports the finding as a
+  warning.
+- A `method: local` target on Windows deploys to its `dir`. The dir is
+  spliced into `sh`, which read the backslashes in `C:\…` as escapes:
+  `mkdir -p` and `cp` succeeded against a mangled relative path, and the
+  deploy exited 0 with nothing in the target dir.
 - `verify:` checks `contains:` and `remote_file:` pass their text and path to
   the shell verbatim. Both were spliced into hand-written single quotes, so a
   `text:` with an apostrophe (`it's live`) broke the quoting and failed a good
@@ -128,7 +145,8 @@
   lock without a word. The lock is now refreshed before every step and every
   soak round, and a run releases only a lock that still names its own deploy
   id, saying so when another run has taken it over. A single step longer than
-  the window can still be taken over.
+  the window can still be taken over. A lock directory with no owner file is
+  left alone by a refresh rather than reported as another run's.
 
 - A failed `verify:` can always be unwound, whatever `keep_releases` says.
   The `files`/`hugo` prune ran before the service's checks and kept the
