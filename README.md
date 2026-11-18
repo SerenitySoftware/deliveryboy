@@ -187,6 +187,27 @@ or Xcode. The `deliver` binary itself does not require a hosted service.
 
 The full guide lives at [deliveryboy.app/docs](https://deliveryboy.app/docs/).
 
+## Development checks
+
+This checkout pins Rust 1.94.0 in `rust-toolchain.toml`; CLI CI uses the same
+version with Clippy and rustfmt. Install [rustup](https://rustup.rs/) if needed.
+From the repository root, run:
+
+```bash
+PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all -- --check
+PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets --locked -- -D warnings
+PATH="$HOME/.cargo/bin:$PATH" cargo test --locked
+```
+
+Each command selects rustup's tools, which read the project pin, even when
+Homebrew Cargo comes first in your shell. These assignments affect only that
+command. Rustup installs the pinned compiler and components on first use.
+Tests also need Hugo installed and on PATH, as in CI.
+
+When updating the compiler, change both `rust-toolchain.toml` and the CLI
+job's `dtolnay/rust-toolchain` version in `.github/workflows/ci.yml`, then run
+these checks and the three CI platforms.
+
 ## License
 
 MIT
