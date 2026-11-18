@@ -6316,22 +6316,6 @@ fn the_scaffolded_macos_stub_is_a_config_the_cli_can_actually_load() {
 // these run against a `method: local` target whose "remote" is a fixture
 // directory laid out the way a `files` deploy leaves one.
 
-/// The atomic swap both `deliver deploy` and `deliver rollback` perform is
-/// `mv -Tf`, which is GNU coreutils only — BSD `mv` (macOS) has no `-T`. The
-/// deployers target Linux hosts, so that is the right command to ship and the
-/// wrong thing to fork per platform; the tests that actually execute a swap
-/// therefore only assert where `mv` can perform one. Everything up to the
-/// swap — validation, refusals, the no-op — is portable and runs everywhere.
-#[cfg(unix)]
-fn mv_can_replace_a_symlink() -> bool {
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg("mv -Tf /nonexistent-deliver-probe /nonexistent-deliver-probe2 2>&1")
-        .output()
-        .map(|o| !String::from_utf8_lossy(&o.stdout).contains("illegal option"))
-        .unwrap_or(false)
-}
-
 #[cfg(unix)]
 fn live_release_of(root: &std::path::Path) -> String {
     std::fs::read_link(root.join("web"))
@@ -6356,10 +6340,6 @@ fn rollback_to(dir: &std::path::Path, cfg: &std::path::Path, id: &str) -> std::p
 #[cfg(unix)]
 #[test]
 fn rollback_to_repoints_the_live_symlink_at_a_retained_release() {
-    if !mv_can_replace_a_symlink() {
-        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
-        return;
-    }
     let dir = tmpdir("rollback-to-retained");
     let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
     let cfg = files_config(&dir, &root);
@@ -6387,10 +6367,6 @@ fn rollback_to_repoints_the_live_symlink_at_a_retained_release() {
 #[cfg(unix)]
 #[test]
 fn a_plain_rollback_after_a_targeted_one_steps_back_to_where_it_came_from() {
-    if !mv_can_replace_a_symlink() {
-        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
-        return;
-    }
     let dir = tmpdir("rollback-to-then-back");
     let root = deployed_fixture(&dir, Some("20260202-1000-bbb2222"));
     let cfg = files_config(&dir, &root);
@@ -6602,10 +6578,6 @@ fn commit_all(dir: &std::path::Path, msg: &str) {
 #[cfg(unix)]
 #[test]
 fn an_unwound_files_deploy_is_followed_by_a_rollback_row_for_the_release_it_restored() {
-    if !mv_can_replace_a_symlink() {
-        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
-        return;
-    }
     let dir = tmpdir("unwind-history-files");
     let root = dir.join("live");
     std::fs::create_dir_all(dir.join("site")).unwrap();
@@ -6677,10 +6649,6 @@ services:
 #[cfg(unix)]
 #[test]
 fn a_first_files_release_that_fails_verify_is_taken_down_and_recorded() {
-    if !mv_can_replace_a_symlink() {
-        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
-        return;
-    }
     let dir = tmpdir("unwind-first-files");
     let root = dir.join("live");
     std::fs::create_dir_all(dir.join("site")).unwrap();
@@ -6824,10 +6792,6 @@ fn pruning_waits_for_verify_and_spares_the_live_and_previous_releases() {
 #[cfg(unix)]
 #[test]
 fn a_failed_verify_with_keep_releases_one_still_unwinds_to_the_previous_release() {
-    if !mv_can_replace_a_symlink() {
-        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
-        return;
-    }
     let dir = tmpdir("prune-keep-one");
     let root = dir.join("live");
     std::fs::create_dir_all(dir.join("site")).unwrap();
@@ -6932,10 +6896,6 @@ services:
 #[cfg(unix)]
 #[test]
 fn a_failed_undo_is_reported_as_failed_not_as_nothing_to_undo() {
-    if !mv_can_replace_a_symlink() {
-        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
-        return;
-    }
     let dir = tmpdir("undo-failed-summary");
     let root = dir.join("live");
     std::fs::create_dir_all(dir.join("site")).unwrap();
@@ -7214,10 +7174,6 @@ fn the_compose_unwind_appends_its_rollback_row_conditionally() {
 #[cfg(unix)]
 #[test]
 fn a_rollback_is_recorded_in_history_and_verified() {
-    if !mv_can_replace_a_symlink() {
-        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
-        return;
-    }
     let dir = tmpdir("rollback-recorded");
     let (root, cfg) = stepped_fixture(&dir, Some("test -L web"));
     let marker = root.join("checked");
@@ -7263,10 +7219,6 @@ fn a_rollback_is_recorded_in_history_and_verified() {
 #[cfg(unix)]
 #[test]
 fn a_rollback_whose_restored_release_fails_its_checks_exits_1() {
-    if !mv_can_replace_a_symlink() {
-        eprintln!("skipped: this host's `mv` has no -T, so it cannot swap a symlink");
-        return;
-    }
     let dir = tmpdir("rollback-unverified");
     let (root, cfg) = stepped_fixture(&dir, Some("false"));
     let (code, text) = rollback_with(&dir, &cfg, &["-y"], "");

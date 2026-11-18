@@ -95,7 +95,7 @@ fn release_of(status: &Status, deploy_id: &str) -> Option<String> {
 ///
 /// Deliberately the same shape as the activate step's own undo in
 /// `deployers::files`: re-read what is live, point `.deliver-previous` at it,
-/// then swap through a temporary name so `mv -T` replaces the symlink in a
+/// then swap through a temporary name to replace the symlink in a
 /// single rename and a reader (nginx) never sees a missing path.
 ///
 /// The `-d` re-check is not redundant with validation: the retained set was
@@ -103,6 +103,7 @@ fn release_of(status: &Status, deploy_id: &str) -> Option<String> {
 /// land in between. Checking on the target, inside the same shell that swaps,
 /// is the only place the answer is still true.
 fn swap_command(
+    target: Option<&Target>,
     live: &str,
     to_path: &str,
     previous_marker: Option<&str>,
@@ -110,6 +111,11 @@ fn swap_command(
     deploy_id: &str,
     sudo: &str,
 ) -> String {
+    let swap = target
+        .map(crate::symlink_swap::SymlinkSwap::for_target)
+        .unwrap_or_else(|| crate::symlink_swap::SymlinkSwap::for_platform(false, "linux"));
+    let guard = swap.guard(live, sudo);
+    let mv = swap.command();
     let record_previous = match previous_marker {
         Some(marker) => format!(
             "printf '%s\\n' \"$CUR\" | {sudo}tee {m} >/dev/null; ",
@@ -123,11 +129,12 @@ fn swap_command(
         "set -e; \
          if [ ! -d {to} ]; then \
            echo 'release {id} is no longer on the target — refusing to swap' >&2; exit 1; fi; \
+         {guard}\
          CUR=''; \
          if [ -L {live} ]; then CUR=$({sudo}readlink -f {live} || true); fi; \
-         {record_previous}\
          {sudo}ln -sfn {to} {live}.rb; \
-         {sudo}mv -Tf {live}.rb {live}; \
+         {sudo}{mv} {live}.rb {live}; \
+         {record_previous}\
          echo \"rolled back {svc} → {id}\"",
         to = shell_quote(to_path),
         live = shell_quote(live),
@@ -210,6 +217,7 @@ fn resolve_one(status: &Status, targets: &BTreeMap<String, Target>, deploy_id: &
         from,
         to_release: release_of(status, deploy_id),
         command: swap_command(
+            targets.get(&status.target),
             live_path,
             &to_path,
             status.previous_marker.as_deref(),
@@ -428,6 +436,105 @@ pub fn unwind_record_command(history_path: &str, stamp: &str, id_expr: &str, sud
 mod tests {
     use super::*;
     use crate::readback::Deploy;
+
+    #[test]
+    fn targeted_swap_checks_destinations_and_preserves_failed_move_state() {
+        #[cfg(unix)]
+        {
+            use std::{fs, os::unix::fs::symlink, process::Command};
+            for shape in ["absent", "dangling", "link", "directory", "failed-move"] {
+                let fixture = crate::deployers::http_test_support::Context::new();
+                let root = &fixture.ctx.repo_root;
+                let live = root.join("live path's link");
+                let to = root.join("new release");
+                let old = root.join("old release");
+                let marker = root.join("previous marker");
+                fs::create_dir(&to).unwrap();
+                fs::create_dir(&old).unwrap();
+                fs::write(to.join("index"), "new").unwrap();
+                fs::write(old.join("index"), "old").unwrap();
+                fs::write(&marker, "keep marker").unwrap();
+                match shape {
+                    "dangling" => symlink(root.join("missing"), &live).unwrap(),
+                    "link" | "failed-move" => symlink(&old, &live).unwrap(),
+                    "directory" => {
+                        fs::create_dir(&live).unwrap();
+                        fs::write(live.join("index"), "directory").unwrap();
+                    }
+                    _ => {}
+                }
+                if shape == "failed-move" {
+                    // An unusable staging name forces the move itself to fail.
+                    fs::create_dir(format!("{}.rb", live.display())).unwrap();
+                }
+                let cmd = swap_command(
+                    Some(&fixture.ctx.target),
+                    live.to_str().unwrap(),
+                    to.to_str().unwrap(),
+                    Some(marker.to_str().unwrap()),
+                    "web",
+                    "new",
+                    "",
+                );
+                let out = Command::new("sh").args(["-c", &cmd]).output().unwrap();
+                if shape == "directory" || shape == "failed-move" {
+                    assert!(!out.status.success(), "{shape}: {cmd}");
+                    assert_eq!(fs::read_to_string(&marker).unwrap(), "keep marker");
+                    assert_eq!(
+                        fs::read_to_string(live.join("index")).unwrap(),
+                        if shape == "directory" {
+                            "directory"
+                        } else {
+                            "old"
+                        }
+                    );
+                    assert!(!live.join("live path's link.rb").exists());
+                } else {
+                    assert!(
+                        out.status.success(),
+                        "{shape}: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    assert_eq!(fs::read_to_string(live.join("index")).unwrap(), "new");
+                    assert!(!std::path::Path::new(&format!("{}.rb", live.display())).exists());
+                    let prev = fs::read_to_string(&marker).unwrap();
+                    if shape == "link" {
+                        assert_eq!(
+                            std::path::Path::new(prev.trim()),
+                            fs::canonicalize(&old).unwrap()
+                        );
+                    } else if shape == "dangling" {
+                        assert!(prev.trim().ends_with("/missing"));
+                    } else {
+                        assert!(prev.trim().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn targeted_swap_keeps_sudo_and_ssh_gnu_flags() {
+        for method in ["local", "ssh"] {
+            let target: Target =
+                serde_yaml::from_str(&format!("{{method: {method}, dir: /fixture}}")).unwrap();
+            let cmd = swap_command(
+                Some(&target),
+                "/fixture/live",
+                "/fixture/old",
+                None,
+                "web",
+                "old",
+                "sudo ",
+            );
+            let expected = if method == "local" && cfg!(target_os = "macos") {
+                "sudo /bin/mv -hf"
+            } else {
+                "sudo mv -Tf"
+            };
+            assert!(cmd.contains(expected), "{cmd}");
+        }
+    }
 
     fn deploy(number: &str, id: &str, release: &str) -> Deploy {
         Deploy {
