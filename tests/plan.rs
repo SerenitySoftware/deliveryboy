@@ -9814,6 +9814,12 @@ fn change_release(dir: &std::path::Path) {
     .unwrap();
     // A release ships its commit, not the working tree.
     commit_all(dir, "release two");
+    // Deploy ids are UTC stamps to the second plus a sha, and the config
+    // snapshot a rollback restores is the newest by *name* — so release two
+    // landing in release one's second would be ordered by the two shas, and
+    // `rollback` would restore release one's own (empty) snapshot about half
+    // the time. A real release never lands twice a second; this test can.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
 }
 
 #[cfg(unix)]
