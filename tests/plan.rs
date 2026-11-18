@@ -2745,6 +2745,8 @@ fn after_tag_steps_are_planned_but_not_run_by_a_dry_run() {
         "  tag: {enabled: true}\n  after_tag:\n    - command: touch after-tag-marker",
     );
     std::fs::write(&cfg, body).unwrap();
+    // A release is built from its commit, config included.
+    commit_all(&dir, "add finalizer");
 
     let out = run_in(&dir, &["deploy", "--dry-run", "--version", "2.0.0"]);
     let text = format!(
@@ -2772,7 +2774,10 @@ fn after_tag_steps_run_only_after_the_tag_exists() {
     let cfg = dir.join(".deliver.yml");
     let body = std::fs::read_to_string(&cfg).unwrap().replace(
         "  tag: {enabled: true}",
-        "  tag: {enabled: true}\n  after_tag:\n    - command: git rev-parse -q --verify refs/tags/v2.0.0 >/dev/null && touch after-tag-marker",
+        &format!(
+            "  tag: {{enabled: true}}\n  after_tag:\n    - command: git rev-parse -q --verify refs/tags/v2.0.0 >/dev/null && touch {}",
+            sh_path(&dir.join("after-tag-marker"))
+        ),
     );
     std::fs::write(&cfg, body).unwrap();
     for args in [vec!["add", "-A"], vec!["commit", "-qm", "add finalizer"]] {
@@ -6562,8 +6567,14 @@ fn a_declined_rollback_changes_nothing() {
     assert_eq!(live_release_of(&root), "20260202-1000-bbb2222", "{text}");
 }
 
-/// Commit whatever changed, so the next deploy has its own sha and id.
-#[cfg(unix)]
+/// A path as `sh` reads it on every platform: forward slashes, so a Windows
+/// `C:\…` survives being spliced into a command.
+fn sh_path(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+/// Commit whatever changed, so the next deploy has its own sha and id — and,
+/// since a release is built from its commit, ships the change.
 fn commit_all(dir: &std::path::Path, msg: &str) {
     for args in [vec!["add", "-A"], vec!["commit", "-qm", msg]] {
         std::process::Command::new("git")
@@ -7811,15 +7822,25 @@ targets:
 services:
   ship:
     deployer: files
-    before: [{{command: "cp marker.txt proof.txt"}}]
+    before: [{{command: "cp marker.txt {}"}}]
     config: {{src: payload.txt}}
 "#,
-            dir.join("dest").display()
+            dir.join("dest").display(),
+            sh_path(&dir.join("dest").join("proof.txt"))
         ),
     )
     .unwrap();
     git_init_tagged(&dir, "v1.0.0");
     dir
+}
+
+/// Take `payload.txt` out of the release a fleet repo deploys: committed, and
+/// `v1.0.0` moved onto that commit. A deploy ships its commit, so deleting
+/// the file from the checkout alone would change nothing.
+fn drop_payload_from_release(repo: &std::path::Path) {
+    std::fs::remove_file(repo.join("payload.txt")).unwrap();
+    commit_all(repo, "drop the payload");
+    git_in(repo, &["tag", "-f", "v1.0.0"]);
 }
 
 /// Does the fleet summary carry this line? The name column is padded to the
@@ -7852,10 +7873,11 @@ fn fleet_deploy_runs_each_repo_in_its_own_directory() {
     let text = fleet_text(&out);
     assert!(out.status.success(), "{text}");
 
-    // Each repo's relative `before:` step resolved against that repo, and each
-    // shipped its own payload — the property the whole loop rests on.
+    // Each repo's relative `before:` step resolved against that repo (a clean
+    // copy of its commit), and each shipped its own payload — the property the
+    // whole loop rests on.
     for (dir, name) in [(&alpha, "alpha"), (&beta, "beta")] {
-        let proof = std::fs::read_to_string(dir.join("proof.txt"))
+        let proof = std::fs::read_to_string(dir.join("dest").join("proof.txt"))
             .unwrap_or_else(|e| panic!("{name} did not run in its own directory: {e}\n{text}"));
         assert_eq!(proof, format!("i am {name}\n"), "{text}");
     }
@@ -7872,7 +7894,7 @@ fn fleet_deploy_stops_at_the_first_failure() {
     fleet_repo(&root, "beta");
     // alpha ships a file that is not there: it fails before the target is
     // touched, which is exactly the shape a fleet must not deploy past.
-    std::fs::remove_file(alpha.join("payload.txt")).unwrap();
+    drop_payload_from_release(&alpha);
 
     let out = run_in(&root, &["fleet", "deploy", "-y"]);
     let text = fleet_text(&out);
@@ -7880,7 +7902,7 @@ fn fleet_deploy_stops_at_the_first_failure() {
     assert!(summary_says(&text, "beta", "not attempted"), "{text}");
     assert!(text.contains("--keep-going"), "{text}");
     // Nothing ran in beta at all.
-    assert!(!root.join("beta/proof.txt").exists(), "{text}");
+    assert!(!root.join("beta/dest/proof.txt").exists(), "{text}");
 }
 
 #[test]
@@ -7888,14 +7910,14 @@ fn fleet_deploy_keeps_going_when_asked() {
     let root = fleet_root("fleet-keep-going", &["alpha", "beta"]);
     let alpha = fleet_repo(&root, "alpha");
     fleet_repo(&root, "beta");
-    std::fs::remove_file(alpha.join("payload.txt")).unwrap();
+    drop_payload_from_release(&alpha);
 
     let out = run_in(&root, &["fleet", "deploy", "-y", "--keep-going"]);
     let text = fleet_text(&out);
     // The fleet still reports the failure, but beta got its turn.
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(summary_says(&text, "beta", "ok"), "{text}");
-    assert!(root.join("beta/proof.txt").exists(), "{text}");
+    assert!(root.join("beta/dest/proof.txt").exists(), "{text}");
 }
 
 #[test]
@@ -7923,8 +7945,8 @@ fn fleet_narrows_to_the_repos_named() {
     let out = run_in(&root, &["fleet", "--repo", "beta", "deploy", "-y"]);
     let text = fleet_text(&out);
     assert!(out.status.success(), "{text}");
-    assert!(root.join("beta/proof.txt").exists(), "{text}");
-    assert!(!root.join("alpha/proof.txt").exists(), "{text}");
+    assert!(root.join("beta/dest/proof.txt").exists(), "{text}");
+    assert!(!root.join("alpha/dest/proof.txt").exists(), "{text}");
     assert!(!text.contains("alpha"), "{text}");
 }
 
@@ -7940,7 +7962,7 @@ fn fleet_refuses_a_repo_selector_that_matches_nothing() {
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(text.contains("no repo named alhpa"), "{text}");
     assert!(text.contains("lists: alpha"), "{text}");
-    assert!(!root.join("alpha/proof.txt").exists(), "{text}");
+    assert!(!root.join("alpha/dest/proof.txt").exists(), "{text}");
 }
 
 #[test]
@@ -8907,12 +8929,12 @@ fn soak_repo(name: &str, passes: u32, soak: &str) -> (std::path::PathBuf, std::p
     let dir = tmpdir(name);
     let dest = dir.join("dest");
     std::fs::create_dir_all(&dest).unwrap();
-    // Relative, so the command is the same on every platform: a local
-    // "remote" step runs in the directory `deliver` was started from.
-    let counter = dir.join("probes");
-    std::fs::write(dir.join(".gitignore"), "probes\n").unwrap();
+    // Outside the repo: a local "remote" step runs in the release's clean
+    // copy, which is gone once the run ends.
+    let counter = dest.join("probes");
+    let probes = sh_path(&counter);
     let check = format!(
-        "n=$(cat probes 2>/dev/null || echo 0); n=$((n+1)); echo $n > probes; [ $n -le {passes} ]"
+        "n=$(cat {probes} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {probes}; [ $n -le {passes} ]"
     );
     std::fs::write(
         dir.join(".deliver.yml"),
@@ -9790,6 +9812,8 @@ fn change_release(dir: &std::path::Path) {
         cfg.replace("MODE: one", "MODE: two"),
     )
     .unwrap();
+    // A release ships its commit, not the working tree.
+    commit_all(dir, "release two");
 }
 
 #[cfg(unix)]
@@ -9858,11 +9882,12 @@ fn env_values_with_dollars_hashes_and_quotes_reach_the_env_file_quoted() {
         ),
     )
     .unwrap();
+    commit_all(&dir, "quoted values");
     let out = deliver()
         .current_dir(&dir)
         .env("PATH", &path)
         .env("DB_PASSWORD", "x7$Kq9pL")
-        .args(["deploy", "--version", "1.0.0"])
+        .args(["deploy", "--version", "1.1.0"])
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
@@ -10053,6 +10078,335 @@ services:
     assert!(text.contains("sudo: false"), "{text}");
 }
 
+// --- a release is built from its commit ------------------------------------
+//
+// `deliver deploy --version` ships exactly the commit the version names,
+// built in a clean copy of it, whatever state the checkout it runs from is in.
+// Secrets and other files git ignores are still read from the checkout.
+
+/// How many worktrees the repo has registered: 1 when the release's clean copy
+/// was cleaned up after itself.
+fn worktrees(dir: &std::path::Path) -> usize {
+    git_stdout(dir, &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter(|l| l.starts_with("worktree "))
+        .count()
+}
+
+/// Uncommitted edits, untracked files and an uncommitted config change in the
+/// checkout do not reach the target: the release is the tagged commit. The
+/// target `dir` is relative, and still lands in the checkout rather than in
+/// the copy that is thrown away. The checkout is left exactly as it was.
+#[test]
+fn a_dirty_checkout_ships_the_tagged_commit() {
+    let dir = local_deploy_repo("source-dirty");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace(&format!("dir: {}", dir.join("dest").display()), "dir: dest");
+    std::fs::write(&cfg, body).unwrap();
+    std::fs::write(dir.join(".gitignore"), "dest/\n").unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+
+    std::fs::write(dir.join("payload.txt"), "uncommitted edit\n").unwrap();
+    std::fs::write(dir.join("untracked.txt"), "not in git\n").unwrap();
+    let edited = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("src: payload.txt", "src: untracked.txt");
+    std::fs::write(&cfg, &edited).unwrap();
+    let status = git_stdout(&dir, &["status", "--porcelain"]);
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dest").join("payload.txt")).ok(),
+        Some("hi\n".to_string()),
+        "the committed payload should have shipped:\n{text}"
+    );
+    assert!(!dir.join("dest").join("untracked.txt").exists(), "{text}");
+    assert!(
+        text.contains("uncommitted and untracked files are not part of the release"),
+        "{text}"
+    );
+    assert!(
+        text.contains("using .deliver.yml as commit"),
+        "the commit's config is the release's:\n{text}"
+    );
+    // The checkout is untouched, and the copy is gone.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("payload.txt")).unwrap(),
+        "uncommitted edit\n"
+    );
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), edited);
+    assert_eq!(git_stdout(&dir, &["status", "--porcelain"]), status);
+    assert_eq!(worktrees(&dir), 1, "the release's copy was left behind");
+}
+
+/// The release ships the committed bytes even where git would render them
+/// with CRLF on checkout (`core.autocrlf`, Windows' default): an LF shell
+/// script stays runnable on a Linux target.
+#[test]
+fn a_release_ships_the_committed_line_endings() {
+    let dir = local_deploy_repo("source-eol");
+    git_init_tagged(&dir, "v1.0.0");
+    git_in(&dir, &["config", "core.autocrlf", "true"]);
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read(dir.join("dest").join("payload.txt")).ok(),
+        Some(b"hi\n".to_vec()),
+        "{text}"
+    );
+}
+
+/// A checkout on another branch, with work committed there, releases the
+/// commit the version's tag names on main; HEAD stays where it was.
+#[test]
+fn a_checkout_on_another_branch_ships_the_tagged_commit() {
+    let dir = local_deploy_repo("source-branch");
+    git_init_tagged(&dir, "v1.0.0");
+    git_in(&dir, &["branch", "-M", "main"]);
+    let tagged = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    git_in(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("payload.txt"), "feature work\n").unwrap();
+    commit_all(&dir, "feature work");
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dest").join("payload.txt")).ok(),
+        Some("hi\n".to_string()),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("v1.0.0 names commit {}", &tagged[..7])),
+        "{text}"
+    );
+    assert!(text.contains("this checkout is at feature"), "{text}");
+    assert_eq!(git_stdout(&dir, &["branch", "--show-current"]), "feature");
+    assert_eq!(
+        git_stdout(&dir, &["rev-list", "-n", "1", "v1.0.0"]),
+        tagged,
+        "the tag must not move"
+    );
+    assert_eq!(worktrees(&dir), 1);
+}
+
+/// `versioning.branch` asks whether the release commit is on the branch, not
+/// whether the checkout is: a tag on main releases from a feature checkout,
+/// and a new number for the feature branch's own HEAD is refused.
+#[test]
+fn the_release_branch_rule_applies_to_the_release_commit() {
+    let dir = local_deploy_repo("source-branch-rule");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "  tag: {enabled: true}",
+        "  branch: main\n  tag: {enabled: true}",
+    );
+    std::fs::write(&cfg, body).unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    git_in(&dir, &["branch", "-M", "main"]);
+    git_in(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("payload.txt"), "feature work\n").unwrap();
+    commit_all(&dir, "feature work");
+    let feature = git_stdout(&dir, &["rev-parse", "HEAD"]);
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.1.0"]);
+    let text = output_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(&format!("release commit {} is not on main", &feature[..7])),
+        "{text}"
+    );
+    assert!(!tag_exists(&dir, "v1.1.0"), "{text}");
+    assert_eq!(worktrees(&dir), 1);
+}
+
+/// A config in a subdirectory of the repository is found, and deploys, from
+/// the same subdirectory of the release's copy.
+#[test]
+fn a_config_in_a_subdirectory_builds_from_that_subdirectory_of_the_commit() {
+    let repo = tmpdir("source-subdir");
+    let app = repo.join("services").join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(repo.join("README"), "monorepo\n").unwrap();
+    std::fs::write(app.join("payload.txt"), "from the subdirectory\n").unwrap();
+    let dest = repo.join("dest");
+    std::fs::write(repo.join(".gitignore"), "dest/\n").unwrap();
+    std::fs::write(
+        app.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: local}}
+targets:
+  local: {{method: local, dir: {}}}
+services:
+  ship:
+    deployer: files
+    config: {{src: payload.txt}}
+"#,
+            dest.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&repo, "v1.0.0");
+    std::fs::write(app.join("payload.txt"), "uncommitted\n").unwrap();
+
+    let out = run_in(&app, &["deploy", "-y", "--version", "1.0.0"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dest.join("payload.txt")).ok(),
+        Some("from the subdirectory\n".to_string()),
+        "{text}"
+    );
+    assert_eq!(worktrees(&repo), 1);
+}
+
+/// Amplifier's shape: a Compose service whose image is built from a `src`
+/// subfolder, and whose `.env` is rendered from a gitignored `.env.deploy`.
+/// A stub `docker` records the build context it was handed and what that
+/// context held.
+#[cfg(unix)]
+fn compose_release_repo(name: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmpdir(name);
+    let live = dir.join("live");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let stub = bin.join("docker");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n\
+             echo \"$PWD: $*\" >> {log}/docker.log\n\
+             if [ \"$1\" = build ]; then\n\
+               for last in \"$@\"; do :; done\n\
+               {{ echo \"context=$PWD/$last\"; ls -A \"$last\"; cat \"$last/app.txt\"; }} > {log}/built.txt\n\
+             fi\n\
+             exit 0\n",
+            log = dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        dir.join(".gitignore"),
+        ".env.deploy\nlive/\nbin/\ndocker.log\nbuilt.txt\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join(".env.deploy"), "API_TOKEN=from-the-checkout\n").unwrap();
+    std::fs::write(dir.join("src/Dockerfile"), "FROM scratch\nCOPY app.txt /\n").unwrap();
+    std::fs::write(dir.join("src/app.txt"), "release one\n").unwrap();
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  app:\n    image: demo:latest\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        format!(
+            r#"
+version: 1
+app: demo
+defaults: {{target: box}}
+targets:
+  box: {{host: localhost, method: local, sudo: false, dir: {}}}
+secrets:
+  providers:
+    - file: .env.deploy
+  define:
+    API_TOKEN: {{}}
+services:
+  app:
+    deployer: docker-compose
+    config:
+      files: [docker-compose.yml]
+      image: {{tag: "demo:latest", context: src}}
+      env_file:
+        path: .env
+        from_secrets: [API_TOKEN]
+        literals: {{APP_VERSION: "{{version}}", APP_COMMIT: "{{sha}}"}}
+"#,
+            live.display()
+        ),
+    )
+    .unwrap();
+    git_init_tagged(&dir, "v1.0.0");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (dir, live, path)
+}
+
+/// The image is built from `src` in the release's copy of the tagged commit
+/// — not the checkout's edited `src`, and without its untracked files — and
+/// the `.env` it ships carries the secret from the checkout's gitignored
+/// `.env.deploy`, which the commit does not have.
+#[cfg(unix)]
+#[test]
+fn a_subfolder_build_context_and_a_gitignored_secrets_file() {
+    let (dir, live, path) = compose_release_repo("source-compose");
+    let tagged = git_stdout(&dir, &["rev-parse", "--short", "HEAD"]);
+    std::fs::write(dir.join("src/app.txt"), "uncommitted edit\n").unwrap();
+    std::fs::write(dir.join("src/untracked.txt"), "not in git\n").unwrap();
+    git_in(&dir, &["checkout", "-q", "-b", "elsewhere"]);
+
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(ok, "{text}");
+
+    let built = std::fs::read_to_string(dir.join("built.txt")).unwrap();
+    let context = built.lines().next().unwrap();
+    assert!(context.ends_with("/src"), "{built}");
+    assert!(
+        !context.starts_with(&format!("context={}", dir.display())),
+        "built from the checkout, not the release's copy: {built}"
+    );
+    assert!(built.contains("Dockerfile"), "{built}");
+    assert!(!built.contains("untracked.txt"), "{built}");
+    assert!(built.ends_with("release one\n"), "{built}");
+
+    let env = std::fs::read_to_string(live.join(".env")).unwrap();
+    assert!(
+        env.contains("API_TOKEN='from-the-checkout'"),
+        "{env}\n{text}"
+    );
+    // Compose's `{version}` is the release as tagged.
+    assert!(env.contains("APP_VERSION='v1.0.0'"), "{env}");
+    assert!(env.contains(&format!("APP_COMMIT='{tagged}'")), "{env}");
+    // The secret's value never reaches the output.
+    assert!(!text.contains("from-the-checkout"), "{text}");
+    assert_eq!(worktrees(&dir), 1);
+}
+
+/// Without the gitignored file in the checkout the release's secrets are
+/// missing, and nothing is built.
+#[cfg(unix)]
+#[test]
+fn a_missing_gitignored_secrets_file_stops_the_release() {
+    let (dir, _live, path) = compose_release_repo("source-compose-no-secrets");
+    std::fs::remove_file(dir.join(".env.deploy")).unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.0"]);
+    assert!(!ok, "{text}");
+    assert!(text.contains("API_TOKEN"), "{text}");
+    assert!(!dir.join("built.txt").exists(), "{text}");
+}
+
 // --- a release number whose tag already exists ------------------------------
 
 /// A local-target repo with three commits: the first tagged `v1.0.0`, the
@@ -10095,14 +10449,49 @@ fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// `--version` naming a tag that sits on another commit is refused before
-/// preflight: nothing is shipped, and the exit code is the config-error one.
+/// `--version` naming a tag that sits on another commit releases that commit,
+/// wherever HEAD is (here: detached on an older, untagged one). Nothing new is
+/// tagged: the release's tag already names what shipped.
 #[test]
-fn version_of_a_taken_tag_is_refused_before_anything_ships() {
+fn version_releases_the_commit_its_tag_names_from_a_detached_head() {
     let dir = repo_between_releases("tag-taken-version");
+    let head = git_stdout(&dir, &["rev-parse", "HEAD"]);
     let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.1"]);
     let text = output_text(&out);
-    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(out.status.success(), "{text}");
+    let tagged = git_stdout(&dir, &["rev-list", "-n", "1", "v1.0.1"]);
+    assert_ne!(head, tagged);
+    assert!(
+        text.contains(&format!("v1.0.1 names commit {}", &tagged[..7])),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("release v1.0.1 (tag) · sha {}", &tagged[..7])),
+        "{text}"
+    );
+    assert!(
+        text.contains("this checkout is at a detached HEAD"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tag:            v1.0.1 (already present)"),
+        "{text}"
+    );
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD"]), head, "HEAD moved");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("dest").join("payload.txt")).ok(),
+        Some("hi\n".to_string()),
+        "{text}"
+    );
+}
+
+/// A number typed at the prompt is a new release of HEAD, so one whose tag
+/// sits on another commit is refused before preflight: nothing is shipped,
+/// and the exit code is the config-error one.
+#[test]
+fn a_typed_version_whose_tag_is_taken_is_refused_before_anything_ships() {
+    let dir = repo_between_releases("tag-taken-typed");
+    let text = deploy_with_input(&dir, "1.0.1\n");
     let taken = git_stdout(&dir, &["rev-list", "-n", "1", "v1.0.1"]);
     assert!(
         text.contains(&format!(
@@ -10201,7 +10590,8 @@ fn version_of_a_tag_held_only_by_origin_is_refused_when_pushing() {
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(
         text.contains(&format!(
-            "tag v1.0.1 already exists on origin ({}) — run git fetch --tags and pick another version",
+            "tag v1.0.1 already exists on origin ({}) — run git fetch --tags to release that \
+             commit, or pick another version",
             &first[..7]
         )),
         "{text}"
@@ -10213,42 +10603,63 @@ fn version_of_a_tag_held_only_by_origin_is_refused_when_pushing() {
     );
 }
 
-/// The name checked is the one `tag.name` renders, not the bare release.
+/// The tag `--version` looks for is the one `tag.name` renders, not the bare
+/// release: `release-1.0.1` names the commit, and a stray `v1.0.1` elsewhere
+/// is not this project's tag.
 #[test]
-fn the_tag_checked_is_the_templated_name() {
+fn the_tag_looked_up_is_the_templated_name() {
     let dir = local_deploy_repo("tag-taken-template");
-    git_init_tagged(&dir, "v1.0.0");
-    let first = git_stdout(&dir, &["rev-parse", "HEAD"]);
-    std::fs::write(dir.join("two.txt"), "x\n").unwrap();
     let cfg = dir.join(".deliver.yml");
     let body = std::fs::read_to_string(&cfg).unwrap().replace(
         "tag: {enabled: true}",
         "tag: {enabled: true, name: 'release-{version}'}",
     );
     std::fs::write(&cfg, body).unwrap();
-    for args in [
-        vec!["add", "-A"],
-        vec!["commit", "-qm", "two"],
-        vec!["tag", "release-1.0.1", first.as_str()],
-    ] {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(&args)
-            .output()
-            .unwrap();
-    }
+    git_init_tagged(&dir, "release-1.0.1");
+    let first = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    std::fs::write(dir.join("two.txt"), "x\n").unwrap();
+    commit_all(&dir, "two");
+    git_in(&dir, &["tag", "v1.0.1"]);
 
-    // `v1.0.1` is free; `release-1.0.1` is what this project would tag.
+    let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.1"]);
+    let text = output_text(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!("release-1.0.1 names commit {}", &first[..7])),
+        "{text}"
+    );
+    assert!(
+        text.contains("tag:            release-1.0.1 (already present)"),
+        "{text}"
+    );
+}
+
+/// The commit was found by this checkout's `tag.name`; when that commit's own
+/// config would tag the release under another name, nothing ships.
+#[test]
+fn a_release_whose_commit_names_its_tag_differently_is_refused() {
+    let dir = local_deploy_repo("tag-template-differs");
+    git_init_tagged(&dir, "v1.0.0");
+    let first = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "tag: {enabled: true}",
+        "tag: {enabled: true, name: 'release-{version}'}",
+    );
+    std::fs::write(&cfg, body).unwrap();
+    commit_all(&dir, "rename the tags");
+    git_in(&dir, &["tag", "release-1.0.1", first.as_str()]);
+
     let out = run_in(&dir, &["deploy", "-y", "--version", "1.0.1"]);
     let text = output_text(&out);
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(
         text.contains(&format!(
-            "tag release-1.0.1 already exists on {} — pick another version",
+            "release-1.0.1 names commit {}, but that commit's own config tags this release v1.0.1",
             &first[..7]
         )),
         "{text}"
     );
     assert!(!dir.join("dest").join("payload.txt").exists(), "{text}");
+    assert!(!tag_exists(&dir, "v1.0.1"), "{text}");
 }

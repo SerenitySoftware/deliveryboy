@@ -513,6 +513,9 @@ fn dns_mismatches(
         .collect()
 }
 
+/// How a missing input file is reported, ahead of its path.
+pub const MISSING_FILE: &str = "missing file referenced by config: ";
+
 /// `also_hosts` are (target, host) pairs to probe on top of the plan's own —
 /// how `deliver preflight` still checks reachability for a service whose plan
 /// would not compile. Empty for every other caller.
@@ -553,7 +556,7 @@ pub fn run(
     }
     for (path, exists) in &files {
         if !exists {
-            problems.push(format!("missing file referenced by config: {path}"));
+            problems.push(format!("{MISSING_FILE}{path}"));
         }
     }
 

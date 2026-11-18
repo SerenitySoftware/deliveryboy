@@ -587,13 +587,17 @@ pub struct VersioningConfig {
     /// tag (default) | commit | commit-count
     #[serde(default, alias = "from")]
     pub version_from: Option<String>,
-    /// Refuse a release from a dirty working tree.
+    /// Refuse a release from a dirty working tree. Met by construction for a
+    /// tagged release, which is built from a clean copy of its commit; it
+    /// applies to `from: commit`/`commit-count`, which build in place.
     #[serde(default)]
     pub require_clean: bool,
-    /// Refuse a release unless HEAD exactly matches its configured upstream.
+    /// Refuse a release whose commit is not on the release branch's upstream
+    /// (any pushed branch without `branch`). In place: HEAD must match it.
     #[serde(default)]
     pub require_pushed: bool,
-    /// Optional branch name required for a release (for example `main`).
+    /// Branch the release's commit must be on (for example `main`). In
+    /// place: the branch the checkout must be on.
     #[serde(default)]
     pub branch: Option<String>,
     #[serde(default)]
@@ -694,6 +698,30 @@ impl Config {
             .get(&name)
             .with_context(|| format!("unknown target '{name}'"))?;
         Ok((name, target.clone()))
+    }
+
+    /// Pin the config's relative paths to this machine to `checkout`.
+    ///
+    /// A release runs in a clean copy of its commit (see `source`), so a
+    /// relative path would otherwise be read against the copy. Two of them name
+    /// things that are this machine's rather than the commit's: a `method:
+    /// local` target's `dir` — where the release lands, which must outlive the
+    /// copy — and an ssh `key`, which git ignores when it sits in the repo.
+    pub fn anchor_local_paths(&mut self, checkout: &Path) {
+        let anchored = |path: &str| {
+            let relative = !path.starts_with('~') && Path::new(path).is_relative();
+            relative.then(|| checkout.join(path).to_string_lossy().into_owned())
+        };
+        for target in self.targets.values_mut() {
+            if target.is_local() {
+                if let Some(dir) = anchored(&target.dir) {
+                    target.dir = dir;
+                }
+            }
+            if let Some(key) = target.ssh.key.as_deref().and_then(anchored) {
+                target.ssh.key = Some(key);
+            }
+        }
     }
 }
 

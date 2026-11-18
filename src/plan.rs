@@ -121,7 +121,20 @@ pub fn build(
     repo_root: &std::path::Path,
     version: &crate::version::DeployVersion,
 ) -> Result<Vec<ServicePlan>> {
-    let compiled = compile(config, only, repo_root, version)?;
+    build_from(config, only, repo_root, repo_root, version)
+}
+
+/// [`build`] for a release built from a clean copy of its commit: the files
+/// the deployers read come from `repo_root` (the copy), the secrets from
+/// `secrets_root` (the checkout, where a gitignored `.env.deploy` lives).
+pub fn build_from(
+    config: &Config,
+    only: &[String],
+    repo_root: &std::path::Path,
+    secrets_root: &std::path::Path,
+    version: &crate::version::DeployVersion,
+) -> Result<Vec<ServicePlan>> {
+    let compiled = compile_from(config, only, repo_root, secrets_root, version)?;
     match compiled.errors.into_iter().next() {
         // Same message, same first-failure ordering as before this returned a
         // partial plan: every caller but preflight still treats one broken
@@ -140,7 +153,18 @@ pub fn compile(
     repo_root: &std::path::Path,
     version: &crate::version::DeployVersion,
 ) -> Result<Compilation> {
-    let resolver = std::rc::Rc::new(crate::secrets::resolver(config, repo_root)?);
+    compile_from(config, only, repo_root, repo_root, version)
+}
+
+/// [`compile`] with the secrets read from `secrets_root` (see [`build_from`]).
+pub fn compile_from(
+    config: &Config,
+    only: &[String],
+    repo_root: &std::path::Path,
+    secrets_root: &std::path::Path,
+    version: &crate::version::DeployVersion,
+) -> Result<Compilation> {
+    let resolver = std::rc::Rc::new(crate::secrets::resolver(config, secrets_root)?);
     // Learn this run's secret values before any of them can reach stdout.
     crate::secrets::prime_redaction(&resolver);
     let mut plan = Vec::new();

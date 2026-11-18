@@ -151,12 +151,18 @@
       "properties": {
         "version_from": { "$ref": "#/definitions/versionFrom" },
         "from": { "$ref": "#/definitions/versionFrom" },
-        "require_clean": { "description": "Refuse a release from a dirty working tree.", "type": "boolean" },
-        "require_pushed": {
-          "description": "Refuse a release unless HEAD exactly matches its configured upstream.",
+        "require_clean": {
+          "description": "Refuse a release from a dirty working tree. Only `from: commit`/`commit-count` deploys build from the working tree; a tagged release is built from a clean copy of its commit and always meets it.",
           "type": "boolean"
         },
-        "branch": { "description": "Branch a release must be made from, e.g. main.", "type": "string" },
+        "require_pushed": {
+          "description": "Refuse a release whose commit is not on the release branch's upstream (or, without `branch`, on any pushed branch). For `from: commit`/`commit-count`, HEAD must match its upstream.",
+          "type": "boolean"
+        },
+        "branch": {
+          "description": "Branch a release's commit must be on, e.g. main. For `from: commit`/`commit-count`, the branch the checkout must be on.",
+          "type": "string"
+        },
         "tag": { "$ref": "#/definitions/tag" },
         "after_tag": {
           "description": "Local steps that run only after the release tag exists (requires `tag.enabled: true`).",

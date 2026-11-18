@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Changed
+
+- `deliver deploy` builds and ships a release's commit, not the folder it runs
+  in. `deliver deploy --version 1.2.3` releases the commit `v1.2.3` already
+  names — tag main, then deploy — or, when the tag does not exist yet,
+  HEAD's commit, which it tags once the release is live. That commit is
+  checked out cleanly with `git worktree` in Delivery Boy's scratch directory,
+  with its own `.deliver.yml`, and every step runs there, so uncommitted or
+  untracked files, another branch or a detached HEAD in the checkout no longer
+  matter and never ship. A release used to build from the working tree, and
+  refused a dirty one ("working tree is dirty — commit before tagging a
+  release"), so releasing an approved commit meant cleaning or switching the
+  checkout, or making a worktree and linking `.env.deploy` into it by hand.
+  Secrets providers (a gitignored `.env.deploy`), a relative `ssh.key` and a
+  relative `method: local` target `dir` are still read from the checkout. A
+  `--version` whose tag names another commit releases that commit instead of
+  being refused; a number typed at the prompt is still a new release of HEAD
+  and is refused when taken. `versioning.branch` and `require_pushed` now ask
+  whether the release commit is on the branch and pushed, wherever the
+  checkout stands; `from: commit` and `commit-count` deploys still build the
+  working tree and keep the old checkout rules. A file the config ships has
+  to be committed (or built by a step) to be in the release; preflight says
+  when it is only in the checkout. `deliver clean` also forgets the clean
+  copies of releases that were killed mid-run.
+
 ### Added
 
 - Preflight validates a `docker-compose` service's project locally with

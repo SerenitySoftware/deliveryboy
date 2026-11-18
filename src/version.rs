@@ -107,11 +107,64 @@ pub fn git_info(root: &Path) -> GitInfo {
     }
 }
 
+/// What git says about one commit, for a release built from a clean copy of
+/// it (`source::Export`) rather than from the working tree. `dirty` is false:
+/// nothing outside the commit is in the copy. `branch` stays the checkout's,
+/// which is what `describe` and the release gate report it as.
+pub fn git_info_at(root: &Path, commit: &str) -> GitInfo {
+    GitInfo {
+        sha: git(
+            root,
+            &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+        )
+        .unwrap_or_else(|| "unknown".into()),
+        short_sha: git(root, &["rev-parse", "--short", commit]).unwrap_or_else(|| "unknown".into()),
+        tag: git(root, &["describe", "--tags", "--exact-match", commit]),
+        branch: git(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        commit_count: git(root, &["rev-list", "--count", commit])
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0),
+        dirty: false,
+    }
+}
+
+/// HEAD's commit, when there is one.
+pub fn head_commit(root: &Path) -> Option<String> {
+    git(root, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+}
+
+/// Whether git answers yes (exit 0) — for the questions it answers with an
+/// exit status and no output, like `merge-base --is-ancestor`.
+fn git_yes(root: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The versioning rules (`require_clean`, `branch`, `require_pushed`).
+///
+/// `in_place` is a deploy that builds from the working tree — `versioning.from:
+/// commit` or `commit-count` — and there the rules are about the checkout: it
+/// must be clean, on the branch, and level with its upstream. A tagged
+/// release is built from a clean copy of `commit` instead (see `source`), so
+/// the checkout's state cannot reach the target and the rules are about the
+/// commit: it must be on the release branch, and pushed. `require_clean` is
+/// met by construction.
 pub fn release_gate(
     root: &Path,
     cfg: Option<&crate::config::VersioningConfig>,
+    commit: &str,
+    in_place: bool,
 ) -> Result<(), String> {
     let Some(cfg) = cfg else { return Ok(()) };
+    if !in_place {
+        return commit_gate(root, cfg, commit);
+    }
     let info = git_info(root);
     if cfg.require_clean && info.dirty {
         return Err("working tree is dirty — commit or stash before releasing".into());
@@ -133,6 +186,82 @@ pub fn release_gate(
                 info.short_sha,
                 &upstream[..upstream.len().min(8)]
             ));
+        }
+    }
+    Ok(())
+}
+
+/// The versioning rules for a release built from `commit`: wherever the
+/// checkout stands, the commit must be on the release branch and, with
+/// `require_pushed`, on what the remote has of it.
+fn commit_gate(
+    root: &Path,
+    cfg: &crate::config::VersioningConfig,
+    commit: &str,
+) -> Result<(), String> {
+    let short = short(commit);
+    let on = |tip: &str| git_yes(root, &["merge-base", "--is-ancestor", commit, tip]);
+    let remote = cfg
+        .tag
+        .as_ref()
+        .and_then(|t| t.remote.clone())
+        .unwrap_or_else(|| "origin".into());
+    if let Some(branch) = &cfg.branch {
+        let local = format!("refs/heads/{branch}");
+        let tracking = format!("refs/remotes/{remote}/{branch}");
+        let known = [&local, &tracking]
+            .iter()
+            .any(|r| git_yes(root, &["rev-parse", "--verify", "--quiet", r.as_str()]));
+        if !known {
+            return Err(format!(
+                "release branch {branch} is not in this clone — fetch it before releasing"
+            ));
+        }
+        if !on(&local) && !on(&tracking) {
+            return Err(format!(
+                "release commit {short} is not on {branch} — release a commit that is"
+            ));
+        }
+    }
+    if cfg.require_pushed {
+        match &cfg.branch {
+            Some(branch) => {
+                // The branch's own upstream when it has one, else the remote's
+                // copy of it.
+                let upstream = git(
+                    root,
+                    &[
+                        "rev-parse",
+                        "--symbolic-full-name",
+                        &format!("refs/heads/{branch}@{{upstream}}"),
+                    ],
+                )
+                .unwrap_or_else(|| format!("refs/remotes/{remote}/{branch}"));
+                if !on(&upstream) {
+                    return Err(format!(
+                        "release commit {short} is not on {} — push it before releasing",
+                        upstream.trim_start_matches("refs/remotes/")
+                    ));
+                }
+            }
+            None => {
+                let pushed = git(
+                    root,
+                    &[
+                        "for-each-ref",
+                        "--count=1",
+                        "--contains",
+                        commit,
+                        "refs/remotes",
+                    ],
+                )
+                .is_some();
+                if !pushed {
+                    return Err(format!(
+                        "release commit {short} is not on any pushed branch — push it before releasing"
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -163,7 +292,15 @@ fn utc_stamp(secs: u64) -> String {
 
 /// Compute both identities. `release_from` comes from config (`release.version_from`).
 pub fn resolve(root: &Path, release_from: Option<&str>) -> DeployVersion {
-    let git = git_info(root);
+    identify(git_info(root), release_from)
+}
+
+/// Both identities for a release built from `commit` rather than HEAD.
+pub fn resolve_at(root: &Path, release_from: Option<&str>, commit: &str) -> DeployVersion {
+    identify(git_info_at(root, commit), release_from)
+}
+
+fn identify(git: GitInfo, release_from: Option<&str>) -> DeployVersion {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -215,9 +352,11 @@ pub struct TagResult {
     pub note: Option<String>,
 }
 
-/// Tag the commit that shipped. Idempotent: an existing tag on the same commit
-/// is reported, not recreated; on a *different* commit it's an error rather than
-/// a silent move, since tags are how you answer "what shipped?".
+/// Tag the commit that shipped — `version.git.sha`, named explicitly, since a
+/// release built from a clean copy of a commit need not be HEAD's. Idempotent:
+/// an existing tag on the same commit is reported, not recreated; on a
+/// *different* commit it's an error rather than a silent move, since tags are
+/// how you answer "what shipped?".
 pub fn tag_release(
     root: &Path,
     version: &DeployVersion,
@@ -280,6 +419,7 @@ pub fn tag_release(
     } else {
         args.push(name.clone());
     }
+    args.push(version.git.sha.clone());
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -360,9 +500,11 @@ impl TagClash {
                     short(commit)
                 )
             }
+            // `deploy --version` releases the commit a tag names, but only a
+            // tag this clone has: what the remote's copy names is not here.
             TagClash::Remote { remote, commit } => format!(
-                "tag {name} already exists on {remote} ({}) — run git fetch --tags and pick \
-                 another version",
+                "tag {name} already exists on {remote} ({}) — run git fetch --tags to release \
+                 that commit, or pick another version",
                 short(commit)
             ),
         }
@@ -721,6 +863,58 @@ mod tag_check_tests {
         };
         assert_eq!(tag_name(&v, Some(&cfg)), "release-1.0.1");
         assert_eq!(tag_name(&v, None), "v1.0.1");
+    }
+
+    #[test]
+    fn a_release_commit_must_be_on_the_branch_and_pushed_wherever_head_is() {
+        use super::release_gate;
+        use crate::config::VersioningConfig;
+        let dir = repo("gate");
+        git(&dir, &["branch", "-M", "main"]);
+        let origin = std::env::temp_dir().join("deliver-tagcheck-gate-origin");
+        let _ = std::fs::remove_dir_all(&origin);
+        git(&dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+        git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "-u", "origin", "main"]);
+        let pushed = head(&dir);
+        // An unpushed commit on main, then a feature branch with a dirty tree.
+        std::fs::write(dir.join("c"), "c").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "three"]);
+        let unpushed = head(&dir);
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("d"), "d").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "four"]);
+        let feature = head(&dir);
+        std::fs::write(dir.join("a"), "dirty").unwrap();
+
+        let rules = VersioningConfig {
+            require_clean: true,
+            require_pushed: true,
+            branch: Some("main".into()),
+            ..VersioningConfig::default()
+        };
+        assert_eq!(release_gate(&dir, Some(&rules), &pushed, false), Ok(()));
+        assert!(release_gate(&dir, Some(&rules), &unpushed, false)
+            .unwrap_err()
+            .contains("is not on origin/main — push it"));
+        assert!(release_gate(&dir, Some(&rules), &feature, false)
+            .unwrap_err()
+            .contains("is not on main"));
+        // Building in place, the rules are still about the checkout.
+        assert!(release_gate(&dir, Some(&rules), &pushed, true)
+            .unwrap_err()
+            .contains("working tree is dirty"));
+
+        let anywhere = VersioningConfig {
+            require_pushed: true,
+            ..VersioningConfig::default()
+        };
+        assert_eq!(release_gate(&dir, Some(&anywhere), &pushed, false), Ok(()));
+        assert!(release_gate(&dir, Some(&anywhere), &feature, false)
+            .unwrap_err()
+            .contains("not on any pushed branch"));
     }
 
     #[test]
