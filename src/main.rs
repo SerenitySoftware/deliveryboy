@@ -20,6 +20,7 @@ mod remote;
 mod rollback;
 mod secrets;
 mod shipping;
+mod symlink_swap;
 mod ui;
 mod verify;
 mod version;

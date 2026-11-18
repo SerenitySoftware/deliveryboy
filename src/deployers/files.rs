@@ -10,7 +10,7 @@
 //!
 //! The live path is **never emptied**. Everything is staged into a fresh release
 //! directory, sanity-checked, and only then swapped in with a single atomic
-//! `mv -T` of the symlink — so nginx never observes a missing or half-written
+//! rename of the symlink — so nginx never observes a missing or half-written
 //! webroot, and the previous release stays on disk to roll back to.
 //!
 //! (The old behavior — clean the live directory, then untar into it — had a
@@ -204,8 +204,11 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         ),
     ));
 
-    // The atomic switch. `ln -sfn` + `mv -T` replaces the symlink in one rename,
+    // The atomic switch replaces the symlink in one rename,
     // so readers (nginx) always see a complete tree — zero downtime.
+    let swap = crate::symlink_swap::SymlinkSwap::for_target(&ctx.target);
+    let guard = swap.guard(&live, sudo);
+    let mv = swap.command();
     let activate = format!(
         "set -e; \
          PREV=''; \
@@ -216,9 +219,10 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
            echo 'migrating pre-existing directory {live} into releases/'; \
            {sudo}mv {live} \"$PREV\"; \
          fi; \
-         printf '%s\\n' \"$PREV\" | {sudo}tee {prev_marker} >/dev/null; \
+         {guard}\
          {sudo}ln -sfn {rel} {live}.new; \
-         {sudo}mv -Tf {live}.new {live}; \
+         {sudo}{mv} {live}.new {live}; \
+         printf '%s\\n' \"$PREV\" | {sudo}tee {prev_marker} >/dev/null; \
          echo \"activated {stamp} (previous: ${{PREV:-none}})\""
     );
     // Undo: point the symlink back at whatever was live before. An empty
@@ -229,9 +233,10 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     let history = format!("{state}/.deliver/history.tsv");
     let undo = format!(
         "set -e; \
+         {guard}\
          PREV=$({sudo}cat {prev_marker} 2>/dev/null || true); \
          if [ -n \"$PREV\" ] && [ -d \"$PREV\" ]; then \
-           {sudo}ln -sfn \"$PREV\" {live}.rb; {sudo}mv -Tf {live}.rb {live}; \
+           {sudo}ln -sfn \"$PREV\" {live}.rb; {sudo}{mv} {live}.rb {live}; \
            echo \"rolled back {subdir} → $PREV\"; {record}; \
          elif [ -z \"$PREV\" ] && {sudo}test -f {prev_marker}; then \
            {sudo}rm -f {live}; \
@@ -327,4 +332,180 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     );
 
     Ok(steps)
+}
+
+#[cfg(all(test, unix))]
+mod swap_tests {
+    use super::*;
+    use crate::deployers::http_test_support::Context;
+    use std::{fs, os::unix::fs::symlink, process::Command};
+
+    fn run(command: &str) -> std::process::Output {
+        Command::new("sh").args(["-c", command]).output().unwrap()
+    }
+
+    #[test]
+    fn activation_and_undo_keep_sudo_and_ssh_gnu_flags() {
+        let mut fixture = Context::new();
+        fixture.ctx.sudo = true;
+        for method in ["local", "ssh"] {
+            fixture.ctx.target.method = method.into();
+            let cfg = serde_yaml::from_str("{src: fixture.tgz, unpack: true}").unwrap();
+            let steps = compile(&cfg, &fixture.ctx).unwrap();
+            let activate = steps
+                .iter()
+                .find(|s| s.label.starts_with("activate release"))
+                .unwrap();
+            let expected = if method == "local" && cfg!(target_os = "macos") {
+                "sudo /bin/mv -hf"
+            } else {
+                "sudo mv -Tf"
+            };
+            assert!(activate.detail().contains(expected));
+            assert!(activate.rollback.as_ref().unwrap().contains(expected));
+        }
+    }
+
+    #[test]
+    fn native_release_activation_and_undo_cover_all_destination_shapes() {
+        for shape in ["absent", "dangling", "link", "directory", "file"] {
+            let mut fixture = Context::new();
+            let root = fixture.ctx.repo_root.join("target");
+            fs::create_dir_all(root.join("releases/old")).unwrap();
+            fs::create_dir_all(root.join("releases/fixture-release")).unwrap();
+            fs::write(root.join("releases/old/index"), "old").unwrap();
+            fs::write(root.join("releases/fixture-release/index"), "new").unwrap();
+            fixture.ctx.target.dir = root.to_string_lossy().into();
+            let live = root.join("web");
+            match shape {
+                "dangling" => symlink(root.join("missing"), &live).unwrap(),
+                "link" => symlink(root.join("releases/old"), &live).unwrap(),
+                "directory" => {
+                    fs::create_dir(&live).unwrap();
+                    fs::write(live.join("index"), "old").unwrap();
+                }
+                "file" => fs::write(&live, "leave me").unwrap(),
+                _ => {}
+            }
+            let cfg = serde_yaml::from_str("{src: fixture.tgz, unpack: true, remote_subdir: web}")
+                .unwrap();
+            let steps = compile(&cfg, &fixture.ctx).unwrap();
+            let activate = steps
+                .iter()
+                .find(|s| s.label.starts_with("activate release"))
+                .unwrap();
+            let out = run(&activate.detail());
+            if shape == "file" {
+                assert!(!out.status.success());
+                assert_eq!(fs::read_to_string(&live).unwrap(), "leave me");
+                continue;
+            }
+            assert!(
+                out.status.success(),
+                "{shape}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(fs::read_to_string(live.join("index")).unwrap(), "new");
+            assert!(!root.join("web.new").exists());
+            let out = run(activate.rollback.as_ref().unwrap());
+            if shape == "dangling" {
+                assert!(!out.status.success());
+                assert_eq!(fs::read_to_string(live.join("index")).unwrap(), "new");
+                continue;
+            }
+            assert!(
+                out.status.success(),
+                "{shape}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if shape == "absent" {
+                assert!(!live.exists());
+                assert!(!live.is_symlink());
+            } else {
+                assert_eq!(fs::read_to_string(live.join("index")).unwrap(), "old");
+            }
+            assert!(!root.join("web.rb").exists());
+        }
+    }
+
+    #[test]
+    fn failed_activation_and_undo_moves_keep_live_marker_and_history() {
+        for stage in ["new", "rb"] {
+            let mut fixture = Context::new();
+            let root = fixture.ctx.repo_root.join("target");
+            fs::create_dir_all(root.join("releases/old")).unwrap();
+            fs::create_dir_all(root.join("releases/fixture-release")).unwrap();
+            fs::create_dir_all(root.join(".deliver")).unwrap();
+            fs::write(root.join("releases/old/index"), "old").unwrap();
+            fs::write(root.join(".deliver/history.tsv"), "history stays").unwrap();
+            fs::write(
+                root.join("releases/.deliver-previous"),
+                root.join("releases/old").to_str().unwrap(),
+            )
+            .unwrap();
+            symlink(root.join("releases/old"), root.join("web")).unwrap();
+            fs::create_dir(root.join(format!("web.{stage}"))).unwrap();
+            fixture.ctx.target.dir = root.to_str().unwrap().into();
+            let cfg = serde_yaml::from_str("{src: fixture.tgz, unpack: true, remote_subdir: web}")
+                .unwrap();
+            let steps = compile(&cfg, &fixture.ctx).unwrap();
+            let activate = steps
+                .iter()
+                .find(|s| s.label.starts_with("activate release"))
+                .unwrap();
+            let marker = fs::read(root.join("releases/.deliver-previous")).unwrap();
+            let command = if stage == "new" {
+                activate.detail()
+            } else {
+                activate.rollback.clone().unwrap()
+            };
+            let out = run(&command);
+            assert!(!out.status.success(), "{stage}: {command}");
+            assert_eq!(fs::read_to_string(root.join("web/index")).unwrap(), "old");
+            assert_eq!(
+                fs::read(root.join("releases/.deliver-previous")).unwrap(),
+                marker
+            );
+            assert_eq!(
+                fs::read_to_string(root.join(".deliver/history.tsv")).unwrap(),
+                "history stays"
+            );
+        }
+    }
+
+    #[test]
+    fn undo_refuses_a_real_directory_without_changing_state() {
+        let mut fixture = Context::new();
+        let root = fixture.ctx.repo_root.join("target");
+        fs::create_dir_all(root.join("releases/old")).unwrap();
+        fs::create_dir_all(root.join("web")).unwrap();
+        fs::write(root.join("web/index"), "untouched").unwrap();
+        fixture.ctx.target.dir = root.to_string_lossy().into();
+        let marker = root.join("releases/.deliver-previous");
+        fs::write(
+            &marker,
+            root.join("releases/old").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let cfg =
+            serde_yaml::from_str("{src: fixture.tgz, unpack: true, remote_subdir: web}").unwrap();
+        let steps = compile(&cfg, &fixture.ctx).unwrap();
+        let undo = steps.iter().find_map(|s| s.rollback.as_ref()).unwrap();
+        let before = fs::read(&marker).unwrap();
+        let out = run(undo);
+        assert!(!out.status.success());
+        assert_eq!(fs::read(&marker).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(root.join("web/index")).unwrap(),
+            "untouched"
+        );
+        assert!(!root.join("web/web.rb").exists());
+        // The first-release removal branch must refuse it too.
+        fs::write(&marker, "").unwrap();
+        assert!(!run(undo).status.success());
+        assert_eq!(
+            fs::read_to_string(root.join("web/index")).unwrap(),
+            "untouched"
+        );
+    }
 }
