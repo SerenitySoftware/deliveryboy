@@ -254,7 +254,7 @@ fronted by nginx can be pointed at the access log instead.
 
 ## Version rules
 
-Projects can refuse releases from the wrong branch, a dirty tree, or a commit that does not match its upstream:
+Projects can refuse releases from the wrong branch, or of a commit that has not been pushed:
 
 ```yaml
 versioning:
@@ -270,13 +270,18 @@ versioning:
 ```
 
 Tags are created only after the release and its checks succeed. The number is
-checked before anything ships: a `--version` or prompted number whose tag
-already sits on another commit — in this clone, or on the remote when
-`tag.push` is set — is refused up front, and the version prompt skips a taken
-number and offers the next free one, saying why.
+checked before anything ships. `--version` whose tag already exists in this
+clone releases the commit that tag names (see
+[`deliver deploy`](../commands/#deliver-deploy)); one whose tag only the remote
+has — asked when `tag.push` is set — is refused until it is fetched. A number
+chosen at the version prompt is a new release of `HEAD`: one whose tag already
+sits on another commit is refused up front, and the prompt skips a taken number
+and offers the next free one, saying why.
 `after_tag` commands run only after the tag exists and a configured tag push
 succeeds. They can publish artifacts that earlier steps placed in `{work}`.
 They run only for a full deploy, not one selected with `--service`. Make these
 commands safe to retry: the tag and any earlier public step may already exist.
 
-Use `versioning.require_clean` and `versioning.require_pushed` for production releases. They keep a local edit or an unpushed commit from becoming a release no one else can reproduce.
+A release is built from a clean copy of its commit (see [`deliver deploy`](../commands/#deliver-deploy)), so the rules are about that commit, wherever the checkout stands: `branch` requires it to be on that branch (locally or on the tag remote's copy), and `require_pushed` requires it to be on the branch's upstream — or, without `branch`, on any pushed branch. `require_clean` is met by construction, since uncommitted files never reach the copy. With `versioning.from: commit` or `commit-count`, which deploy the working tree, they keep their checkout meaning: the tree must be clean, on `branch`, and level with its upstream.
+
+Use `versioning.branch` and `versioning.require_pushed` for production releases. They keep an unmerged or unpushed commit from becoming a release no one else can reproduce.

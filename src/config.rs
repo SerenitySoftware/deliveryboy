@@ -587,13 +587,17 @@ pub struct VersioningConfig {
     /// tag (default) | commit | commit-count
     #[serde(default, alias = "from")]
     pub version_from: Option<String>,
-    /// Refuse a release from a dirty working tree.
+    /// Refuse a release from a dirty working tree. Met by construction for a
+    /// tagged release, which is built from a clean copy of its commit; it
+    /// applies to `from: commit`/`commit-count`, which build in place.
     #[serde(default)]
     pub require_clean: bool,
-    /// Refuse a release unless HEAD exactly matches its configured upstream.
+    /// Refuse a release whose commit is not on the release branch's upstream
+    /// (any pushed branch without `branch`). In place: HEAD must match it.
     #[serde(default)]
     pub require_pushed: bool,
-    /// Optional branch name required for a release (for example `main`).
+    /// Branch the release's commit must be on (for example `main`). In
+    /// place: the branch the checkout must be on.
     #[serde(default)]
     pub branch: Option<String>,
     #[serde(default)]
@@ -695,6 +699,63 @@ impl Config {
             .with_context(|| format!("unknown target '{name}'"))?;
         Ok((name, target.clone()))
     }
+
+    /// Pin the config's relative paths to this machine to `checkout`.
+    ///
+    /// A release runs in a clean copy of its commit (see `source`), so a
+    /// relative path would otherwise be read against the copy. Two of them name
+    /// things that are this machine's rather than the commit's: a `method:
+    /// local` target's `dir` — where the release lands, which must outlive the
+    /// copy — and an ssh `key`, which git ignores when it sits in the repo.
+    pub fn anchor_local_paths(&mut self, checkout: &Path) {
+        self.anchor_paths(&checkout.to_string_lossy(), cfg!(windows));
+    }
+
+    /// [`Config::anchor_local_paths`], with the platform's path rules passed
+    /// in so both can be tested anywhere. On Windows the checkout arrives
+    /// canonicalized (`\\?\C:\…`, see `discover`), a form `sh` cannot use, and a
+    /// local `dir` gets the forward slashes `load` gives every local `dir`.
+    fn anchor_paths(&mut self, checkout: &str, windows: bool) {
+        let checkout = if windows {
+            without_verbatim(checkout)
+        } else {
+            checkout.to_string()
+        };
+        let separator = if windows { '\\' } else { '/' };
+        let anchored = |path: &str| {
+            let absolute = path.starts_with('~')
+                || path.starts_with(['/', '\\'])
+                || (windows && path.as_bytes().get(1) == Some(&b':'));
+            (!absolute).then(|| {
+                format!(
+                    "{}{separator}{path}",
+                    checkout.trim_end_matches(['/', '\\'])
+                )
+            })
+        };
+        for target in self.targets.values_mut() {
+            if target.is_local() {
+                if let Some(dir) = anchored(&target.dir) {
+                    target.dir = sh_path(&dir, windows);
+                }
+            }
+            if let Some(key) = target.ssh.key.as_deref().and_then(anchored) {
+                target.ssh.key = Some(key);
+            }
+        }
+    }
+}
+
+/// A Windows path without the verbatim prefix `canonicalize` adds:
+/// `\\?\C:\x` is `C:\x`, and `\\?\UNC\server\share` is `\\server\share`.
+fn without_verbatim(path: &str) -> String {
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(share) => format!(r"\\{share}"),
+            None => rest.to_string(),
+        },
+        None => path.to_string(),
+    }
 }
 
 pub fn load(path: &Path) -> Result<Config> {
@@ -784,6 +845,56 @@ mod sh_path_tests {
     fn a_unix_path_is_left_exactly_as_written() {
         // A backslash is a legal (if odd) character in a unix file name.
         assert_eq!(sh_path(r"/srv/odd\name", false), r"/srv/odd\name");
+    }
+
+    fn anchored(checkout: &str, windows: bool) -> super::Config {
+        let mut config: super::Config = serde_yaml::from_str(
+            r#"
+version: 1
+app: demo
+targets:
+  here: {method: local, dir: dest, ssh: {key: deploy.pem}}
+  there: {method: local, dir: /srv/demo, ssh: {key: ~/.ssh/demo}}
+  box: {host: box.example.md, dir: srv, ssh: {key: keys/box.pem}}
+services: {}
+"#,
+        )
+        .unwrap();
+        config.anchor_paths(checkout, windows);
+        config
+    }
+
+    #[test]
+    fn relative_local_paths_are_pinned_to_the_checkout() {
+        let config = anchored("/home/me/app", false);
+        assert_eq!(config.targets["here"].dir, "/home/me/app/dest");
+        assert_eq!(
+            config.targets["here"].ssh.key.as_deref(),
+            Some("/home/me/app/deploy.pem")
+        );
+        assert_eq!(config.targets["there"].dir, "/srv/demo");
+        assert_eq!(
+            config.targets["there"].ssh.key.as_deref(),
+            Some("~/.ssh/demo")
+        );
+        // A remote target's dir is on the remote, not here.
+        assert_eq!(config.targets["box"].dir, "srv");
+        assert_eq!(
+            config.targets["box"].ssh.key.as_deref(),
+            Some("/home/me/app/keys/box.pem")
+        );
+    }
+
+    #[test]
+    fn a_canonical_windows_checkout_reaches_sh_as_a_plain_path() {
+        let config = anchored(r"\\?\C:\Users\me\app", true);
+        assert_eq!(config.targets["here"].dir, "C:/Users/me/app/dest");
+        assert_eq!(
+            config.targets["here"].ssh.key.as_deref(),
+            Some(r"C:\Users\me\app\deploy.pem")
+        );
+        let config = anchored(r"\\?\UNC\server\share\app", true);
+        assert_eq!(config.targets["here"].dir, "//server/share/app/dest");
     }
 }
 

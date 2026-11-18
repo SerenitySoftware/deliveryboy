@@ -20,6 +20,7 @@ mod remote;
 mod rollback;
 mod secrets;
 mod shipping;
+mod source;
 mod symlink_swap;
 mod ui;
 mod verify;
@@ -759,19 +760,27 @@ fn release_named(root: &Path, v: version::DeployVersion, wanted: &str) -> versio
 }
 
 /// Say when the tag this release would get already names another commit. A
-/// preview (`plan`, `--dry-run`) only warns; a deploy refuses (see
-/// `resolve_release`).
+/// preview (`plan`, `--dry-run`) only warns. A deploy with `--version`
+/// releases the commit a local tag names (see `release_commit`), and refuses
+/// one only the remote has (see `resolve_release`).
 fn warn_if_tag_taken(root: &Path, v: &version::DeployVersion, tag_cfg: Option<&config::TagConfig>) {
     let name = version::tag_name(v, tag_cfg);
     let check = version::check_tag(root, &name, &v.git.sha, tag_cfg);
     if let Some(warning) = check.warning {
         ui::warn(warning);
     }
-    if let Some(clash) = check.clash {
-        ui::warn(format!(
+    match check.clash {
+        Some(version::TagClash::Local { commit }) => ui::warn(format!(
+            "tag {name} already names {} — `deliver deploy --version` releases that commit, \
+             not this plan's {}",
+            &commit[..7.min(commit.len())],
+            v.git.short_sha
+        )),
+        Some(clash) => ui::warn(format!(
             "{} — a deploy with this number would be refused",
             clash.refusal(&name)
-        ));
+        )),
+        None => {}
     }
 }
 
@@ -806,7 +815,10 @@ fn resolve_release(
 
     // A tag on HEAD is confirmed later, by `shipping_approved`, once the
     // target has been read and the prompt can say what the release ships.
-    if v.release.is_some() {
+    // `--version` is the operator's answer already: the release is the number
+    // given, built from the commit its tag names (see `release_commit`), even
+    // when that commit carries other tags too.
+    if v.release.is_some() && version_arg.is_none() {
         return Ok(Resolved::Release(v));
     }
 
@@ -996,6 +1008,16 @@ fn cmd_secrets(explicit: ConfigArgs<'_>, action: &Option<SecretsAction>) -> Resu
     }
 }
 
+/// Runs `git worktree prune` in the checkout when dropped, on every path out
+/// of `cmd_clean`.
+struct Prune(PathBuf);
+
+impl Drop for Prune {
+    fn drop(&mut self) {
+        source::prune(&self.0);
+    }
+}
+
 /// Remove the local work directory. Deploys clean up after themselves on
 /// success; this is for when one failed and left artifacts behind.
 fn cmd_clean(explicit: ConfigArgs<'_>) -> Result<i32> {
@@ -1003,6 +1025,9 @@ fn cmd_clean(explicit: ConfigArgs<'_>) -> Result<i32> {
     let path = config::resolve(explicit.path)?;
     let config = config::load(&path)?;
     let scratch = version::scratch_root(&config.app);
+    // A release killed mid-run leaves its clean copy registered as a git
+    // worktree; once the directory below is gone, git can forget it.
+    let _forget = Prune(repo_root(&path));
     ui::phase("Cleaning");
     ui::detail(format!("scratch: {}", scratch.display()));
     if !scratch.exists() {
@@ -1021,7 +1046,7 @@ fn cmd_clean(explicit: ConfigArgs<'_>) -> Result<i32> {
 fn cmd_validate(explicit: ConfigArgs<'_>) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
-    let v = version_announced(&config, &repo_root(&path));
+    let v = version_announced(&config, &repo_root(&path), None);
     ui::phase("Validating");
     ui::ok("schema and references are valid");
     ui::detail(format!(
@@ -1070,9 +1095,21 @@ fn load_announced(explicit: ConfigArgs<'_>) -> Result<(config::Config, PathBuf)>
 
 /// Resolve this deploy's identity: Delivery Boy's own deploy id, plus the app's
 /// release number. Reported up front so you know what you're about to ship.
-fn version_announced(config: &config::Config, root: &Path) -> version::DeployVersion {
-    let release_cfg = config.versioning.as_ref();
-    let v = version::resolve(root, release_cfg.and_then(|r| r.version_from.as_deref()));
+/// `built_from` is the commit a release is built from (see `release_commit`);
+/// `None` describes HEAD and the working tree.
+fn version_announced(
+    config: &config::Config,
+    root: &Path,
+    built_from: Option<&str>,
+) -> version::DeployVersion {
+    let from = config
+        .versioning
+        .as_ref()
+        .and_then(|r| r.version_from.as_deref());
+    let v = match built_from {
+        Some(commit) => version::resolve_at(root, from, commit),
+        None => version::resolve(root, from),
+    };
     ui::phase("Versioning");
     ui::detail(format!("deploy version: {}", v.id));
     ui::detail(v.describe());
@@ -1150,15 +1187,18 @@ fn report_exposure(exposed: &[secrets::Exposure]) -> usize {
     tracked
 }
 
-/// Phase: compile the plan, reporting its size.
+/// Phase: compile the plan, reporting its size. Files are read from `root`;
+/// secrets from `secrets_root` — the checkout, when `root` is a release's
+/// clean copy of its commit.
 fn compile_announced(
     config: &config::Config,
     only: &[String],
     root: &Path,
+    secrets_root: &Path,
     version: &version::DeployVersion,
 ) -> Result<Vec<plan::ServicePlan>> {
     ui::phase("Compiling plan");
-    let compiled = plan::build(config, only, root, version)?;
+    let compiled = plan::build_from(config, only, root, secrets_root, version)?;
     let steps: usize = compiled.iter().map(|sp| sp.steps.len()).sum();
     ui::detail(format!(
         "{} service(s), {steps} step(s): {}",
@@ -1247,18 +1287,36 @@ fn compile_reported(
 }
 
 /// Phase: preflight. Returns false when it found problems.
+///
+/// `checkout` is set when `root` is a release's clean copy of its commit: a
+/// file the config names that is missing from the commit but present in the
+/// checkout is uncommitted or ignored by git, and the problem says so.
 fn preflight_announced(
     config: &config::Config,
     compiled: &[plan::ServicePlan],
     root: &Path,
     check_remote: bool,
     unplanned: &Unplanned,
+    checkout: Option<&Path>,
 ) -> bool {
     ui::phase("Preflight");
     if !check_remote {
         ui::detail("(dry run — skipping remote reachability)");
     }
     let mut report = preflight::run(config, compiled, root, check_remote, &unplanned.hosts);
+    if let Some(checkout) = checkout {
+        for problem in report.problems.iter_mut() {
+            let only_here = problem
+                .strip_prefix(preflight::MISSING_FILE)
+                .is_some_and(|rel| checkout.join(rel).exists());
+            if only_here {
+                problem.push_str(
+                    " — it is in this checkout but not in the release commit; a release ships \
+                     only committed files, so commit it or have a step build it",
+                );
+            }
+        }
+    }
     // First, because everything after it is downstream of a plan that compiles.
     for problem in unplanned.problems.iter().rev() {
         report.problems.insert(0, problem.clone());
@@ -1285,7 +1343,7 @@ fn cmd_plan(
     ui::banner();
     let (config, path) = load_announced(explicit)?;
     let root = repo_root(&path);
-    let mut v = version_announced(&config, &root);
+    let mut v = version_announced(&config, &root, None);
     if let Some(wanted) = version_arg {
         v = release_named(&root, v, wanted);
         ui::detail(format!("planned release: {}", v.release_display()));
@@ -1295,7 +1353,7 @@ fn cmd_plan(
             config.versioning.as_ref().and_then(|r| r.tag.as_ref()),
         );
     }
-    let compiled = compile_announced(&config, only, &root, &v)?;
+    let compiled = compile_announced(&config, only, &root, &root, &v)?;
     if json {
         println!(
             "{}",
@@ -1408,6 +1466,162 @@ fn shipping_approved(
     Ok(prompt_yes_no(&question)?.unwrap_or(true))
 }
 
+/// The commit a deploy builds and ships, or `None` to build in the working
+/// tree.
+///
+/// A release numbered by a tag — the default `versioning.from` — is a commit:
+/// the one `--version`'s tag already names (`deploy --version 1.2.3` after
+/// tagging main), else HEAD's, which the release is tagged on once it is live.
+/// `from: commit` and `commit-count` deploy the working tree as they always
+/// have, as does a directory git does not track or a repo with no commits.
+fn release_commit(
+    config: &config::Config,
+    root: &Path,
+    version_arg: Option<&str>,
+) -> Option<Commit> {
+    let from = config
+        .versioning
+        .as_ref()
+        .and_then(|r| r.version_from.as_deref());
+    if matches!(from, Some("commit" | "commit-count")) {
+        return None;
+    }
+    source::repo_prefix(root)?;
+    let head = version::head_commit(root)?;
+    let Some(wanted) = version_arg else {
+        return Some(Commit {
+            sha: head,
+            tagged_as: None,
+        });
+    };
+    let name = release_tag_name(config, root, &head, wanted);
+    Some(match version::tag_commit(root, &name) {
+        Some(sha) => Commit {
+            sha,
+            tagged_as: Some(name),
+        },
+        None => Commit {
+            sha: head,
+            tagged_as: None,
+        },
+    })
+}
+
+/// The commit a release is built from, and the tag that named it when
+/// `--version` found one.
+struct Commit {
+    sha: String,
+    tagged_as: Option<String>,
+}
+
+/// The tag `config` gives release `wanted` (its `tag.name` template).
+fn release_tag_name(config: &config::Config, root: &Path, commit: &str, wanted: &str) -> String {
+    let from = config
+        .versioning
+        .as_ref()
+        .and_then(|r| r.version_from.as_deref());
+    let named = release_named(root, version::resolve_at(root, from, commit), wanted);
+    version::tag_name(
+        &named,
+        config.versioning.as_ref().and_then(|r| r.tag.as_ref()),
+    )
+}
+
+/// Check out `commit` cleanly in Delivery Boy's scratch directory and move the
+/// process into it, so every step builds and ships the commit and nothing
+/// else. Returns the copy and the config as the commit has it, or `None` when
+/// the run must stop (having said why).
+///
+/// The commit's own config, because how a release is built is part of the
+/// release: an uncommitted edit to `.deliver.yml` in the checkout is no more
+/// part of it than an uncommitted edit to the code. Secrets and relative ssh
+/// keys are still read from the checkout (`anchor_local_paths`), where a
+/// gitignored `.env.deploy` lives.
+fn enter_release_copy(
+    config: &config::Config,
+    config_path: &Path,
+    root: &Path,
+    built_from: &Commit,
+    version_arg: Option<&str>,
+    target: Option<&str>,
+    dry_run: bool,
+) -> Result<Option<(source::Export, config::Config)>> {
+    ui::phase("Release source");
+    let commit = built_from.sha.as_str();
+    let short = &commit[..7.min(commit.len())];
+    if let Some(tag) = &built_from.tagged_as {
+        ui::detail(format!("{tag} names commit {short}"));
+    }
+    let dir =
+        version::scratch_root(&config.app).join(format!("source-{short}-{}", std::process::id()));
+    let mut copy = source::Export::create(root, commit, &dir)?;
+    ui::detail(format!(
+        "commit {short}, checked out clean: {}",
+        copy.root.display()
+    ));
+    let here = version::git_info(root);
+    if here.sha != commit {
+        let at = match here.branch.as_deref() {
+            None | Some("HEAD") => "a detached HEAD".to_string(),
+            Some(branch) => branch.to_string(),
+        };
+        ui::detail(format!(
+            "this checkout is at {at} ({}) — that is not what ships",
+            here.short_sha
+        ));
+    }
+    if here.dirty {
+        ui::detail("this checkout's uncommitted and untracked files are not part of the release");
+    }
+
+    let rel = config_path.strip_prefix(root).unwrap_or(config_path);
+    let committed = copy.root.join(rel);
+    if !committed.is_file() {
+        ui::phase("Aborted");
+        ui::note(format!(
+            "{} is not in commit {short} — a release is built from its commit, config included; \
+             commit it first.",
+            rel.display()
+        ));
+        ui::note("nothing was built, shipped, or changed.");
+        return Ok(None);
+    }
+    let mut release_config = config::load(&committed)?;
+    if let Some(name) = target {
+        release_config.select_target(name)?;
+    }
+    release_config.anchor_local_paths(root);
+    // The commit was found by the tag this checkout's `tag.name` gives the
+    // version; the release is tagged by the commit's own. Two names for one
+    // release would leave the second pointing nowhere anyone looks.
+    if let (Some(found), Some(wanted)) = (&built_from.tagged_as, version_arg) {
+        let own = release_tag_name(&release_config, root, commit, wanted);
+        if own != *found {
+            ui::phase("Aborted");
+            ui::note(format!(
+                "{found} names commit {short}, but that commit's own config tags this release \
+                 {own} — make the two `tag.name`s agree, or tag {short} as {own}."
+            ));
+            ui::note("nothing was built, shipped, or changed.");
+            return Ok(None);
+        }
+    }
+    if std::fs::read(config_path).ok() != std::fs::read(&committed).ok() {
+        ui::note(format!(
+            "using {} as commit {short} has it — this checkout's copy differs",
+            rel.display()
+        ));
+        // Its secrets were checked; these are the ones the release will use.
+        if !secrets_announced(&release_config, root) && !dry_run {
+            ui::phase("Aborted");
+            ui::note("secrets not ready — nothing was tagged, built, or changed.");
+            return Ok(None);
+        }
+    }
+    copy.enter()?;
+    Ok(Some((copy, release_config)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_deploy(
     explicit: ConfigArgs<'_>,
@@ -1422,6 +1636,8 @@ fn cmd_deploy(
     ui::banner();
     let timer = ui::Timer::start();
     let (config, path) = load_announced(explicit)?;
+    // Absolute before anything moves the working directory (`source::Export`).
+    let path = std::path::absolute(&path)?;
     let root = repo_root(&path);
 
     // Before anything is tagged, built, or shipped.
@@ -1431,15 +1647,57 @@ fn cmd_deploy(
         return Ok(2);
     }
 
+    // A tagged release is built from a clean copy of its commit, whatever state
+    // this checkout is in; from here on `config` is the commit's own, files are
+    // read from `build_root`, and secrets and git from `root`. The copy lives
+    // until this function returns, after the deploy lock is given back.
+    let built_from = if verify_only {
+        None
+    } else {
+        release_commit(&config, &root, version_arg)
+    };
+    let mut copy = None;
+    let config = match &built_from {
+        None => config,
+        Some(commit) => {
+            match enter_release_copy(
+                &config,
+                &path,
+                &root,
+                commit,
+                version_arg,
+                explicit.target,
+                dry_run,
+            )? {
+                Some((entered, config)) => {
+                    copy = Some(entered);
+                    config
+                }
+                None => return Ok(2),
+            }
+        }
+    };
+    let build_root = copy
+        .as_ref()
+        .map(|c: &source::Export| c.root.clone())
+        .unwrap_or_else(|| root.clone());
+
     if !dry_run && !verify_only {
-        if let Err(reason) = version::release_gate(&root, config.versioning.as_ref()) {
+        let commit = built_from.as_ref().map_or("", |c| c.sha.as_str());
+        if let Err(reason) = version::release_gate(
+            &root,
+            config.versioning.as_ref(),
+            commit,
+            built_from.is_none(),
+        ) {
             ui::phase("Aborted");
             ui::note(reason);
+            ui::note("nothing was built, shipped, or changed.");
             return Ok(2);
         }
     }
 
-    let v = version_announced(&config, &root);
+    let v = version_announced(&config, &root, built_from.as_ref().map(|c| c.sha.as_str()));
     let tag_cfg = config.versioning.as_ref().and_then(|r| r.tag.as_ref());
     // `verify` ships nothing, so it needs no release of its own: it checks
     // whatever is live, on any commit, tagged or not.
@@ -1461,7 +1719,7 @@ fn cmd_deploy(
         }
         Resolved::Cancelled => return Ok(0),
     };
-    let mut plan = compile_announced(&config, only, &root, &v)?;
+    let mut plan = compile_announced(&config, only, &build_root, &root, &v)?;
     // `--no-soak` for a scripted run; and `verify` always, since it checks
     // what is live once rather than watching a release it just shipped.
     if no_soak {
@@ -1482,7 +1740,14 @@ fn cmd_deploy(
     }
 
     // Preflight before anything is built or shipped.
-    if !preflight_announced(&config, &plan, &root, !dry_run, &Unplanned::default()) {
+    if !preflight_announced(
+        &config,
+        &plan,
+        &build_root,
+        !dry_run,
+        &Unplanned::default(),
+        copy.as_ref().map(|_| root.as_path()),
+    ) {
         ui::phase("Aborted");
         ui::note("preflight failed — nothing was built, shipped, or changed.");
         return Ok(2);
@@ -2012,7 +2277,7 @@ fn cmd_rollback(explicit: ConfigArgs<'_>, only: &[String], how: RollbackRun) -> 
             .as_ref()
             .and_then(|r| r.version_from.as_deref()),
     );
-    let plan = compile_announced(&config, only, &root, &v)?;
+    let plan = compile_announced(&config, only, &root, &root, &v)?;
 
     let reversible: Vec<&plan::ServicePlan> = plan
         .iter()
@@ -2388,14 +2653,20 @@ fn cmd_preflight(explicit: ConfigArgs<'_>, only: &[String]) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
     let secrets_ok = secrets_announced(&config, &repo_root(&path));
-    let v = version_announced(&config, &repo_root(&path));
+    let v = version_announced(&config, &repo_root(&path), None);
     // A plan that will not compile is a *finding* here, not a fatal error:
     // preflight is the command whose whole job is to list everything wrong at
     // once, and an operator who is also missing `hugo` or cannot reach the box
     // should learn that now rather than on the next run.
     let (compiled, unplanned) = compile_reported(&config, only, &repo_root(&path), &v);
-    let ok =
-        preflight_announced(&config, &compiled, &repo_root(&path), true, &unplanned) && secrets_ok;
+    let ok = preflight_announced(
+        &config,
+        &compiled,
+        &repo_root(&path),
+        true,
+        &unplanned,
+        None,
+    ) && secrets_ok;
     ui::phase(if ok { "Done" } else { "Failed" });
     if ok {
         ui::ok("ready to deploy");

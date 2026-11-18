@@ -92,6 +92,8 @@ deliver deploy --version 1.2.3
 
 `--service NAME` can be repeated. `--version` supplies the release version without a prompt. `--yes` accepts a tag already present on `HEAD`; it does not invent an untagged release.
 
+A release is built from its commit, not from the folder `deploy` runs in. When `--version`'s tag already exists (`git tag -a v1.2.3 -m v1.2.3 main`, then `deliver deploy --version 1.2.3`), the release is the commit that tag names; otherwise it is `HEAD`'s commit, tagged once the release is live when `versioning.tag` is on. `deploy` checks that commit out cleanly with `git worktree` in its own scratch directory, uses the commit's own `.deliver.yml`, runs every step there, and removes the copy when it finishes. Uncommitted or untracked files, another branch or a detached `HEAD` in the checkout never reach the target; the "Release source" phase says when the checkout differs from what ships. What git ignores is read from the checkout instead: secrets providers such as `file: .env.deploy`, a relative `ssh.key`, and a relative `dir` of a `method: local` target. A file the config ships has to be committed — or built by a step — to be in the release, and preflight says so when it is only in the checkout. `versioning.from: commit` and `commit-count` still deploy the working tree, and `plan`, `preflight` and `validate` read the checkout.
+
 After preflight, `deploy` reads what each target has live and lists the commits it is about to ship — `git log <live>..HEAD`, from the sha the last deploy recorded — and a tag found on `HEAD` is confirmed with that range in the question: `Deploy release v1.2.3 (abc1234), shipping 7 commit(s) since live v1.2.2 (def4567)?`. It also says when a deploy re-ships the live commit or moves the target backwards. The range covers the services that keep a deploy record (`files`, `hugo`, `docker-compose`); a dry run reads only `method: local` targets, as it skips remote reachability in preflight. An unreadable target or a live commit this clone does not have is reported, never fatal.
 
 A service with a [`soak:`](../configuration/#soak) window keeps `deploy` attached after the release is live, re-running its checks until the window closes; a failure inside it rolls back like any failed check. `--no-soak` skips the windows (the checks still run once).
@@ -254,7 +256,7 @@ Show every declared secret and whether a configured provider can resolve it. Val
 
 ## `deliver clean`
 
-Remove Delivery Boy build artifacts from the system temporary directory.
+Remove Delivery Boy build artifacts from the system temporary directory, and forget the clean copy (`git worktree prune`) of any release that was killed before it could remove its own.
 
 ## Exit codes
 
