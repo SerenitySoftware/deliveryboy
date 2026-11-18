@@ -8,7 +8,8 @@
 //! <target.dir>/<subdir>  ->  releases/<stamp>     (symlink, flipped atomically)
 //! ```
 //!
-//! The live path is **never emptied**. Everything is staged into a fresh release
+//! For established symlink releases, the live path is never emptied. Everything
+//! is staged into a fresh release
 //! directory, sanity-checked, and only then swapped in with a single atomic
 //! rename of the symlink — so nginx never observes a missing or half-written
 //! webroot, and the previous release stays on disk to roll back to.
@@ -395,7 +396,9 @@ mod swap_tests {
                 .find(|s| s.label.starts_with("activate release"))
                 .unwrap();
             let out = run(&activate.detail());
-            if shape == "file" {
+            // Preserve GNU replacement of regular files; the scoped BSD guard
+            // deliberately refuses every existing non-symlink.
+            if shape == "file" && cfg!(target_os = "macos") {
                 assert!(!out.status.success());
                 assert_eq!(fs::read_to_string(&live).unwrap(), "leave me");
                 continue;
@@ -418,7 +421,7 @@ mod swap_tests {
                 "{shape}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            if shape == "absent" {
+            if shape == "absent" || shape == "file" {
                 assert!(!live.exists());
                 assert!(!live.is_symlink());
             } else {
