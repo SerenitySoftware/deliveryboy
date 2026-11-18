@@ -18,6 +18,10 @@ A directory is packaged and released atomically. With `build:`, `src` is the bui
 
 Old releases are pruned to `keep_releases` (default 5) after the service's `verify:` checks pass, never before them, and a failed release prunes nothing. The live release and the one `.deliver-previous` names are always spared on top of that count, so a rollback — automatic or `deliver rollback --to` — always has somewhere to go, even with `keep_releases: 1`.
 
+Local file and Hugo releases on macOS use the built-in `/bin/mv` for activation and both forms of rollback; GNU coreutils is not required. SSH targets still use GNU `mv -T` on the remote host. This does not add remote macOS or native Windows release support.
+
+Before a local macOS swap, Delivery Boy refuses an existing live path that is not a symlink, except for the first activation's directory migration. Keep other writers away from that path: a process outside Delivery Boy's lock can replace it between this check and the rename. The check cannot provide GNU `-T`'s refusal of a directory introduced during that interval. Established symlinks switch with one rename; the initial directory migration still has a gap.
+
 ## `docker-compose`
 
 Build an image locally, ship it as a tarball or through a registry, preserve the Compose files byte-for-byte, start infrastructure, run release commands, and check the live service.
