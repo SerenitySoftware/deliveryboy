@@ -10676,3 +10676,248 @@ fn a_release_whose_commit_names_its_tag_differently_is_refused() {
     assert!(!dir.join("dest").join("payload.txt").exists(), "{text}");
     assert!(!tag_exists(&dir, "v1.0.1"), "{text}");
 }
+
+// Nested Compose layouts: real CLI and local temp targets, stub Docker only.
+#[cfg(unix)]
+fn nested_compose_repo(name: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, live, path) = compose_snapshot_repo(name);
+    std::fs::create_dir_all(dir.join("deploy/assets")).unwrap();
+    std::fs::create_dir_all(dir.join("override")).unwrap();
+    std::fs::rename(
+        dir.join("docker-compose.yml"),
+        dir.join("deploy/compose.yml"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("override/compose.yml"), "services: {}\n").unwrap();
+    std::fs::write(dir.join("deploy/assets/rules.txt"), "one\n").unwrap();
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(dir.join(".deliver.yml"), cfg.replace(
+        "files: [docker-compose.yml]",
+        "files: [./deploy/compose.yml, override/compose.yml]\n      include: [deploy/assets/rules.txt]"
+    )).unwrap();
+    let stub = dir.join("bin/docker");
+    std::fs::write(
+        &stub,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$PWD: $*" >> {0}/docker.log
+previous=
+for arg in "$@"; do
+  if [ "$previous" = '-f' ] && [ ! -f "$arg" ]; then
+    echo "missing compose input: $arg" >&2; exit 1
+  fi
+  previous=$arg
+done
+case "$*" in *' exec '*) test ! -e {0}/fail-health;; *) exit 0;; esac
+"#,
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    commit_all(&dir, "nested fixture");
+    (dir, live, path)
+}
+
+#[cfg(unix)]
+fn change_nested_release(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("deploy/compose.yml"),
+        "services:\n  web:\n    image: nginx:1.27\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("deploy/assets/rules.txt"), "two\n").unwrap();
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        cfg.replace("MODE: one", "MODE: two"),
+    )
+    .unwrap();
+    commit_all(dir, "nested release two");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_compose_ships_distinct_basenames_and_unwinds_failed_release() {
+    let (dir, live, path) = nested_compose_repo("nested-compose-unwind");
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
+    assert!(ok, "{text}");
+    assert!(live.join("deploy/compose.yml").is_file());
+    assert_eq!(
+        std::fs::read_to_string(live.join("override/compose.yml")).unwrap(),
+        "services: {}\n"
+    );
+    assert!(!live.join("compose.yml").exists());
+    change_nested_release(&dir);
+    std::fs::write(dir.join("fail-health"), "").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("rolled back to the previous config"),
+        "{text}"
+    );
+    assert!(std::fs::read_to_string(live.join("deploy/compose.yml"))
+        .unwrap()
+        .contains("nginx:1.25"));
+    assert_eq!(
+        std::fs::read_to_string(live.join("deploy/assets/rules.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(std::fs::read_to_string(live.join(".env"))
+        .unwrap()
+        .contains("MODE='one'"));
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_compose_rollback_recreates_missing_parents() {
+    let (dir, live, path) = nested_compose_repo("nested-compose-rollback");
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
+    assert!(ok, "{text}");
+    change_nested_release(&dir);
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+    assert!(ok, "{text}");
+    std::fs::remove_dir_all(live.join("deploy")).unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["rollback", "-y"]);
+    assert!(ok, "{text}");
+    assert!(std::fs::read_to_string(live.join("deploy/compose.yml"))
+        .unwrap()
+        .contains("nginx:1.25"));
+    assert_eq!(
+        std::fs::read_to_string(live.join("deploy/assets/rules.txt")).unwrap(),
+        "one\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_compose_refuses_flat_legacy_target_without_target_changes() {
+    let (dir, live, path) = nested_compose_repo("nested-compose-flat");
+    std::fs::write(live.join("compose.yml"), "legacy bytes\n").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
+    assert!(
+        !ok && text.contains("legacy flattened nested layout"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(live.join("compose.yml")).unwrap(),
+        "legacy bytes\n"
+    );
+    assert!(!live.join(".deliver").exists());
+    assert!(!live.join("deploy").exists());
+    let log = std::fs::read_to_string(dir.join("docker.log")).unwrap_or_default();
+    assert!(
+        !log.contains(&format!("{}:", live.display())),
+        "target docker ran: {log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_compose_refuses_legacy_or_corrupt_snapshot_before_rollback() {
+    for corrupt in [false, true] {
+        let (dir, live, path) = nested_compose_repo(if corrupt {
+            "nested-compose-corrupt"
+        } else {
+            "nested-compose-legacy"
+        });
+        let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
+        assert!(ok, "{text}");
+        change_nested_release(&dir);
+        let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+        assert!(ok, "{text}");
+        for snapshot in std::fs::read_dir(live.join(".deliver/config")).unwrap() {
+            let marker = snapshot.unwrap().path().join(".layout-v1");
+            if corrupt {
+                std::fs::write(marker, "corrupt").unwrap();
+            } else {
+                std::fs::remove_file(marker).unwrap();
+            }
+        }
+        let before = std::fs::read(live.join("deploy/compose.yml")).unwrap();
+        let history = std::fs::read(live.join(".deliver/history.tsv")).unwrap();
+        std::fs::write(dir.join("docker.log"), "").unwrap();
+        let (ok, text) = deliver_with_path(&dir, &path, &["rollback", "-y"]);
+        assert!(!ok, "{text}");
+        assert!(
+            text.contains(if corrupt {
+                "snapshot layout mismatch"
+            } else {
+                "legacy nested config snapshot"
+            }),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read(live.join("deploy/compose.yml")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(live.join(".deliver/history.tsv")).unwrap(),
+            history
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("docker.log")).unwrap(), "");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_compose_first_failure_removes_only_shipped_paths() {
+    let (dir, live, path) = nested_compose_repo("nested-compose-first-failure");
+    std::fs::write(live.join("keep.txt"), "keep").unwrap();
+    std::fs::create_dir_all(live.join("deploy/assets")).unwrap();
+    std::fs::write(live.join("deploy/assets/rules.txt"), "existing rules").unwrap();
+    std::fs::write(live.join(".env"), "existing env").unwrap();
+    std::fs::write(dir.join("fail-health"), "").unwrap();
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
+    assert!(!ok, "{text}");
+    assert!(text.contains("first release: brought snap down"), "{text}");
+    assert!(!live.join("deploy/compose.yml").exists());
+    assert!(!live.join("override/compose.yml").exists());
+    assert_eq!(
+        std::fs::read_to_string(live.join(".env")).unwrap(),
+        "existing env"
+    );
+    assert_eq!(
+        std::fs::read_to_string(live.join("deploy/assets/rules.txt")).unwrap(),
+        "existing rules"
+    );
+    assert_eq!(
+        std::fs::read_to_string(live.join("keep.txt")).unwrap(),
+        "keep"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_compose_executes_paths_with_spaces_and_quotes() {
+    let (dir, live, path) = nested_compose_repo("nested-compose-quotes");
+    std::fs::create_dir_all(dir.join("deploy dir")).unwrap();
+    let file = "deploy dir/it's compose.yml";
+    std::fs::rename(dir.join("deploy/compose.yml"), dir.join(file)).unwrap();
+    let cfg = std::fs::read_to_string(dir.join(".deliver.yml")).unwrap();
+    std::fs::write(
+        dir.join(".deliver.yml"),
+        cfg.replace(
+            "./deploy/compose.yml",
+            &serde_json::to_string(file).unwrap(),
+        ),
+    )
+    .unwrap();
+    commit_all(&dir, "quoted nested fixture");
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "1.0.1"]);
+    assert!(ok, "{text}");
+    assert!(std::fs::read_to_string(live.join(file))
+        .unwrap()
+        .contains("nginx:1.25"));
+    std::fs::write(dir.join(file), "services:\n  web:\n    image: nginx:1.27\n").unwrap();
+    change_nested_release(&dir);
+    let (ok, text) = deliver_with_path(&dir, &path, &["deploy", "--version", "2.0.0"]);
+    assert!(ok, "{text}");
+    let (ok, text) = deliver_with_path(&dir, &path, &["rollback", "-y"]);
+    assert!(ok, "{text}");
+    assert!(std::fs::read_to_string(live.join(file))
+        .unwrap()
+        .contains("nginx:1.25"));
+}
