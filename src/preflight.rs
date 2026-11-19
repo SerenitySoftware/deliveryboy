@@ -715,7 +715,7 @@ mod tests {
             project: "demo".into(),
             files: vec!["deploy/compose.yml".into()],
             layout: vec![
-                ("deploy/compose.yml".into(), "compose.yml".into()),
+                ("deploy/compose.yml".into(), "deploy/compose.yml".into()),
                 ("conf/rules".into(), "conf/rules".into()),
             ],
             env: env.map(|(p, c)| (p.to_string(), c.to_string())),
@@ -759,7 +759,7 @@ mod tests {
             }
             *seen.borrow_mut() = Some((
                 args.to_vec(),
-                dir.join("compose.yml").is_file(),
+                dir.join("deploy/compose.yml").is_file(),
                 dir.join("conf/rules/a.yml").is_file(),
                 env,
             ));
@@ -774,7 +774,7 @@ mod tests {
         );
         assert!(
             compose,
-            "a Compose file lands at the root under its own name"
+            "a Compose file retains its repository-relative path"
         );
         assert!(include, "an include keeps its repo-relative path");
         assert_eq!(env, "A='1'\n");

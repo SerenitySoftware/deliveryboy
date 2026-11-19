@@ -204,13 +204,78 @@ fn builds_image(cfg: &Value, ctx: &PlanContext, files: &[String], tag: &str) -> 
 /// directory per deploy id, relative to the project root.
 const SNAPSHOTS: &str = ".deliver/config";
 
-/// The paths, relative to the project root, that a deploy overwrites: each
-/// Compose file and `.env` land at the root under their own name, an
-/// `include:` at its repo-relative path. Anything that would resolve outside
-/// the root is left out rather than copied around blind.
+/// Use a portable, unambiguous relative destination on both local and SSH targets.
+fn relative_path(path: &str) -> Result<String> {
+    let path = path.trim_end_matches('/');
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if path.is_empty()
+        || path.starts_with(['/', '-'])
+        || path.contains(['\\', ':'])
+        || path.chars().any(char::is_control)
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || matches!(
+            path.split('/').next(),
+            Some(".deliver" | ".first" | ".layout-v1")
+        )
+    {
+        bail!("docker-compose: unsafe repository-relative path {path:?}");
+    }
+    Ok(path.to_string())
+}
+
+/// Validate all destinations before producing any executable steps. Includes
+/// cannot cover Compose inputs, each other, or the rendered root env file.
+fn validated_config(cfg: &Value) -> Result<Value> {
+    let mut cfg = cfg.clone();
+    let files: Vec<String> = compose_files(&cfg)
+        .iter()
+        .map(|p| relative_path(p))
+        .collect::<Result<_>>()?;
+    let includes: Vec<String> = string_list(cfg.get("include"))
+        .iter()
+        .map(|p| relative_path(p))
+        .collect::<Result<_>>()?;
+    let mut destinations = files.clone();
+    destinations.extend(includes.iter().cloned());
+    if let Some(env) = cfg.get("env_file") {
+        let path = relative_path(env.get("path").and_then(Value::as_str).unwrap_or(".env"))?;
+        let basename = path.rsplit('/').next().unwrap().to_string();
+        destinations.push(basename.clone());
+        cfg["env_file"]["path"] = Value::String(basename);
+    }
+    for (i, path) in destinations.iter().enumerate() {
+        for other in &destinations[..i] {
+            if path == other
+                || path.starts_with(&format!("{other}/"))
+                || other.starts_with(&format!("{path}/"))
+            {
+                bail!("docker-compose: overlapping destinations {other:?} and {path:?}");
+            }
+        }
+    }
+    cfg["files"] = serde_yaml::to_value(files)?;
+    cfg["include"] = serde_yaml::to_value(includes)?;
+    Ok(cfg)
+}
+
+fn path_arg(path: &str) -> String {
+    if path
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+    {
+        path.to_string()
+    } else {
+        shell_quote(path)
+    }
+}
+
+/// Compose files and includes retain their repository paths. The rendered env
+/// retains the existing root-basename rule.
 fn shipped_config(cfg: &Value, files: &[String]) -> Vec<String> {
     let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-    let mut paths: Vec<String> = files.iter().map(|f| basename(f)).collect();
+    let mut paths: Vec<String> = files.to_vec();
     paths.extend(
         string_list(cfg.get("include"))
             .into_iter()
@@ -232,6 +297,40 @@ fn shipped_config(cfg: &Value, files: &[String]) -> Vec<String> {
 /// the stack down instead of looking for a previous release that never was.
 const FIRST_MARKER: &str = ".first";
 
+const LAYOUT_MARKER: &str = ".layout-v1";
+
+fn layout_manifest(paths: &[String], files: &[String]) -> String {
+    serde_json::json!({"version": 1, "files": files, "paths": paths}).to_string()
+}
+
+/// S names the candidate snapshot. Never infer nested paths from a legacy
+/// basename snapshot, and never use a snapshot for a different ordered layout.
+fn snapshot_guard(sudo: &str, paths: &[String], files: &[String]) -> String {
+    let expected = shell_quote(&layout_manifest(paths, files));
+    let absent = if files.iter().any(|p| p.contains('/')) {
+        "echo 'docker-compose: legacy nested config snapshot needs explicit migration' >&2; exit 1"
+    } else {
+        ":"
+    };
+    format!(
+        "if [ -e \"$S/{LAYOUT_MARKER}\" ]; then \
+        if [ \"$({sudo}cat \"$S/{LAYOUT_MARKER}\")\" != {expected} ]; then \
+          echo 'docker-compose: config snapshot layout mismatch' >&2; exit 1; fi; \
+        else {absent}; fi"
+    )
+}
+
+/// Runs before any target mutation or Docker command. Legacy flat files stay
+/// untouched: operators must choose a migration rather than silently lose them.
+fn legacy_target_guard(root: &str, sudo: &str, files: &[String]) -> String {
+    files.iter().filter(|p| p.contains('/')).map(|p| {
+        let nested = shell_quote(&format!("{root}/{p}"));
+        let flat = shell_quote(&format!("{root}/{}", p.rsplit('/').next().unwrap()));
+        format!("if {sudo}test -e {flat} && ! {sudo}test -e {nested}; then \
+          echo 'docker-compose: legacy flattened nested layout needs explicit migration' >&2; exit 1; fi")
+    }).collect::<Vec<_>>().join("; ")
+}
+
 /// Copy the live config aside before the deploy overwrites it. A path the
 /// target does not have yet is skipped: there is nothing to put back. Two
 /// deploys of one commit inside a second share an id, so a taken one gets a
@@ -243,7 +342,7 @@ fn snapshot_command(
     sudo: &str,
     id: &str,
     paths: &[String],
-    compose_file: &str,
+    files: &[String],
 ) -> String {
     let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
     format!(
@@ -252,29 +351,39 @@ fn snapshot_command(
          {sudo}mkdir -p \"$S\"; N=0; \
          for p in {list}; do if [ -e \"$p\" ]; then \
            {sudo}mkdir -p \"$S/$(dirname \"$p\")\"; {sudo}cp -Rp \"$p\" \"$S/$p\"; N=$((N+1)); fi; \
-         done; echo \"saved $N live config path(s) to $S\"; \
+         done; printf '%s\\n' {manifest} | {sudo}tee \"$S/{LAYOUT_MARKER}\" >/dev/null; \
+         echo \"saved $N live config path(s) to $S\"; \
          if [ ! -e {compose_file} ]; then {sudo}touch \"$S/{FIRST_MARKER}\"; \
            echo 'first release: nothing was running from {root} before it'; fi",
         list = quoted.join(" "),
-        compose_file = shell_quote(compose_file),
+        compose_file = shell_quote(&files[0]),
+        manifest = shell_quote(&layout_manifest(paths, files)),
     )
 }
 
-/// Put back the newest snapshot. Newest, not this run's id: `deliver
-/// rollback` compiles a fresh plan, and the snapshot it has to restore is the
-/// one the last deploy took. Sets `RESTORED` when there was one, and never
-/// fails on its own, so the image undo that follows it still runs.
-fn restore_command(root: &str, sudo: &str, paths: &[String]) -> String {
-    let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
+/// Restore the paths present in the already validated snapshot named by S.
+fn restore_paths_command(sudo: &str, paths: &[String]) -> String {
+    let list = paths
+        .iter()
+        .map(|p| shell_quote(p))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("for p in {list}; do \
+        if [ -d \"$S/$p\" ]; then {sudo}mkdir -p \"$p\"; {sudo}cp -Rp \"$S/$p/.\" \"$p/\"; \
+        elif [ -e \"$S/$p\" ]; then {sudo}mkdir -p \"$(dirname \"$p\")\"; {sudo}cp -p \"$S/$p\" \"$p\"; fi; done")
+}
+
+/// Restore the newest snapshot, including for a fresh `deliver rollback` plan.
+/// Refuse an incompatible layout or failed copy before any image undo runs.
+fn restore_command(root: &str, sudo: &str, paths: &[String], files: &[String]) -> String {
     format!(
-        "cd {root}; RESTORED=; S=$(ls -1d {SNAPSHOTS}/*/ 2>/dev/null | sed 's:/*$::' | LC_ALL=C sort | tail -n 1); \
-         if [ -n \"$S\" ]; then \
-           for p in {list}; do \
-             if [ -d \"$S/$p\" ]; then {sudo}mkdir -p \"$p\" && {sudo}cp -Rp \"$S/$p/.\" \"$p/\"; \
-             elif [ -e \"$S/$p\" ]; then {sudo}cp -p \"$S/$p\" \"$p\"; fi; \
-           done; RESTORED=1; echo \"restored the config saved in $S\"; \
-         else echo 'no config snapshot on the target — the shipped config stays' >&2; fi",
-        list = quoted.join(" ")
+        "set -e; cd {root}; RESTORED=; S=$(ls -1d {SNAPSHOTS}/*/ 2>/dev/null | sed 's:/*$::' | LC_ALL=C sort | tail -n 1); \
+         if [ -n \"$S\" ]; then {guard}; {copy}; \
+           RESTORED=1; echo \"restored the config saved in $S\"; \
+         else echo 'no config snapshot on the target — the shipped config stays' >&2; {missing}; fi",
+        guard = snapshot_guard(sudo, paths, files),
+        copy = restore_paths_command(sudo, paths),
+        missing = if files.iter().any(|p| p.contains('/')) { "exit 1" } else { ":" },
     )
 }
 
@@ -296,8 +405,7 @@ pub fn input_files(cfg: &Value) -> Vec<String> {
 }
 
 /// Where each input lands under the target's root, mirroring the ship steps:
-/// a Compose file and the `.env` by their own name, an `include:` at its
-/// repo-relative path.
+/// Compose files and includes at their repo-relative paths; rendered env at root.
 fn compose_project(
     cfg: &Value,
     project: &str,
@@ -305,8 +413,7 @@ fn compose_project(
     env: Option<(String, String)>,
 ) -> ComposeProject {
     let basename = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-    let mut layout: Vec<(String, String)> =
-        files.iter().map(|f| (f.clone(), basename(f))).collect();
+    let mut layout: Vec<(String, String)> = files.iter().map(|f| (f.clone(), f.clone())).collect();
     layout.extend(string_list(cfg.get("include")).into_iter().map(|p| {
         let dest = p.trim_end_matches('/').to_string();
         (p, dest)
@@ -320,11 +427,16 @@ fn compose_project(
 }
 
 pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
+    let validated = validated_config(cfg)?;
+    let cfg = &validated;
     let files = compose_files(cfg);
     let project = cfg_str(cfg, "project").unwrap_or_else(|| ctx.app.clone());
     let root = ctx.target.dir.trim_end_matches('/').to_string();
     let sudo = ctx.sudo_prefix();
-    let compose_files: String = files.iter().map(|f| format!("-f {f} ")).collect();
+    let compose_files: String = files
+        .iter()
+        .map(|f| format!("-f {} ", path_arg(f)))
+        .collect();
     let compose = format!("docker compose {compose_files}-p {project}");
 
     // A project can build several images (api, web, exporter). `image:` is the
@@ -414,6 +526,13 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     };
 
     let mut steps = Vec::new();
+    let legacy_guard = legacy_target_guard(&root, sudo, &files);
+    if !legacy_guard.is_empty() {
+        steps.push(PlannedStep::ssh(
+            "check Compose target layout".to_string(),
+            legacy_guard,
+        ));
+    }
 
     // A project whose services only pull published images has nothing to build,
     // nothing to save and nothing to load; shipping the files, backing up,
@@ -587,25 +706,31 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // live copies go aside first, and putting them back is this step's undo —
     // the last thing an unwind does, after which the snapshot is spent.
     let config_paths = shipped_config(cfg, &files);
-    let restore = restore_command(&root, sudo, &config_paths);
+    let restore = restore_command(&root, sudo, &config_paths, &files);
     steps.push(
         PlannedStep::ssh(
             format!("snapshot live config → {SNAPSHOTS}/{}", ctx.version.id),
-            snapshot_command(
-                &root,
-                sudo,
-                &ctx.version.id,
-                &config_paths,
-                // Shipped to the root under its own name, as `shipped_config` has it.
-                files[0].rsplit('/').next().unwrap_or(&files[0]),
-            ),
+            snapshot_command(&root, sudo, &ctx.version.id, &config_paths, &files),
         )
         .with_rollback(format!(
             "{restore}; if [ -n \"$S\" ]; then {sudo}rm -rf \"$S\"; fi"
         )),
     );
     for file in &files {
-        let step = PlannedStep::command(format!("ship {file}"), ctx.copy(file, &root));
+        let dest = file
+            .rsplit_once('/')
+            .map(|(parent, _)| format!("{root}/{parent}"))
+            .unwrap_or_else(|| root.clone());
+        if dest != root {
+            steps.push(PlannedStep::ssh(
+                format!("ensure {dest}"),
+                format!("{sudo}mkdir -p {}", shell_quote(&dest)),
+            ));
+        }
+        let step = PlannedStep::command(
+            format!("ship {file}"),
+            ctx.copy(&path_arg(file), &path_arg(&dest)),
+        );
         // The compose file is shipped byte-for-byte, so what is in the repo is
         // what lands on the target — which makes it diffable against the one
         // currently running there. Unreadable is not a failure here; the copy
@@ -628,19 +753,19 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             Some((parent, _)) => format!("{root}/{parent}"),
             None => root.clone(),
         };
+        steps.push(PlannedStep::ssh(
+            format!("ensure {dest}"),
+            format!("{sudo}mkdir -p {}", shell_quote(&dest)),
+        ));
         if local.is_dir() {
-            steps.push(PlannedStep::ssh(
-                format!("ensure {dest}"),
-                format!("{sudo}mkdir -p {dest}"),
-            ));
             steps.push(PlannedStep::command(
                 format!("ship {path}/"),
-                ctx.copy_dir(&path, &dest),
+                ctx.copy_dir(&path_arg(&path), &path_arg(&dest)),
             ));
         } else {
             steps.push(PlannedStep::command(
                 format!("ship {path}"),
-                ctx.copy(&path, &dest),
+                ctx.copy(&path_arg(&path), &path_arg(&dest)),
             ));
         }
     }
@@ -659,15 +784,21 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         ));
         steps.push(PlannedStep::command(
             format!("ship {env_path} (0600)"),
-            ctx.copy(&local, &root),
+            ctx.copy(&path_arg(&local), &path_arg(&root)),
         ));
         steps.push(PlannedStep::ssh(
             format!("secure {env_path}"),
-            format!("{sudo}chmod 600 {root}/{env_path}"),
+            format!(
+                "{sudo}chmod 600 {}",
+                path_arg(&format!("{root}/{env_path}"))
+            ),
         ));
         steps.push(
-            PlannedStep::command(format!("remove local {env_path}"), format!("rm -f {local}"))
-                .into_cleanup(),
+            PlannedStep::command(
+                format!("remove local {env_path}"),
+                format!("rm -f {}", path_arg(&local)),
+            )
+            .into_cleanup(),
         );
     }
 
@@ -890,14 +1021,18 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         sudo,
     );
     steps.push(start.with_rollback(format!(
-        "cd {root}; S=; for d in {SNAPSHOTS}/{id} {SNAPSHOTS}/{id}-*; do [ -d \"$d\" ] && S=$d; done; \
+        "set -e; {legacy}; cd {root}; S=; for d in {SNAPSHOTS}/{id} {SNAPSHOTS}/{id}-*; do if [ -d \"$d\" ]; then S=$d; fi; done; \
+         if [ -n \"$S\" ]; then {guard}; fi; \
          if [ -n \"$S\" ] && [ -e \"$S/{FIRST_MARKER}\" ]; then \
            set -e; {sudo}{compose} down --remove-orphans; \
-           for p in {shipped}; do [ -e \"$S/$p\" ] || {sudo}rm -rf \"$p\"; done; \
+           for p in {shipped}; do [ -e \"$S/$p\" ] || {sudo}rm -rf \"$p\"; done; {copy_saved}; \
            echo 'first release: brought {project} down — nothing is served until a release passes its checks'; \
            {first_record}; \
          else {undo}; fi",
         shipped = shipped.join(" "),
+        copy_saved = restore_paths_command(sudo, &config_paths),
+        legacy = if files.iter().any(|p| p.contains('/')) { legacy_target_guard(&root, sudo, &files) } else { ":".to_string() },
+        guard = snapshot_guard(sudo, &config_paths, &files),
         id = ctx.version.id,
     )));
 
@@ -1148,5 +1283,119 @@ health: {{{option} url: https://example.com/health, remote_url: http://127.0.0.1
                 baseline = Some(ssh);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use crate::deployers::{http_test_support, StepKind};
+
+    #[test]
+    fn unsafe_and_overlapping_paths_fail_before_a_plan_exists() {
+        for path in [
+            "/tmp/compose.yml",
+            "../compose.yml",
+            "deploy/../compose.yml",
+            "a//b",
+            "C:/compose.yml",
+            "a\\b",
+            ".deliver/history.tsv",
+            ".first",
+            ".layout-v1",
+            "-compose.yml",
+            "a\nb",
+        ] {
+            let cfg = serde_yaml::to_value(serde_json::json!({"files": [path]})).unwrap();
+            assert!(validated_config(&cfg).is_err(), "accepted {path:?}");
+        }
+        for cfg in [
+            "files: [compose.yml, ./compose.yml]",
+            "files: [deploy/compose.yml]\ninclude: [deploy]",
+            "files: [compose.yml]\ninclude: [a, a/b]",
+            "files: [.env]\nenv_file: {literals: {A: one}}",
+        ] {
+            assert!(
+                validated_config(&serde_yaml::from_str(cfg).unwrap()).is_err(),
+                "{cfg}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_local_and_ssh_plans_share_paths_and_quote_shell_arguments() {
+        let mut fixture = http_test_support::Context::new();
+        let file = "deploy dir/it's compose.yml";
+        std::fs::create_dir_all(fixture.ctx.repo_root.join("deploy dir")).unwrap();
+        std::fs::write(fixture.ctx.repo_root.join(file), "services: {}\n").unwrap();
+        let cfg = serde_yaml::to_value(
+            serde_json::json!({"files": [format!("./{file}")], "build": false}),
+        )
+        .unwrap();
+        for method in ["local", "ssh"] {
+            fixture.ctx.target = serde_yaml::from_str(&format!(
+                "{{method: {method}, host: example.com, user: deploy, dir: /fixture}}"
+            ))
+            .unwrap();
+            let steps = compile(&cfg, &fixture.ctx).unwrap();
+            assert!(steps[0].label.contains("layout"));
+            let ship = steps
+                .iter()
+                .find(|s| s.label == format!("ship {file}"))
+                .unwrap();
+            let command = match &ship.kind {
+                StepKind::Command { command, .. } => command,
+                _ => panic!("copy must be a command"),
+            };
+            assert!(command.contains(&shell_quote(file)), "{command}");
+            assert!(
+                command.contains(&shell_quote("/fixture/deploy dir")),
+                "{command}"
+            );
+            assert_eq!(
+                ship.live_config.as_ref().unwrap().remote_path,
+                format!("/fixture/{file}")
+            );
+            let project = steps
+                .iter()
+                .find_map(|s| s.compose_project.as_ref())
+                .unwrap();
+            assert_eq!(project.files, [file]);
+            assert_eq!(project.layout, [(file.to_string(), file.to_string())]);
+            let start = steps.iter().find(|s| s.label == "start services").unwrap();
+            let command = match &start.kind {
+                StepKind::Ssh { command } => command,
+                _ => panic!("start"),
+            };
+            assert!(
+                command.contains(&format!("-f {}", shell_quote(file))),
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_only_legacy_snapshots_remain_restorable() {
+        let fixture = http_test_support::Context::new();
+        let root = fixture.ctx.repo_root.to_str().unwrap();
+        let snap = fixture.ctx.repo_root.join(".deliver/config/old");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("compose.yml"), "old").unwrap();
+        std::fs::write(fixture.ctx.repo_root.join("compose.yml"), "new").unwrap();
+        let paths = vec!["compose.yml".to_string()];
+        let out = std::process::Command::new("sh")
+            .args(["-c", &restore_command(root, "", &paths, &paths)])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.ctx.repo_root.join("compose.yml")).unwrap(),
+            "old"
+        );
     }
 }
