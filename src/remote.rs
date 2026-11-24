@@ -96,6 +96,13 @@ pub fn stream_lines(
             .arg(script);
         cmd
     };
+    // Keep a local shell's children in the same cancellable group. Killing
+    // only sh can leave tail holding a silent stderr pipe open forever.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -138,6 +145,18 @@ pub fn stream_lines(
                 line.and_then(|(stream, bytes)| emit(stream, &String::from_utf8_lossy(&bytes)));
             if let Err(err) = result {
                 // Reap the process even when the consumer closes its pipe.
+                #[cfg(unix)]
+                let _ = Command::new("kill")
+                    .args(["-KILL", &format!("-{}", child.id())])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                #[cfg(windows)]
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
                 let _ = child.kill();
                 drop(rx);
                 return Err(err);
@@ -148,4 +167,21 @@ pub fn stream_lines(
     let status = child.wait()?;
     result?;
     Ok(status.success())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn a_closed_consumer_cancels_children_holding_silent_pipes() {
+        let target = serde_yaml::from_str("method: local\nhost: localhost\ndir: .\n").unwrap();
+        let start = std::time::Instant::now();
+        let result = super::stream_lines(
+            &target,
+            "localhost",
+            "printf 'first\\n'; sleep 5",
+            |_, _| Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(start.elapsed() < std::time::Duration::from_secs(4));
+    }
 }
