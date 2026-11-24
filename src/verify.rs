@@ -32,6 +32,7 @@ pub fn compile(check: &Value, ctx: &PlanContext) -> Result<PlannedStep> {
             secret: false,
             live_config: None,
             release_state: None,
+            ingress_state: None,
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),

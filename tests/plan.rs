@@ -7,6 +7,161 @@ fn deliver() -> Command {
     Command::new(env!("CARGO_BIN_EXE_deliver"))
 }
 
+#[cfg(unix)]
+#[test]
+fn ingress_status_history_and_fleet_read_all_vhosts_in_one_connection() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = tmpdir("ingress-readback");
+    let bin = dir.join("bin");
+    let etc = dir.join("nginx-state");
+    for path in [
+        &bin,
+        &etc.join("sites-available"),
+        &etc.join("sites-enabled"),
+        &dir.join("nginx"),
+        &dir.join("certs/live/example.com"),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let cert = dir.join("certs/live/example.com/fullchain.pem");
+    let generated = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "9",
+            "-subj",
+            "/CN=example.com",
+            "-keyout",
+        ])
+        .arg(dir.join("key.pem"))
+        .arg("-out")
+        .arg(&cert)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let before = std::fs::read(&cert).unwrap();
+    std::fs::write(dir.join("nginx/plain.conf"), "server {}\n").unwrap();
+    let calls = dir.join("connections");
+    let ssh = format!("#!/bin/sh\n[ ! -f offline ] || exit 1\necho connection >> {}\nfor arg do script=$arg; done\nprintf %s \"$script\" | sed 's#/etc/letsencrypt#{}#g' | sh\n", calls.display(), dir.join("certs").display());
+    let nginx = format!("#!/bin/sh\n[ ! -f {} ]\n", dir.join("fail-nginx").display());
+    for (name, content) in [("ssh", ssh), ("nginx", nginx)] {
+        let path = bin.join(name);
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(dir.join("nginx/site.conf"), "server {\n server_name __DOMAIN__;\n ssl_certificate /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;\n}\n").unwrap();
+    std::fs::write(dir.join("nginx/api.conf"), "server {\n server_name api.__DOMAIN__;\n ssl_certificate /etc/letsencrypt/live/api.__DOMAIN__/fullchain.pem;\n}\n").unwrap();
+    let config = format!("version: 1\napp: example\ndefaults: {{target: box}}\ntargets:\n  box: {{host: example.com, user: example, sudo: false, dir: {}}}\nservices:\n  ingress:\n    deployer: nginx-vhost\n    config:\n      provider: none\n      vhosts: [{{conf: nginx/site.conf}}, {{conf: nginx/api.conf}}]\n      render: {{__DOMAIN__: example.com}}\n  plain:\n    deployer: nginx-vhost\n    config: {{conf: nginx/plain.conf, ssl: false}}\n", dir.display());
+    std::fs::write(dir.join(".deliver.yml"), config).unwrap();
+    std::fs::write(etc.join("sites-available/site.conf"), "installed site").unwrap();
+    symlink(
+        "../sites-available/site.conf",
+        etc.join("sites-enabled/site.conf"),
+    )
+    .unwrap();
+    // A wrong link must not count as enabled, even if its target exists.
+    symlink(
+        "../sites-available/site.conf",
+        etc.join("sites-enabled/api.conf"),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        deliver()
+            .current_dir(&dir)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("DELIVER_NGINX_DIR", &etc)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["status", "--json"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+    let ingress = &rows[0]["ingress"];
+    assert!(rows[1]["ingress"][0]["certificates"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(ingress.as_array().unwrap().len(), 2);
+    assert_eq!(ingress[0]["installed"], true);
+    assert_eq!(ingress[0]["enabled"], true);
+    assert_eq!(ingress[0]["nginx_test"], true);
+    assert_eq!(ingress[1]["installed"], false);
+    assert_eq!(ingress[1]["enabled"], false);
+    assert_eq!(ingress[0]["certificates"][0]["name"], "example.com");
+    let days = ingress[0]["certificates"][0]["health"]["days_remaining"]
+        .as_u64()
+        .unwrap();
+    assert!((8..=9).contains(&days));
+    assert_eq!(ingress[1]["certificates"][0]["health"]["kind"], "missing");
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    std::fs::write(dir.join("fail-nginx"), "").unwrap();
+    let status = run(&["status"]);
+    let text = fleet_text(&status);
+    assert!(
+        text.contains("nginx -t      fails") && text.contains("day(s) remaining"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Nothing to read back") && !text.contains("nothing deployed yet"),
+        "{text}"
+    );
+    let history = fleet_text(&run(&["history"]));
+    assert!(
+        history.contains("do not record release history"),
+        "{history}"
+    );
+    std::fs::write(dir.join("deliver.fleet.yml"), "version: 1\nrepos: [.]\n").unwrap();
+    let fleet = fleet_text(&run(&["fleet", "status"]));
+    let summary = fleet.split("Fleet summary").nth(1).unwrap();
+    assert!(
+        summary.contains("day(s) remaining (minimum)") && summary.contains("missing/unreadable"),
+        "{fleet}"
+    );
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 4);
+    std::fs::write(dir.join("offline"), "").unwrap();
+    let offline = run(&["status", "--json"]);
+    assert_eq!(offline.status.code(), Some(1));
+    let unread: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(unread[0]["reachable"], false);
+    assert_eq!(
+        unread[0]["ingress"][0]["installed"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        unread[0]["ingress"][0]["certificates"][0]["health"]["kind"],
+        "unreadable"
+    );
+    assert_eq!(std::fs::read(&cert).unwrap(), before);
+    assert_eq!(
+        std::fs::read_to_string(etc.join("sites-available/site.conf")).unwrap(),
+        "installed site"
+    );
+    assert_eq!(
+        std::fs::read_link(etc.join("sites-enabled/site.conf"))
+            .unwrap()
+            .to_str(),
+        Some("../sites-available/site.conf")
+    );
+}
+
 const SAMPLE: &str = r#"
 version: 1
 app: sample
@@ -5645,7 +5800,7 @@ targets:
 services:
   nginx:
     deployer: nginx-vhost
-    config: {conf: nginx/readback.conf, provider: none}
+    config: {strategy: script, conf: nginx/readback.conf, script: nginx/custom.sh, provider: none}
 "#,
     );
     let out = deliver()

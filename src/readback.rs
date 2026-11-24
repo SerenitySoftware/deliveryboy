@@ -18,7 +18,7 @@
 //! way out goes through [`crate::secrets::redact`].
 
 use crate::config::Target;
-use crate::deployers::ReleaseState;
+use crate::deployers::{IngressState, ReleaseState};
 use crate::plan::ServicePlan;
 use crate::remote::{capture, nonce, shell_quote};
 use serde::Serialize;
@@ -30,7 +30,213 @@ pub struct Request {
     pub service: String,
     pub target: String,
     pub host: String,
-    pub state: ReleaseState,
+    pub state: Option<ReleaseState>,
+    pub ingress: Vec<IngressState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Ingress {
+    pub conf_path: String,
+    pub enabled_path: String,
+    pub installed: Option<bool>,
+    pub enabled: Option<bool>,
+    pub nginx_test: Option<bool>,
+    pub certificates: Vec<Certificate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Certificate {
+    pub name: String,
+    pub path: String,
+    pub health: CertificateHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CertificateHealth {
+    Valid { days_remaining: u64 },
+    Expired,
+    Missing,
+    Unreadable,
+}
+
+fn ingress_probes(index: usize, states: &[IngressState], sudo: &str) -> Vec<Probe> {
+    let mut probes = Vec::new();
+    if states.is_empty() {
+        return probes;
+    }
+    probes.push(Probe {
+        key: format!("{index}:nginx"),
+        snippet: format!("if {sudo}nginx -t >/dev/null 2>&1; then echo yes; else echo no; fi"),
+    });
+    for (v, state) in states.iter().enumerate() {
+        let conf = shell_quote(&state.conf_path);
+        let link = shell_quote(&state.enabled_path);
+        probes.push(Probe {
+            key: format!("{index}:ingress:{v}"),
+            // -ef follows relative links too, and rejects dangling or wrong links.
+            snippet: format!(
+                "if ! {sudo}test -d /; then printf 'unknown\\nunknown\\n'; else \
+                   if {sudo}test -f {conf}; then echo yes; else echo no; fi; \
+                   if {sudo}test -L {link} && {sudo}test {link} -ef {conf}; then echo yes; else echo no; fi; fi"
+            ),
+        });
+        for (c, name) in state.cert_names.iter().enumerate() {
+            let path = shell_quote(&format!("/etc/letsencrypt/live/{name}/fullchain.pem"));
+            probes.push(Probe {
+                key: format!("{index}:cert:{v}:{c}"),
+                // First distinguish missing and malformed/unreadable from expired.
+                // Binary search whole days with checkend: no remote date parser,
+                // local clock assumptions or writes. X.509 dates end at year 9999;
+                // ten thousand years is an upper bound, not a capped answer.
+                snippet: format!(
+                    "if ! {sudo}test -d /; then echo unreadable; \
+                     elif ! {sudo}test -e {path}; then echo missing; \
+                     elif ! {sudo}openssl x509 -in {path} -noout >/dev/null 2>&1; then echo unreadable; \
+                     elif {sudo}openssl x509 -in {path} -noout -checkend 0 >/dev/null 2>&1; then \
+                       LO=0; HI=3652500; while [ $((HI - LO)) -gt 1 ]; do \
+                         MID=$(((LO + HI) / 2)); \
+                         if {sudo}openssl x509 -in {path} -noout -checkend $((MID * 86400)) >/dev/null 2>&1; \
+                         then LO=$MID; else HI=$MID; fi; done; echo \"$LO\"; \
+                     else echo expired; fi"
+                ),
+            });
+        }
+    }
+    probes
+}
+
+fn parse_ingress(
+    index: usize,
+    states: &[IngressState],
+    answers: &BTreeMap<String, String>,
+) -> Vec<Ingress> {
+    let yes_no = |text: Option<&str>| match text {
+        Some("yes") => Some(true),
+        Some("no") => Some(false),
+        _ => None,
+    };
+    states
+        .iter()
+        .enumerate()
+        .map(|(v, state)| {
+            let fields: Vec<_> = answers
+                .get(&format!("{index}:ingress:{v}"))
+                .map(|text| text.lines().collect())
+                .unwrap_or_default();
+            Ingress {
+                conf_path: state.conf_path.clone(),
+                enabled_path: state.enabled_path.clone(),
+                installed: yes_no(fields.first().copied()),
+                enabled: yes_no(fields.get(1).copied()),
+                nginx_test: yes_no(answers.get(&format!("{index}:nginx")).map(|s| s.trim())),
+                certificates: state
+                    .cert_names
+                    .iter()
+                    .enumerate()
+                    .map(|(c, name)| {
+                        let text = answers
+                            .get(&format!("{index}:cert:{v}:{c}"))
+                            .map(|s| s.trim())
+                            .unwrap_or("");
+                        Certificate {
+                            name: name.clone(),
+                            path: format!("/etc/letsencrypt/live/{name}/fullchain.pem"),
+                            health: match text {
+                                "expired" => CertificateHealth::Expired,
+                                "missing" => CertificateHealth::Missing,
+                                other => other
+                                    .parse()
+                                    .map(|days_remaining| CertificateHealth::Valid {
+                                        days_remaining,
+                                    })
+                                    .unwrap_or(CertificateHealth::Unreadable),
+                            },
+                        }
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn render_ingress(ingress: &[Ingress]) -> String {
+    let mut out = String::new();
+    let flag = |value| match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    };
+    for site in ingress {
+        out.push_str(&format!(
+            "    vhost         {} · installed {} · enabled {} ({})\n",
+            site.conf_path,
+            flag(site.installed),
+            flag(site.enabled),
+            site.enabled_path
+        ));
+        out.push_str(&format!(
+            "    nginx -t      {}\n",
+            match site.nginx_test {
+                Some(true) => "passes",
+                Some(false) => "fails (or could not run)",
+                None => "unknown",
+            }
+        ));
+        if site.certificates.is_empty() {
+            out.push_str("    certificates  none declared\n");
+        }
+        for cert in &site.certificates {
+            let health = match cert.health {
+                CertificateHealth::Valid { days_remaining } => {
+                    format!("{days_remaining} day(s) remaining")
+                }
+                CertificateHealth::Expired => "EXPIRED".into(),
+                CertificateHealth::Missing => "missing".into(),
+                CertificateHealth::Unreadable => "unreadable (or openssl unavailable)".into(),
+            };
+            out.push_str(&format!("    certificate   {} · {health}\n", cert.name));
+        }
+    }
+    out
+}
+
+/// Worst certificate result for one fleet row. Unknown certs must not be hidden
+/// behind a healthy certificate's remaining days.
+pub fn certificate_summary(statuses: &[Status]) -> Option<String> {
+    let certs: Vec<_> = statuses
+        .iter()
+        .flat_map(|s| &s.ingress)
+        .flat_map(|i| &i.certificates)
+        .collect();
+    if certs.is_empty() {
+        return None;
+    }
+    let expired = certs.iter().any(|c| c.health == CertificateHealth::Expired);
+    let unknown = certs.iter().any(|c| {
+        matches!(
+            c.health,
+            CertificateHealth::Missing | CertificateHealth::Unreadable
+        )
+    });
+    let days = certs
+        .iter()
+        .filter_map(|c| match c.health {
+            CertificateHealth::Valid { days_remaining } => Some(days_remaining),
+            _ => None,
+        })
+        .min();
+    let mut parts = Vec::new();
+    if expired {
+        parts.push("EXPIRED".to_string());
+    }
+    if unknown {
+        parts.push("missing/unreadable".to_string());
+    }
+    if let Some(days) = days {
+        parts.push(format!("{days} day(s) remaining (minimum)"));
+    }
+    Some(format!("certificates: {}", parts.join(" · ")))
 }
 
 /// What the live path points at.
@@ -65,6 +271,8 @@ pub struct Deploy {
 /// Everything read back for one service on one host.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Status {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ingress: Vec<Ingress>,
     pub service: String,
     pub target: String,
     pub host: String,
@@ -137,29 +345,31 @@ pub(crate) fn basename(path: &str) -> &str {
 /// Pure: it walks the plan the deployers already produced, so the paths read
 /// are by construction the paths the deploy writes.
 pub fn collect(plan: &[ServicePlan]) -> Vec<Request> {
-    let mut seen: Vec<Request> = Vec::new();
-    for sp in plan {
-        for step in &sp.steps {
-            let Some(state) = &step.release_state else {
-                continue;
-            };
-            let request = Request {
+    plan.iter()
+        .filter_map(|sp| {
+            let state = sp.steps.iter().find_map(|step| step.release_state.clone());
+            let ingress: Vec<_> = sp
+                .steps
+                .iter()
+                .filter_map(|step| step.ingress_state.clone())
+                .collect();
+            (state.is_some() || !ingress.is_empty()).then(|| Request {
                 service: sp.service.clone(),
                 target: sp.target.clone(),
                 host: sp.host.clone(),
-                state: state.clone(),
-            };
-            // A service compiles one record step; belt and braces against a
-            // deployer that ever grows a second one.
-            if !seen
-                .iter()
-                .any(|r| r.service == request.service && r.host == request.host)
-            {
-                seen.push(request);
-            }
-        }
-    }
-    seen
+                state,
+                ingress,
+            })
+        })
+        .collect()
+}
+
+/// Release consumers (shipping and rollback) must not treat ingress as a release.
+pub fn collect_releases(plan: &[ServicePlan]) -> Vec<Request> {
+    collect(plan)
+        .into_iter()
+        .filter(|r| r.state.is_some())
+        .collect()
 }
 
 /// One framed probe: a key to find the answer by, and the snippet that answers.
@@ -340,7 +550,20 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
         let sudo = if target.uses_sudo() { "sudo " } else { "" };
         let probes: Vec<Probe> = indexes
             .iter()
-            .flat_map(|i| probes_for(*i, &requests[*i].state, sudo))
+            .flat_map(|i| {
+                let request = &requests[*i];
+                let mut probes = request
+                    .state
+                    .as_ref()
+                    .map(|state| probes_for(*i, state, sudo))
+                    .unwrap_or_default();
+                probes.extend(ingress_probes(
+                    *i,
+                    &request.ingress,
+                    if target.uses_sudo() { "sudo -n " } else { "" },
+                ));
+                probes
+            })
             .collect();
         let marker = nonce();
         let script = probe_script(&probes, &marker);
@@ -367,8 +590,18 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
             let answer = answers.remove(&i).flatten();
             let reachable = answer.is_some();
             let answer = answer.unwrap_or_default();
+            let ingress = parse_ingress(i, &request.ingress, &answer);
+            // Ingress has no release history; these empty fields preserve the
+            // release readback shape without inventing deploy records.
+            let state = request.state.unwrap_or(ReleaseState {
+                history_path: String::new(),
+                live_path: None,
+                releases_dir: None,
+                previous_marker: None,
+                backups_dir: None,
+            });
             let live = match answer.get(&format!("{i}:live")) {
-                None if request.state.live_path.is_none() => Live::NotApplicable,
+                None if state.live_path.is_none() => Live::NotApplicable,
                 None => Live::Missing,
                 Some(text) => match text.trim() {
                     "" => Live::Missing,
@@ -396,6 +629,7 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                 .map(|text| parse_history(text))
                 .unwrap_or_default();
             Status {
+                ingress,
                 service: request.service,
                 target: request.target,
                 host: request.host,
@@ -403,17 +637,17 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                 live,
                 releases,
                 history,
-                history_path: request.state.history_path,
-                live_path: request.state.live_path,
-                releases_dir: request.state.releases_dir,
-                previous_marker: request.state.previous_marker,
-                backups: request.state.backups_dir.as_ref().map(|_| {
+                history_path: state.history_path,
+                live_path: state.live_path,
+                releases_dir: state.releases_dir,
+                previous_marker: state.previous_marker,
+                backups: state.backups_dir.as_ref().map(|_| {
                     answer
                         .get(&format!("{i}:backups"))
                         .map(|text| sort_backups(text))
                         .unwrap_or_default()
                 }),
-                backups_dir: request.state.backups_dir,
+                backups_dir: state.backups_dir,
                 previous: answer
                     .get(&format!("{i}:previous"))
                     .map(|text| text.trim().to_string())
@@ -443,6 +677,13 @@ pub fn render_status(statuses: &[Status]) -> String {
         if !status.reachable {
             out.push_str("    could not read the target\n\n");
             continue;
+        }
+        if !status.ingress.is_empty() {
+            out.push_str(&render_ingress(&status.ingress));
+            if status.history_path.is_empty() {
+                out.push('\n');
+                continue;
+            }
         }
         match (&status.live, status.live_deploy_id()) {
             (Live::Unmanaged, _) => {
@@ -527,6 +768,11 @@ pub fn render_history(statuses: &[Status], limit: usize) -> String {
             out.push_str("    could not read the target\n\n");
             continue;
         }
+        if status.history_path.is_empty() && !status.ingress.is_empty() {
+            out.push_str(&render_ingress(&status.ingress));
+            out.push_str("    nginx installs do not record release history\n\n");
+            continue;
+        }
         if status.history.is_empty() {
             out.push_str(&format!(
                 "    no deploys recorded in {}\n\n",
@@ -575,6 +821,126 @@ pub fn render_history(statuses: &[Status], limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingress_answers_preserve_failures_and_the_worst_certificate() {
+        let states = vec![IngressState {
+            conf_path: "/etc/nginx/sites-available/example".into(),
+            enabled_path: "/etc/nginx/sites-enabled/example".into(),
+            cert_names: vec![
+                "example.com".into(),
+                "api.example.com".into(),
+                "old.example.com".into(),
+                "missing.example.com".into(),
+            ],
+        }];
+        let answers = BTreeMap::from([
+            ("0:ingress:0".into(), "yes\nno".into()),
+            ("0:nginx".into(), "no".into()),
+            ("0:cert:0:0".into(), "61".into()),
+            ("0:cert:0:1".into(), "7".into()),
+            ("0:cert:0:2".into(), "expired".into()),
+            ("0:cert:0:3".into(), "missing".into()),
+        ]);
+        let ingress = parse_ingress(0, &states, &answers);
+        assert_eq!(ingress[0].installed, Some(true));
+        assert_eq!(ingress[0].enabled, Some(false));
+        let text = render_ingress(&ingress);
+        assert!(text.contains("nginx -t      fails"), "{text}");
+        assert!(text.contains("7 day(s) remaining"), "{text}");
+        assert!(text.contains("EXPIRED"), "{text}");
+        let mut status = Status {
+            ingress,
+            service: "nginx".into(),
+            target: "box".into(),
+            host: "example.com".into(),
+            reachable: true,
+            live: Live::NotApplicable,
+            releases: Vec::new(),
+            history: Vec::new(),
+            history_path: String::new(),
+            live_path: None,
+            releases_dir: None,
+            previous_marker: None,
+            backups: None,
+            backups_dir: None,
+            previous: None,
+        };
+        let summary = certificate_summary(std::slice::from_ref(&status)).unwrap();
+        assert!(
+            summary.contains("EXPIRED")
+                && summary.contains("missing/unreadable")
+                && summary.contains("7 day(s)"),
+            "{summary}"
+        );
+        assert!(!render_status(std::slice::from_ref(&status)).contains("nothing deployed"));
+        assert!(render_history(std::slice::from_ref(&status), 0)
+            .contains("do not record release history"));
+        status.ingress = parse_ingress(0, &states, &BTreeMap::new());
+        assert_eq!(status.ingress[0].installed, None);
+        assert_eq!(
+            status.ingress[0].certificates[0].health,
+            CertificateHealth::Unreadable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkend_probe_reads_a_real_certificate_without_changing_it() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("deliver-checkend-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let result = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "3",
+                "-subj",
+                "/CN=example.com",
+                "-keyout",
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let original = std::fs::read(&cert).unwrap();
+        let states = [IngressState {
+            conf_path: "/unused".into(),
+            enabled_path: "/unused".into(),
+            cert_names: vec!["example.com".into()],
+        }];
+        let mut probes = ingress_probes(0, &states, "");
+        let probe = probes.pop().unwrap();
+        let script = probe.snippet.replace(
+            "/etc/letsencrypt/live/example.com/fullchain.pem",
+            cert.to_str().unwrap(),
+        );
+        let run = || Command::new("sh").args(["-c", &script]).output().unwrap();
+        let output = run();
+        let days: u64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert!((2..=3).contains(&days), "{days}");
+        assert_eq!(std::fs::read(&cert).unwrap(), original);
+        std::fs::write(&cert, "not a certificate").unwrap();
+        assert_eq!(String::from_utf8_lossy(&run().stdout).trim(), "unreadable");
+        std::fs::remove_file(&cert).unwrap();
+        assert_eq!(String::from_utf8_lossy(&run().stdout).trim(), "missing");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn state() -> ReleaseState {
         ReleaseState {
@@ -660,6 +1026,7 @@ mod tests {
     #[test]
     fn the_live_symlink_names_the_deploy_that_is_live() {
         let status = Status {
+            ingress: Vec::new(),
             service: "web".into(),
             target: "production".into(),
             host: "example.com".into(),
@@ -694,6 +1061,7 @@ mod tests {
     #[test]
     fn a_live_release_missing_from_history_says_so_rather_than_inventing_one() {
         let status = Status {
+            ingress: Vec::new(),
             service: "web".into(),
             target: "production".into(),
             host: "example.com".into(),
@@ -719,6 +1087,7 @@ mod tests {
     #[test]
     fn an_unreachable_target_is_reported_not_read_as_empty() {
         let status = Status {
+            ingress: Vec::new(),
             service: "web".into(),
             target: "production".into(),
             host: "example.com".into(),
@@ -742,6 +1111,7 @@ mod tests {
     #[test]
     fn a_deployer_with_no_symlink_falls_back_to_the_newest_recorded_deploy() {
         let status = Status {
+            ingress: Vec::new(),
             service: "stack".into(),
             target: "production".into(),
             host: "example.com".into(),

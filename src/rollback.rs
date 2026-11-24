@@ -549,6 +549,7 @@ mod tests {
 
     fn status() -> Status {
         Status {
+            ingress: Vec::new(),
             service: "web".into(),
             target: "box".into(),
             host: "localhost".into(),
