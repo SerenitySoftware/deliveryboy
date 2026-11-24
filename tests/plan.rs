@@ -7553,6 +7553,116 @@ fn logs_tail_flag_sets_the_line_count() {
     assert!(!stdout.contains("first line"), "{stdout}");
 }
 
+fn secret_logs_repo(name: &str, source: &str) -> std::path::PathBuf {
+    let (dir, log) = logs_repo(
+        name,
+        &format!("  api:\n    deployer: commands\n    config: {{steps: [{{command: \"true\"}}]}}\n    logs: {source}\n"),
+    );
+    std::fs::write(
+        dir.join("test-secrets.env"),
+        "LOG_TOKEN=synthetic-log-token-8741\n",
+    )
+    .unwrap();
+    // End without a newline: the last record still needs scrubbing at EOF.
+    std::fs::write(&log, "ordinary line\ntoken=synthetic-log-token-8741").unwrap();
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("LOGPATH", &log.display().to_string());
+    std::fs::write(
+        cfg,
+        format!(
+            "{body}\nsecrets:\n  providers: [{{file: test-secrets.env}}]\n  define: [LOG_TOKEN]\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn logs_never_prints_a_resolved_secret_from_a_file() {
+    let dir = secret_logs_repo("logs-secret-file", "{files: [LOGPATH]}");
+    let out = run_in(&dir, &["logs"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(stdout, "ordinary line\ntoken=[redacted:LOG_TOKEN]");
+    assert!(!stderr.contains("synthetic-log-token-8741"), "{stderr}");
+}
+
+#[test]
+fn logs_scrubs_both_output_pipes_and_keeps_command_failure() {
+    let dir = secret_logs_repo(
+        "logs-secret-command",
+        r#"{command: "cat 'LOGPATH'; cat 'LOGPATH' >&2; exit 7"}"#,
+    );
+    let out = run_in(&dir, &["logs"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(stdout, "ordinary line\ntoken=[redacted:LOG_TOKEN]");
+    assert!(
+        stderr.contains("ordinary line\ntoken=[redacted:LOG_TOKEN]"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("synthetic-log-token-8741"), "{stderr}");
+}
+
+#[test]
+fn logs_follow_flushes_scrubbed_lines_before_the_command_exits() {
+    use std::io::BufRead;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dir = secret_logs_repo(
+        "logs-secret-follow",
+        r#"{command: "sh stream.sh {follow}"}"#,
+    );
+    std::fs::write(
+        dir.join("stream.sh"),
+        "[ \"$1\" = -f ] || exit 9\n\
+         i=0; while [ \"$i\" -lt 4000 ]; do\n\
+           printf 'stderr must drain while stdout is open: 012345678901234567890123456789\n' >&2\n\
+           i=$((i + 1))\n\
+         done\n\
+         printf 'token=synthetic-log-'\n\
+         sleep 0.05\n\
+         printf 'token-8741\n'\n\
+         while [ ! -f release ]; do sleep 0.05; done\n",
+    )
+    .unwrap();
+    let mut child = deliver()
+        .current_dir(&dir)
+        .args(["logs", "--follow"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send((result, line));
+    });
+    // The producer cannot exit until the test receives the line: buffering the
+    // whole command's output would time out here. Always clean up on failure.
+    let received = rx.recv_timeout(Duration::from_secs(10));
+    let still_running = child.try_wait().unwrap().is_none();
+    std::fs::write(dir.join("release"), "done").unwrap();
+    if received.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    let (result, line) = received.expect("a line must arrive before the command exits");
+    result.unwrap();
+    assert!(still_running);
+    assert!(status.success());
+    assert_eq!(line, "token=[redacted:LOG_TOKEN]\n");
+}
+
 #[test]
 fn a_service_that_cannot_say_where_its_logs_are_says_so() {
     let (dir, _) = logs_repo(
