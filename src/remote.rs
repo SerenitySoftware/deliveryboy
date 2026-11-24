@@ -121,9 +121,121 @@ fn scrub_stream(input: impl Read, mut output: impl Write) -> io::Result<()> {
     Ok(())
 }
 
+/// Read both output pipes concurrently, forwarding complete lines as they
+/// arrive. A bounded queue keeps a slow consumer from buffering a whole follow
+/// session. Each pipe preserves its own order; there is no order across pipes.
+pub fn stream_lines(
+    target: &Target,
+    host: &str,
+    script: &str,
+    mut emit: impl FnMut(&str, &str) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::mpsc::sync_channel;
+
+    let mut command = if target.is_local() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    } else {
+        let mut cmd = Command::new("ssh");
+        cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+            .args(target.ssh_args())
+            .arg(format!("{}@{host}", target.ssh.user))
+            .arg(script);
+        cmd
+    };
+    // Keep a local shell's children in the same cancellable group. Killing
+    // only sh can leave tail holding a silent stderr pipe open forever.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = sync_channel(32);
+    let result = std::thread::scope(|scope| {
+        for (stream, pipe) in [
+            ("stdout", Box::new(stdout) as Box<dyn Read + Send>),
+            ("stderr", Box::new(stderr) as Box<dyn Read + Send>),
+        ] {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let mut reader = BufReader::new(pipe);
+                loop {
+                    let mut bytes = Vec::new();
+                    match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if bytes.last() == Some(&b'\n') {
+                                bytes.pop();
+                            }
+                            if tx.send(Ok((stream, bytes))).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(err));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx);
+        for line in &rx {
+            let result =
+                line.and_then(|(stream, bytes)| emit(stream, &String::from_utf8_lossy(&bytes)));
+            if let Err(err) = result {
+                // Reap the process even when the consumer closes its pipe.
+                #[cfg(unix)]
+                let _ = Command::new("kill")
+                    .args(["-KILL", &format!("-{}", child.id())])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                #[cfg(windows)]
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = child.kill();
+                drop(rx);
+                return Err(err);
+            }
+        }
+        Ok(())
+    });
+    let status = child.wait()?;
+    result?;
+    Ok(status.success())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_consumer_cancels_children_holding_silent_pipes() {
+        let target = serde_yaml::from_str("method: local\nhost: localhost\ndir: .\n").unwrap();
+        let start = std::time::Instant::now();
+        let result = super::stream_lines(
+            &target,
+            "localhost",
+            "printf 'first\\n'; sleep 5",
+            |_, _| Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(start.elapsed() < std::time::Duration::from_secs(4));
+    }
 
     #[test]
     fn scrubs_secrets_split_across_reads_and_keeps_line_endings() {

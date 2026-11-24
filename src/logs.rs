@@ -20,6 +20,78 @@ use crate::config::{Config, LogsConfig};
 use crate::deployers::LogSource;
 use crate::plan::ServicePlan;
 use crate::remote::stream;
+use std::collections::BTreeMap;
+use std::io::Write;
+
+/// NDJSON is an envelope around source text, not an OTLP log record. Resource
+/// metadata describes the live release observed before this read, which may
+/// differ from the release that wrote an old line.
+pub fn run_json(
+    request: &Request,
+    config: &Config,
+    follow: bool,
+    tail: usize,
+    deployed: Option<&crate::readback::Deploy>,
+) -> bool {
+    let Some(target) = config.targets.get(&request.target) else {
+        crate::ui::fail(format!(
+            "{}: target '{}' is not defined",
+            request.service, request.target
+        ));
+        return false;
+    };
+    let mut resource = BTreeMap::from([
+        ("service.name", request.service.clone()),
+        ("host.name", request.host.clone()),
+    ]);
+    if let Some(deploy) = deployed {
+        for (key, value) in [
+            ("service.version", &deploy.release),
+            ("deployment.id", &deploy.deploy_id),
+            ("vcs.revision", &deploy.sha),
+        ] {
+            if !value.is_empty() {
+                resource.insert(key, value.clone());
+            }
+        }
+    }
+    // Scrub values before JSON escaping, so quotes or newlines in a secret
+    // neither evade redaction nor corrupt the JSON document.
+    for value in resource.values_mut() {
+        *value = crate::secrets::redact::scrub(value);
+    }
+    let sudo = if target.uses_sudo() { "sudo " } else { "" };
+    let command = request.source.command(sudo, follow, tail);
+    crate::ui::detail(format!("$ {command}"));
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    let result = crate::remote::stream_lines(target, &request.host, &command, |stream, body| {
+        let observed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string();
+        let record = serde_json::json!({
+            "body": crate::secrets::redact::scrub(body),
+            "stream": stream,
+            "observed_time_unix_nano": observed,
+            "resource": resource,
+        });
+        serde_json::to_writer(&mut output, &record)?;
+        output.write_all(b"\n")?;
+        output.flush()
+    });
+    match result {
+        Ok(ok) => ok,
+        Err(err) => {
+            crate::ui::fail(format!(
+                "{}: could not run the read — {err}",
+                request.service
+            ));
+            false
+        }
+    }
+}
 
 /// One service whose logs can be read, and where from.
 #[derive(Debug, Clone, PartialEq)]

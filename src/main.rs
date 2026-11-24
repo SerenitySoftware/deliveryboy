@@ -200,6 +200,9 @@ enum Commands {
         /// How many existing lines to show first
         #[arg(long, short = 'n', default_value_t = 50)]
         tail: usize,
+        /// Emit one JSON object per log line (NDJSON)
+        #[arg(long)]
+        json: bool,
     },
     /// Roll back to the previous release (repoints the live symlink)
     Rollback {
@@ -327,7 +330,8 @@ fn run(cli: &Cli) -> Result<i32> {
             service,
             follow,
             tail,
-        } => cmd_logs(args, service, *follow, *tail),
+            json,
+        } => cmd_logs(args, service, *follow, *tail, *json),
         Commands::Rollback {
             service,
             to,
@@ -2035,7 +2039,13 @@ fn cmd_readback(
     Ok(0)
 }
 
-fn cmd_logs(explicit: ConfigArgs<'_>, only: &[String], follow: bool, tail: usize) -> Result<i32> {
+fn cmd_logs(
+    explicit: ConfigArgs<'_>,
+    only: &[String],
+    follow: bool,
+    tail: usize,
+    json: bool,
+) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
     let root = repo_root(&path);
@@ -2078,6 +2088,21 @@ fn cmd_logs(explicit: ConfigArgs<'_>, only: &[String], follow: bool, tail: usize
         return Ok(2);
     }
 
+    // Snapshot the target's recorded live release, never the local checkout's
+    // version. Old log lines can predate this snapshot.
+    let statuses = if json {
+        let probes = readback::collect(&plan)
+            .into_iter()
+            .filter(|p| {
+                requests
+                    .iter()
+                    .any(|r| r.service == p.service && r.target == p.target && r.host == p.host)
+            })
+            .collect();
+        readback::read(probes, &config.targets)
+    } else {
+        Vec::new()
+    };
     let mut failed = false;
     for request in &requests {
         ui::phase(&format!(
@@ -2089,7 +2114,20 @@ fn cmd_logs(explicit: ConfigArgs<'_>, only: &[String], follow: bool, tail: usize
                 .map(|t| t.describe(&request.host))
                 .unwrap_or_else(|| request.host.clone())
         ));
-        if !logs::run(request, &config, follow, tail) {
+        let ok = if json {
+            let deployed = statuses
+                .iter()
+                .find(|s| {
+                    s.service == request.service
+                        && s.target == request.target
+                        && s.host == request.host
+                })
+                .and_then(|s| s.live_deploy());
+            logs::run_json(request, &config, follow, tail, deployed)
+        } else {
+            logs::run(request, &config, follow, tail)
+        };
+        if !ok {
             failed = true;
         }
     }
