@@ -7594,7 +7594,7 @@ fn logs_never_prints_a_resolved_secret_from_a_file() {
 fn logs_scrubs_both_output_pipes_and_keeps_command_failure() {
     let dir = secret_logs_repo(
         "logs-secret-command",
-        r#"{command: "cat 'LOGPATH'; cat 'LOGPATH' >&2; exit 7"}"#,
+        r#"{command: "cat app.log; cat app.log >&2; exit 7"}"#,
     );
     let out = run_in(&dir, &["logs"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
