@@ -71,3 +71,81 @@ pub fn stream(target: &Target, host: &str, script: &str) -> std::io::Result<bool
     };
     Ok(status.success())
 }
+
+/// Read both output pipes concurrently, forwarding complete lines as they
+/// arrive. A bounded queue keeps a slow consumer from buffering a whole follow
+/// session. Each pipe preserves its own order; there is no order across pipes.
+pub fn stream_lines(
+    target: &Target,
+    host: &str,
+    script: &str,
+    mut emit: impl FnMut(&str, &str) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::mpsc::sync_channel;
+
+    let mut command = if target.is_local() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
+        cmd
+    } else {
+        let mut cmd = Command::new("ssh");
+        cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+            .args(target.ssh_args())
+            .arg(format!("{}@{host}", target.ssh.user))
+            .arg(script);
+        cmd
+    };
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = sync_channel(32);
+    let result = std::thread::scope(|scope| {
+        for (stream, pipe) in [
+            ("stdout", Box::new(stdout) as Box<dyn Read + Send>),
+            ("stderr", Box::new(stderr) as Box<dyn Read + Send>),
+        ] {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let mut reader = BufReader::new(pipe);
+                loop {
+                    let mut bytes = Vec::new();
+                    match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if bytes.last() == Some(&b'\n') {
+                                bytes.pop();
+                            }
+                            if tx.send(Ok((stream, bytes))).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(err));
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx);
+        for line in &rx {
+            let result =
+                line.and_then(|(stream, bytes)| emit(stream, &String::from_utf8_lossy(&bytes)));
+            if let Err(err) = result {
+                // Reap the process even when the consumer closes its pipe.
+                let _ = child.kill();
+                drop(rx);
+                return Err(err);
+            }
+        }
+        Ok(())
+    });
+    let status = child.wait()?;
+    result?;
+    Ok(status.success())
+}

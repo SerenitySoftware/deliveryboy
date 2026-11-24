@@ -7487,6 +7487,186 @@ fn the_scaffolded_spa_config_is_a_config_the_cli_can_actually_load() {
 }
 
 // --- `deliver logs` ---------------------------------------------------------
+
+#[test]
+fn logs_json_preserves_lines_channels_and_failed_status() {
+    let (dir, _) = logs_repo(
+        "logs-json-lines",
+        r#"  api:
+    deployer: commands
+    config: {steps: [{command: "true"}]}
+    logs:
+      command: |
+        printf '%s\n' 'api-1 | hello "world"' ''
+        printf 'last line'
+        printf 'diagnostic\n' >&2
+        exit 7
+"#,
+    );
+    let out = run_in(&dir, &["logs", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let stdout: Vec<_> = rows
+        .iter()
+        .filter(|r| r["stream"] == "stdout")
+        .map(|r| r["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(stdout, ["api-1 | hello \"world\"", "", "last line"]);
+    assert!(rows
+        .iter()
+        .any(|r| r["stream"] == "stderr" && r["body"] == "diagnostic"));
+    for row in &rows {
+        assert_eq!(row["resource"]["service.name"], "api");
+        assert_eq!(row["resource"]["host.name"], "localhost");
+        assert!(row["resource"].get("service.version").is_none());
+        assert!(
+            row["observed_time_unix_nano"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap()
+                > 0
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn logs_json_uses_live_history_instead_of_the_local_version_or_latest_row() {
+    let dir = tmpdir("logs-json-live-history");
+    // History has a newer deploy, but the symlink still names the older one.
+    let root = deployed_fixture(&dir, Some("20260101-0900-aaa1111"));
+    let cfg = files_config(&dir, &root);
+    let mut body = std::fs::read_to_string(&cfg).unwrap();
+    body.push_str("    logs:\n      command: printf 'hello\\n'\n");
+    std::fs::write(&cfg, body).unwrap();
+    let read = || {
+        deliver()
+            .current_dir(&dir)
+            .args(["--config", cfg.to_str().unwrap(), "logs", "--json"])
+            .output()
+            .unwrap()
+    };
+    let out = read();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let row: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(row["resource"]["service.version"], "v0.1.0");
+    assert_eq!(row["resource"]["deployment.id"], "20260101-0900-aaa1111");
+    assert_eq!(row["resource"]["vcs.revision"], "aaa1111deadbeef00");
+    std::fs::remove_file(root.join(".deliver/history.tsv")).unwrap();
+    let out = read();
+    assert!(out.status.success());
+    let row: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(row["resource"].get("service.version").is_none());
+    assert!(row["resource"].get("deployment.id").is_none());
+    assert!(row["resource"].get("vcs.revision").is_none());
+}
+
+#[test]
+fn logs_json_tails_files_and_replaces_invalid_utf8() {
+    let (dir, log) = logs_repo("logs-json-file", "  api:\n    deployer: commands\n    config: {steps: [{command: \"true\"}]}\n    logs:\n      files: [LOGPATH]\n");
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("LOGPATH", log.to_str().unwrap());
+    std::fs::write(cfg, body).unwrap();
+    std::fs::write(log, b"discard\nlast\xff\r\n").unwrap();
+    let out = run_in(&dir, &["logs", "--json", "--tail", "1"]);
+    assert!(out.status.success());
+    let row: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(row["body"], "last\u{fffd}\r");
+}
+
+#[test]
+fn logs_json_redacts_resolved_values_before_json_escaping() {
+    let (dir, log) = logs_repo("logs-json-redaction", "  api:\n    deployer: commands\n    config: {steps: [{command: \"true\"}]}\n    logs:\n      files: [LOGPATH]\n");
+    let cfg = dir.join(".deliver.yml");
+    let mut body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("LOGPATH", log.to_str().unwrap());
+    body.push_str("secrets:\n  providers: [env]\n  define: [JSON_LOG_TOKEN]\n");
+    std::fs::write(cfg, body).unwrap();
+    let token = "synthetic-quoted-\"token\\value";
+    std::fs::write(log, format!("value={token}\n")).unwrap();
+    let out = deliver()
+        .current_dir(&dir)
+        .args(["logs", "--json"])
+        .env("JSON_LOG_TOKEN", token)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let row: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(row["body"], "value=[redacted:JSON_LOG_TOKEN]");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(token));
+}
+
+#[cfg(unix)]
+#[test]
+fn logs_json_follow_flushes_before_the_producer_exits_and_drains_both_pipes() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let (dir, _) = logs_repo(
+        "logs-json-follow",
+        r#"  api:
+    deployer: commands
+    config: {steps: [{command: "true"}]}
+    logs:
+      command: |
+        printf 'first\n'
+        i=0; while [ "$i" -lt 3000 ]; do printf 'stderr line %s padding padding padding padding\n' "$i" >&2; i=$((i+1)); done
+        while [ ! -f 'RELEASE' ]; do sleep 0.05; done
+        printf 'last\n'
+"#,
+    );
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("RELEASE", dir.join("release").to_str().unwrap());
+    std::fs::write(cfg, body).unwrap();
+    let mut child = deliver()
+        .current_dir(&dir)
+        .args(["logs", "--json", "--follow"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut count = 0;
+        for line in BufReader::new(stdout).lines() {
+            let row: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if row["body"] == "first" {
+                tx.send(()).unwrap();
+            }
+            count += 1;
+        }
+        count
+    });
+    let first = rx.recv_timeout(std::time::Duration::from_secs(10));
+    let running = child.try_wait().unwrap().is_none();
+    // Release even on failure, so a failed assertion leaves no subprocess.
+    std::fs::write(dir.join("release"), "").unwrap();
+    let status = child.wait().unwrap();
+    let count = reader.join().unwrap();
+    assert!(first.is_ok(), "first line was not flushed");
+    assert!(running, "producer exited before the release signal");
+    assert!(status.success());
+    assert_eq!(count, 3002);
+}
 //
 // A `method: local` target runs the read through `sh` on this machine, so the
 // whole path — collect the source, render the command, stream it — is exercised

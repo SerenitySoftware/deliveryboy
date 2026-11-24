@@ -132,6 +132,7 @@ Tail what the deploy is running, without an ssh session.
 deliver logs
 deliver logs --service api --follow
 deliver logs --tail 200
+deliver logs --service api --json
 ```
 
 `--tail N` sets how many existing lines to show first (default 50) and
@@ -150,6 +151,30 @@ on half of the hosts this tool targets. Give those services a
 is reported as such and exits `2`.
 
 The command it runs is printed before it runs, and the read is read-only.
+
+`--json` writes NDJSON: one JSON object per source line on stdout, flushed as
+it arrives, including with `--follow`. Each object has `body` (the original
+line without its final newline), `stream` (`stdout` or `stderr`),
+`observed_time_unix_nano` (the CLI's observation time, as a decimal string),
+and a `resource` object containing `service.name` and `host.name`.
+CLI messages stay on stderr. Source stderr, including SSH diagnostics, becomes
+records on stdout; it does not imply an error severity. Each channel keeps its
+own line order; order between channels is unspecified. Invalid UTF-8 becomes
+replacement characters, and a final line without a newline still gets a record.
+
+When target read-back can match a live release to its history row, `resource`
+also includes `service.version`, `deployment.id` and `vcs.revision`. These
+describe the live release observed before reading logs, not necessarily the
+release that wrote an older line. Missing or unreadable history leaves those
+attributes out; the CLI never substitutes its local checkout version. Metadata
+stays fixed for that read, even if a deploy happens during `--follow`.
+The body keeps source timestamps and prefixes; the CLI does not guess a log's
+event time or severity. JSON output is an envelope, not OTLP. A failed source
+command still exits `1`, even if it emitted records first.
+
+For example, select just the bodies with
+`deliver logs --json | jq -r '.body'`. Log reads stay on demand and end with
+the command; JSON mode adds no background collection or shipping.
 
 ## `deliver verify`
 
