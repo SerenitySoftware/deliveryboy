@@ -13,8 +13,8 @@
 //! files and the `-p` project because it wrote them — so every other service
 //! either carries a `logs:` block or is reported as having nowhere to look.
 //!
-//! Read-only: nothing here mutates the target, and the command runs with this
-//! process's stdio attached so `--follow` streams.
+//! Read-only: nothing here mutates the target. Each output line passes through
+//! the secret scrubber and flushes immediately so `--follow` streams.
 
 use crate::config::{Config, LogsConfig};
 use crate::deployers::LogSource;
