@@ -56,7 +56,7 @@
 //!       content: 'proxy_set_header X-Admin-Access "{secret:ADMIN_TOKEN}";'
 //! ```
 
-use super::{cfg_bool, cfg_str, PlanContext, PlannedStep};
+use super::{cfg_bool, cfg_str, IngressState, PlanContext, PlannedStep};
 use crate::remote::shell_quote;
 use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
@@ -611,7 +611,12 @@ fn with_nginx_lock(script: &str, sudo: &str, holder: &str) -> String {
 /// marked `.previous.absent` on a first install), so the step's undo can put
 /// it back beside the previous release: after a later step fails, on Ctrl-C,
 /// and on `deliver rollback`.
-fn install_step(spec: &VhostSpec, ctx: &PlanContext, content: Option<&str>) -> PlannedStep {
+fn install_step(
+    spec: &VhostSpec,
+    ctx: &PlanContext,
+    content: Option<&str>,
+    cert_names: Vec<String>,
+) -> PlannedStep {
     let sudo = ctx.sudo_prefix();
     let root = ctx.target.dir.trim_end_matches('/');
     let site = &spec.site_name;
@@ -651,12 +656,17 @@ fn install_step(spec: &VhostSpec, ctx: &PlanContext, content: Option<&str>) -> P
          echo \"restored previous vhost {site}\""
     );
     let holder = format!("{root} {site}");
-    let step = PlannedStep::ssh(
+    let mut step = PlannedStep::ssh(
         format!("install vhost {site} (validate + rollback on failure)"),
         with_nginx_lock(&script, sudo, &holder),
     )
     .with_rollback(with_nginx_lock(&undo, sudo, &holder))
     .needs_remote(&["nginx", "systemctl"]);
+    step.ingress_state = Some(IngressState {
+        conf_path: available.clone(),
+        enabled_path: enabled,
+        cert_names,
+    });
     match content {
         Some(text) => step.with_live_config(&available, text),
         None => step,
@@ -846,7 +856,11 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
             Some(text) => Some(text.clone()),
             None => std::fs::read_to_string(ctx.repo_root.join(&spec.conf)).ok(),
         };
-        steps.push(install_step(spec, ctx, content.as_deref()));
+        let names = cert_needs_for(spec, ctx, content.as_deref())?
+            .into_iter()
+            .map(|cert| cert.cert_name)
+            .collect();
+        steps.push(install_step(spec, ctx, content.as_deref(), names));
     }
 
     // An nginx deploy is only "done" if the config parses and the running nginx

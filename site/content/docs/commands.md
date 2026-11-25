@@ -111,6 +111,8 @@ deliver status --service web --json
 
 Services deployed with `files` or `hugo` answer from the release symlink; `docker-compose` services have no symlink, so they answer from the newest recorded deploy and say so. A target that cannot be read is reported as such and exits `1`, so a failed read never looks like "nothing is deployed".
 
+Managed `nginx-vhost` services show whether each conf is installed and its `sites-enabled` link points to it, whether `nginx -t` passes, and the whole days remaining for each declared Let's Encrypt certificate. Expired, missing and unreadable certificates are named explicitly. These checks share the existing connection per target; they do not install, reload or renew anything. `--json` includes an `ingress` array with these results. Script-managed nginx services cannot declare their installed paths and are not probed.
+
 ## `deliver history`
 
 List the deploys recorded on the target, newest first, marking the one that is live.
@@ -121,6 +123,8 @@ deliver history --limit 0
 ```
 
 `--limit N` shows the newest `N` per service (default 10); `--limit 0` shows every recorded deploy.
+
+Managed nginx services show their ingress checks and state that nginx installs do not record release history.
 
 A deploy that failed and was unwound is followed by a `(rollback)` row for the release it restored, so the live marker stays on what is actually running.
 
@@ -229,6 +233,8 @@ deliver fleet preflight
 deliver fleet deploy
 deliver fleet --repo conduit deploy
 ```
+
+For repos with managed nginx services, the fleet summary includes the lowest certificate day count across all their vhosts. It also flags expired, missing or unreadable certs, so a healthy certificate cannot hide a failed read of another one.
 
 The fleet file is a list of repo paths, relative to the file itself (`~` works):
 

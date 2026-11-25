@@ -890,7 +890,7 @@ fn live_release(
     root: &Path,
     v: version::DeployVersion,
 ) -> Result<version::DeployVersion> {
-    let requests = readback::collect(&plan::build(config, only, root, &v)?);
+    let requests = readback::collect_releases(&plan::build(config, only, root, &v)?);
     let statuses = if requests.is_empty() {
         Vec::new()
     } else {
@@ -1424,7 +1424,7 @@ fn shipping_approved(
     assume_yes: bool,
     dry_run: bool,
 ) -> Result<bool> {
-    let mut requests = readback::collect(plan);
+    let mut requests = readback::collect_releases(plan);
     // A dry run does not reach remote targets, for the same reason preflight
     // skips remote reachability there; a local target costs nothing to read.
     let before = requests.len();
@@ -1977,6 +1977,16 @@ fn cmd_readback(
     what: Readback,
     json: bool,
 ) -> Result<i32> {
+    cmd_readback_with_summary(explicit, only, what, json, &mut None)
+}
+
+fn cmd_readback_with_summary(
+    explicit: ConfigArgs<'_>,
+    only: &[String],
+    what: Readback,
+    json: bool,
+    summary: &mut Option<String>,
+) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
     let root = repo_root(&path);
@@ -1995,7 +2005,7 @@ fn cmd_readback(
         ui::phase("Nothing to read back");
         ui::note(
             "no service in this config records deploy state on the target — \
-             that record is written by the files/hugo and docker-compose deployers.",
+             supported deployers are files/hugo, docker-compose and managed nginx-vhost.",
         );
         return Ok(0);
     }
@@ -2012,6 +2022,7 @@ fn cmd_readback(
     ));
     let statuses = readback::read(requests, &config.targets);
 
+    *summary = readback::certificate_summary(&statuses);
     if json {
         println!(
             "{}",
@@ -2332,7 +2343,7 @@ fn cmd_rollback(explicit: ConfigArgs<'_>, only: &[String], how: RollbackRun) -> 
     // anything is touched. Read-only, so a dry run reads it too: the preview
     // is the whole point of one.
     let names: Vec<&str> = reversible.iter().map(|sp| sp.service.as_str()).collect();
-    let requests: Vec<readback::Request> = readback::collect(&plan)
+    let requests: Vec<readback::Request> = readback::collect_releases(&plan)
         .into_iter()
         .filter(|r| names.contains(&r.service.as_str()))
         .collect();
@@ -2448,7 +2459,7 @@ fn cmd_rollback_to(
             .and_then(|r| r.version_from.as_deref()),
     );
     let plan = plan::build(&config, only, &root, &v)?;
-    let requests = readback::collect(&plan);
+    let requests = readback::collect_releases(&plan);
     if requests.is_empty() {
         ui::phase("Failed");
         ui::fail("no service in this config keeps releases on the target");
@@ -2634,6 +2645,7 @@ fn cmd_fleet(
         target: None,
     };
     let mut outcomes: Vec<(&fleet::Repo, fleet::RepoOutcome)> = Vec::new();
+    let mut certificate_summaries = std::collections::BTreeMap::new();
     let mut stopped = false;
     for repo in &selected {
         if stopped {
@@ -2641,6 +2653,7 @@ fn cmd_fleet(
             continue;
         }
         ui::phase(&format!("{} — {}", repo.name, repo.path.display()));
+        let mut certificate_summary = None;
         let outcome = fleet::run_in(repo, || match action {
             FleetAction::Preflight { service } => cmd_preflight(each, service),
             FleetAction::Deploy {
@@ -2650,8 +2663,17 @@ fn cmd_fleet(
                 force,
                 ..
             } => cmd_deploy(each, service, *dry_run, false, *yes, None, *force, false),
-            FleetAction::Status { service } => cmd_readback(each, service, Readback::Status, false),
+            FleetAction::Status { service } => cmd_readback_with_summary(
+                each,
+                service,
+                Readback::Status,
+                false,
+                &mut certificate_summary,
+            ),
         });
+        if let Some(summary) = certificate_summary {
+            certificate_summaries.insert(repo.name.clone(), summary);
+        }
         // Ctrl-C ends the fleet run even with --keep-going: the operator
         // stopped one repo and did not ask for the next to start.
         if !outcome.ok() && (stop_on_failure || interrupt::seen()) {
@@ -2667,7 +2689,11 @@ fn cmd_fleet(
         .max()
         .unwrap_or(0);
     for (repo, outcome) in &outcomes {
-        let line = format!("{:width$}  {}", repo.name, outcome.describe());
+        let suffix = certificate_summaries
+            .get(&repo.name)
+            .map(|s| format!(" · {s}"))
+            .unwrap_or_default();
+        let line = format!("{:width$}  {}{suffix}", repo.name, outcome.describe());
         match outcome {
             fleet::RepoOutcome::Ran(0) => ui::ok(line),
             fleet::RepoOutcome::NotAttempted => ui::detail(format!("- {line}")),

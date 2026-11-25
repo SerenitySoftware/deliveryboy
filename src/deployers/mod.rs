@@ -99,6 +99,14 @@ pub struct ReleaseState {
     pub backups_dir: Option<String>,
 }
 
+/// Installed nginx paths and certificate names, declared by the install step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IngressState {
+    pub conf_path: String,
+    pub enabled_path: String,
+    pub cert_names: Vec<String>,
+}
+
 /// Where a service's runtime logs can be read on the target, carried alongside
 /// a step so `deliver logs` can tail them (see [`crate::logs`]).
 ///
@@ -194,6 +202,8 @@ pub struct PlannedStep {
     /// part of the step the executor runs.
     #[serde(skip_serializing)]
     pub release_state: Option<ReleaseState>,
+    #[serde(skip_serializing)]
+    pub ingress_state: Option<IngressState>,
     /// How this step's service can be tailed on the target, when the deployer
     /// knows. Not serialized, for the same reason `release_state` is not: it is
     /// compile-time metadata for a local read, not part of the step.
@@ -231,6 +241,7 @@ impl PlannedStep {
             secret: false,
             live_config: None,
             release_state: None,
+            ingress_state: None,
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
@@ -253,6 +264,7 @@ impl PlannedStep {
             secret: false,
             live_config: None,
             release_state: None,
+            ingress_state: None,
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
@@ -270,6 +282,7 @@ impl PlannedStep {
             secret: false,
             live_config: None,
             release_state: None,
+            ingress_state: None,
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
@@ -296,6 +309,7 @@ impl PlannedStep {
             secret: true,
             live_config: None,
             release_state: None,
+            ingress_state: None,
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
@@ -331,6 +345,7 @@ impl PlannedStep {
             secret: false,
             live_config: None,
             release_state: None,
+            ingress_state: None,
             log_source: None,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
