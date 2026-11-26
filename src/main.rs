@@ -1050,8 +1050,43 @@ fn cmd_clean(explicit: ConfigArgs<'_>) -> Result<i32> {
 fn cmd_validate(explicit: ConfigArgs<'_>) -> Result<i32> {
     ui::banner();
     let (config, path) = load_announced(explicit)?;
-    let v = version_announced(&config, &repo_root(&path), None);
+    let root = repo_root(&path);
+    let v = version_announced(&config, &root, None);
     ui::phase("Validating");
+
+    // Compile every service, including `enabled: false` ones: passing every
+    // service name as `only` overrides `enabled: false` so a broken disabled
+    // service is caught here rather than when someone runs `--service`.
+    let all: Vec<String> = config.services.keys().cloned().collect();
+    let compiled = plan::compile(&config, &all, &root, &v)?;
+
+    let mut failures = 0usize;
+    for err in &compiled.errors {
+        if err
+            .error
+            .chain()
+            .any(|cause| cause.is::<secrets::Unresolved>())
+        {
+            ui::warn(format!("{err} — run `deliver secrets` to check providers"));
+        } else if err
+            .error
+            .chain()
+            .any(|cause| cause.is::<deployers::MissingInput>())
+        {
+            ui::warn(format!(
+                "{err} — run `deliver preflight` to check local files"
+            ));
+        } else {
+            failures += 1;
+            ui::fail(err.to_string());
+        }
+    }
+
+    if failures > 0 {
+        ui::note("fix the above — deliver plan would refuse this config");
+        return Ok(2);
+    }
+
     ui::ok("schema and references are valid");
     ui::detail(format!(
         "would deploy as {} · {}",

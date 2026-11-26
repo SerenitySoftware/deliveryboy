@@ -106,13 +106,28 @@ pub fn unplanned_hosts(
     pairs
 }
 
+/// One service that failed to compile, keeping the underlying error chain so
+/// callers can distinguish runtime findings (missing secrets or local input
+/// files) from config errors without matching formatted text.
+#[derive(Debug)]
+pub struct ServiceError {
+    pub service: String,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "service '{}': {}", self.service, self.error)
+    }
+}
+
 /// A compiled plan plus the services that would not compile.
 pub struct Compilation {
     pub plan: Vec<ServicePlan>,
     /// One entry per failed service, in plan order. [`build`] turns the first
-    /// into its error; `deliver preflight` reports all of them as findings so
-    /// the rest of its checks still run.
-    pub errors: Vec<String>,
+    /// into its error; `deliver preflight` and `deliver validate` inspect all
+    /// of them.
+    pub errors: Vec<ServiceError>,
 }
 
 pub fn build(
@@ -174,7 +189,10 @@ pub fn compile_from(
         let (target_name, target) = match config.target_for(service) {
             Ok(pair) => pair,
             Err(e) => {
-                errors.push(format!("service '{name}': {e}"));
+                errors.push(ServiceError {
+                    service: name,
+                    error: e,
+                });
                 continue;
             }
         };
@@ -220,7 +238,10 @@ pub fn compile_from(
                     soak,
                 }),
                 Err(e) => {
-                    failed = Some(format!("service '{name}': {e}"));
+                    failed = Some(ServiceError {
+                        service: name.clone(),
+                        error: e,
+                    });
                     break;
                 }
             }

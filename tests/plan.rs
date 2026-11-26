@@ -11366,3 +11366,209 @@ fn nested_compose_executes_paths_with_spaces_and_quotes() {
         .unwrap()
         .contains("nginx:1.25"));
 }
+
+#[test]
+fn validate_refuses_unknown_deployer_missing_deployer_keys_and_unknown_verify() {
+    let demo = |services: &str| {
+        format!(
+            "version: 1\napp: demo\ndefaults: {{target: prod}}\ntargets:\n  prod: {{host: demo.example.com, user: root, dir: /srv/demo}}\nservices:\n{services}"
+        )
+    };
+
+    // 1. Unknown deployer
+    let dir = tmpdir("validate-unknown-deployer");
+    let cfg = write_config(&dir, &demo("  app:\n    deployer: ftp\n    config: {}\n"));
+    let out = deliver()
+        .args(["--config"])
+        .arg(&cfg)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("✗ service 'app'"), "{err}");
+    assert!(err.contains("unknown deployer 'ftp'"), "{err}");
+    assert!(
+        err.contains("fix the above — deliver plan would refuse this config"),
+        "{err}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+
+    // 2. Missing required keys on files and nginx-vhost — both reported in one pass
+    let dir = tmpdir("validate-missing-keys");
+    let cfg = write_config(
+        &dir,
+        &demo(
+            "  assets:\n    deployer: files\n    config: {}\n  ingress:\n    deployer: nginx-vhost\n    config: {}\n",
+        ),
+    );
+    let out = deliver()
+        .args(["--config"])
+        .arg(&cfg)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("✗ service 'assets'"), "{err}");
+    assert!(err.contains("files: 'src' is required"), "{err}");
+    assert!(err.contains("✗ service 'ingress'"), "{err}");
+    assert!(err.contains("`conf:` or `vhosts:` is required"), "{err}");
+    assert!(
+        err.contains("fix the above — deliver plan would refuse this config"),
+        "{err}"
+    );
+
+    // 3. Unknown verify check
+    let dir = tmpdir("validate-unknown-verify");
+    let cfg = write_config(
+        &dir,
+        &demo(
+            "  app:\n    deployer: commands\n    config: {steps: [{command: \"echo ok\"}]}\n    verify: [{ping: \"https://demo.example.com/\"}]\n",
+        ),
+    );
+    let out = deliver()
+        .args(["--config"])
+        .arg(&cfg)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("✗ service 'app'"), "{err}");
+    assert!(err.contains("unknown verify check"), "{err}");
+    assert!(err.contains("ping"), "{err}");
+    assert!(
+        err.contains("fix the above — deliver plan would refuse this config"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_catches_errors_on_disabled_services() {
+    let dir = tmpdir("validate-disabled-service");
+    let cfg = write_config(
+        &dir,
+        "version: 1\napp: demo\ndefaults: {target: prod}\ntargets:\n  prod: {host: demo.example.com, user: root, dir: /srv/demo}\nservices:\n  web:\n    deployer: commands\n    config: {steps: [{command: \"echo ok\"}]}\n  api:\n    enabled: false\n    deployer: docker-compose\n    config:\n      image:\n        name: demo-api\n        transport: ftp\n",
+    );
+    let out = deliver()
+        .args(["--config"])
+        .arg(&cfg)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("✗ service 'api'"), "{err}");
+    assert!(err.contains("transport"), "{err}");
+    assert!(err.contains("ftp"), "{err}");
+    assert!(
+        err.contains("fix the above — deliver plan would refuse this config"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_warns_not_fails_on_missing_inputs_and_unresolved_secrets() {
+    // Missing nginx conf (managed vhost) and missing docker-compose include stay findings
+    let dir = tmpdir("validate-missing-input");
+    let cfg = write_config(
+        &dir,
+        r#"
+version: 1
+app: demo
+defaults: {target: prod}
+targets:
+  prod: {host: demo.example.com, user: root, dir: /srv/demo}
+services:
+  nginx:
+    deployer: nginx-vhost
+    config: {conf: nginx/sample.conf}
+  stack:
+    deployer: docker-compose
+    config:
+      include: [monitoring/rules.yml]
+"#,
+    );
+    let out = deliver()
+        .args(["--config"])
+        .arg(&cfg)
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("! service 'nginx': nginx-vhost: cannot read")
+            && err.contains("deliver preflight"),
+        "{err}"
+    );
+    assert!(
+        err.contains("! service 'stack': docker-compose: include 'monitoring/rules.yml'")
+            && err.contains("deliver preflight"),
+        "{err}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("OK — demo:"));
+
+    // Unresolved secrets in both docker-compose and nginx-vhost stay findings
+    let dir = tmpdir("validate-unresolved-secrets");
+    std::fs::create_dir_all(dir.join("nginx")).unwrap();
+    std::fs::write(
+        dir.join("nginx/site.conf"),
+        "server { server_name __HOST__; }\n",
+    )
+    .unwrap();
+    let cfg = write_config(
+        &dir,
+        r#"
+version: 1
+app: demo
+defaults: {target: prod}
+secrets:
+  providers: [env]
+  define: [DELIVER_TEST_MISSING_DB_PASS, DELIVER_TEST_MISSING_HOST]
+targets:
+  prod: {host: demo.example.com, user: root, dir: /srv/demo}
+services:
+  stack:
+    deployer: docker-compose
+    config:
+      env_file:
+        path: .env
+        from_secrets: [DELIVER_TEST_MISSING_DB_PASS]
+  nginx:
+    deployer: nginx-vhost
+    config:
+      conf: nginx/site.conf
+      render:
+        __HOST__: "{secret:DELIVER_TEST_MISSING_HOST}"
+"#,
+    );
+    let out = deliver()
+        .args(["--config"])
+        .arg(&cfg)
+        .arg("validate")
+        .env_remove("DELIVER_TEST_MISSING_DB_PASS")
+        .env_remove("DELIVER_TEST_MISSING_HOST")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("! service 'stack':") && err.contains("deliver secrets"),
+        "{err}"
+    );
+    assert!(
+        err.contains("! service 'nginx':") && err.contains("deliver secrets"),
+        "{err}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("OK — demo:"));
+}
