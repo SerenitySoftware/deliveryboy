@@ -55,6 +55,33 @@ impl std::error::Error for MissingInput {
     }
 }
 
+/// A deployer that requires a different host OS (e.g. `macos_app` on Linux or
+/// Windows).
+///
+/// Carried as a typed error so `deliver validate` can report it as a finding
+/// when linting a config on another OS, while `plan` and `deploy` still refuse
+/// to run on an unsupported host.
+#[derive(Debug)]
+pub struct UnsupportedHost {
+    message: String,
+}
+
+impl UnsupportedHost {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UnsupportedHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UnsupportedHost {}
+
 /// One concrete step. `Command` runs locally; `Ssh` runs on the target;
 /// `Http` is a request (used by verify).
 #[derive(Debug, Clone, Serialize)]

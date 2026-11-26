@@ -2377,6 +2377,24 @@ fn macos_app_fails_fast_off_macos() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("requires macOS"));
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn validate_warns_not_fails_on_macos_app_off_macos() {
+    let dir = macos_repo("macos-validate-wrong-os");
+    let out = run_in(&dir, &["validate"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("! service 'macos':") && err.contains("requires macOS"),
+        "{err}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("OK —"));
+}
+
 #[test]
 fn named_service_overrides_enabled_false() {
     let dir = tmpdir("enabled-override");

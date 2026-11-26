@@ -126,11 +126,12 @@ fn shell_quote(value: &str) -> String {
 pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     // Fail at compile time, not halfway through a release: this only runs on macOS.
     if std::env::consts::OS != "macos" {
-        bail!(
+        return Err(crate::deployers::UnsupportedHost::new(format!(
             "macos_app requires macOS (running on {}). Build the Mac app from a Mac; \
              a remote macOS runner is a later milestone.",
             std::env::consts::OS
-        );
+        ))
+        .into());
     }
 
     // Sparkle, the DMG name, and the appcast all need a release number. `plan`

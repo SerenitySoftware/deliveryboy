@@ -1076,6 +1076,12 @@ fn cmd_validate(explicit: ConfigArgs<'_>) -> Result<i32> {
             ui::warn(format!(
                 "{err} — run `deliver preflight` to check local files"
             ));
+        } else if err
+            .error
+            .chain()
+            .any(|cause| cause.is::<deployers::UnsupportedHost>())
+        {
+            ui::warn(err.to_string());
         } else {
             failures += 1;
             ui::fail(err.to_string());
