@@ -12,6 +12,22 @@ pub mod resolve;
 
 pub use resolve::{parse_definitions, parse_providers, Exposure, Resolver};
 
+/// A secret that no configured provider could supply during plan compilation.
+///
+/// Carried as a typed error so `deliver validate` can report it as a finding
+/// (pointing at `deliver secrets`) rather than a config failure, while `plan`
+/// and `deploy` still refuse to ship without the value.
+#[derive(Debug)]
+pub struct Unresolved(pub String);
+
+impl std::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unresolved {}
+
 use crate::config::Config;
 use std::path::Path;
 use std::process::{Command, Stdio};

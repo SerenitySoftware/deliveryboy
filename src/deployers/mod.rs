@@ -13,6 +13,75 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 use serde_yaml::Value;
 
+/// A local input file a deployer needs to read at compile time (e.g. an nginx
+/// vhost conf or a Compose `include:` path) that is absent or unreadable.
+///
+/// Carried as a typed error so `deliver validate` can report it as a finding
+/// (pointing at `deliver preflight`) rather than a config failure, while `plan`
+/// and `deploy` still refuse to run without it.
+#[derive(Debug)]
+pub struct MissingInput {
+    message: String,
+    source: Option<std::io::Error>,
+}
+
+impl MissingInput {
+    pub fn io(message: impl Into<String>, source: std::io::Error) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(source),
+        }
+    }
+
+    pub fn missing(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+}
+
+impl std::fmt::Display for MissingInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MissingInput {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// A deployer that requires a different host OS (e.g. `macos_app` on Linux or
+/// Windows).
+///
+/// Carried as a typed error so `deliver validate` can report it as a finding
+/// when linting a config on another OS, while `plan` and `deploy` still refuse
+/// to run on an unsupported host.
+#[derive(Debug)]
+pub struct UnsupportedHost {
+    message: String,
+}
+
+impl UnsupportedHost {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UnsupportedHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UnsupportedHost {}
+
 /// One concrete step. `Command` runs locally; `Ssh` runs on the target;
 /// `Http` is a request (used by verify).
 #[derive(Debug, Clone, Serialize)]

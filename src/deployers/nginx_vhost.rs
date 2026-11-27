@@ -133,11 +133,11 @@ fn expand_secrets(template: &str, ctx: &PlanContext) -> Result<String> {
                     .filter(|d| !d.required)
                     .map(|_| String::new())
             })
-            .with_context(|| {
-                format!(
+            .ok_or_else(|| {
+                crate::secrets::Unresolved(format!(
                     "nginx-vhost: {{{kind}:{name}}} needs secret '{name}', which no provider has ({})",
                     ctx.resolver().describe()
-                )
+                ))
             })?;
         out.push_str(&rest[..start]);
         out.push_str(&if kind == "origin" {
@@ -343,8 +343,12 @@ fn cert_needs_for(
         Some(text) => text.to_string(),
         None => {
             let local = ctx.repo_root.join(&spec.conf);
-            std::fs::read_to_string(&local)
-                .with_context(|| format!("nginx-vhost: cannot read {}", local.display()))?
+            std::fs::read_to_string(&local).map_err(|source| {
+                crate::deployers::MissingInput::io(
+                    format!("nginx-vhost: cannot read {}", local.display()),
+                    source,
+                )
+            })?
         }
     };
     let facts = parse_vhost(&text);
@@ -718,8 +722,12 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         }
         for spec in &specs {
             let local = ctx.repo_root.join(&spec.conf);
-            let text = std::fs::read_to_string(&local)
-                .with_context(|| format!("nginx-vhost: cannot read {}", local.display()))?;
+            let text = std::fs::read_to_string(&local).map_err(|source| {
+                crate::deployers::MissingInput::io(
+                    format!("nginx-vhost: cannot read {}", local.display()),
+                    source,
+                )
+            })?;
             let mut rendered = text.clone();
             for (key, value) in &subs {
                 // A placeholder that isn't there is a rename or a typo — and it

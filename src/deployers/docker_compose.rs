@@ -138,12 +138,13 @@ fn render_env(
         }
     }
     if !missing.is_empty() {
-        bail!(
+        return Err(crate::secrets::Unresolved(format!(
             "docker-compose: {} secret(s) not found in any provider ({}): {}",
             missing.len(),
             resolver.describe(),
             missing.join(", ")
-        );
+        ))
+        .into());
     }
 
     lines.sort();
@@ -747,7 +748,10 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     for path in string_list(cfg.get("include")) {
         let local = ctx.repo_root.join(&path);
         if !local.exists() {
-            bail!("docker-compose: include '{path}' does not exist in the repo");
+            return Err(crate::deployers::MissingInput::missing(format!(
+                "docker-compose: include '{path}' does not exist in the repo"
+            ))
+            .into());
         }
         let dest = match path.rsplit_once('/') {
             Some((parent, _)) => format!("{root}/{parent}"),
