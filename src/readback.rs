@@ -835,7 +835,11 @@ fn detect_image_drift(
                 },
             )
         } else if tag_matches_sha(tag, &old.sha) {
-            Some(short_sha(&recorded.sha))
+            Some(if !recorded.sha.is_empty() && recorded.sha != "unknown" {
+                short_sha(&recorded.sha)
+            } else {
+                recorded.deploy_id.clone()
+            })
         } else {
             None
         }
@@ -1776,6 +1780,26 @@ mod tests {
         assert!(!text.contains("cache runs"), "{text}");
         assert!(!text.contains("exporter runs"), "{text}");
         assert!(!text.contains("cron runs"), "{text}");
+    }
+
+    #[test]
+    fn compose_drift_falls_back_to_deploy_id_when_recorded_sha_is_unknown() {
+        let raw = "ok\n\
+            {\"Service\":\"api\",\"Name\":\"app-api-1\",\"Image\":\"myapp:aaaaaaa\",\"State\":\"running\",\"Status\":\"Up 1 hour\"}\n";
+        let (containers, reachable) = parse_compose_ps(raw);
+        let status = compose_status(
+            "1\t20261001T120000Z-aaaaaaa\tv1.1.0\taaaaaaa1234\t2026-10-01T12:00:00Z\n\
+             2\t20261015T120000Z-bbbbbbb\tv1.2.0\tunknown\t2026-10-15T12:00:00Z\n",
+            containers,
+            reachable,
+        );
+        let text = render_status(&[status]);
+        assert!(
+            text.contains(
+                "drift         api runs myapp:aaaaaaa but the record says myapp:20261015T120000Z-bbbbbbb"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
