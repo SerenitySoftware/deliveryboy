@@ -109,7 +109,7 @@ deliver status
 deliver status --service web --json
 ```
 
-Services deployed with `files` or `hugo` answer from the release symlink; `docker-compose` services have no symlink, so they answer from the newest recorded deploy and say so. A target that cannot be read is reported as such and exits `1`, so a failed read never looks like "nothing is deployed".
+Services deployed with `files` or `hugo` answer from the release symlink; `docker-compose` services have no symlink, so they answer from the newest recorded deploy and also run `docker compose ps --format json` over the same connection to report live container state (running, healthy, uptime, restarting, or nothing running) and flag any container whose image tag differs from the recorded release. An unreachable Docker daemon is reported on its own line rather than as "nothing running". `--json` includes a `containers` array and `docker_reachable` for Compose services. A target that cannot be read is reported as such and exits `1`, so a failed read never looks like "nothing is deployed".
 
 Managed `nginx-vhost` services show whether each conf is installed and its `sites-enabled` link points to it, whether `nginx -t` passes, and the whole days remaining for each declared Let's Encrypt certificate. Expired, missing and unreadable certificates are named explicitly. These checks share the existing connection per target; they do not install, reload or renew anything. `--json` includes an `ingress` array with these results. Script-managed nginx services cannot declare their installed paths and are not probed.
 
