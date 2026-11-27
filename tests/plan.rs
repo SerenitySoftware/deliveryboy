@@ -31,6 +31,8 @@ fn compose_status_reports_containers_restarts_drift_empty_and_unreachable_daemon
     let calls = dir.join("connections");
     let docker_args = dir.join("docker-args");
     let ps_file = dir.join("ps-output");
+    let ids_file = dir.join("ids-output");
+    let inspect_file = dir.join("inspect-output");
     let daemon_down = dir.join("daemon-down");
 
     let ssh = format!(
@@ -38,9 +40,11 @@ fn compose_status_reports_containers_restarts_drift_empty_and_unreachable_daemon
         calls.display()
     );
     let docker = format!(
-        "#!/bin/sh\necho \"$PWD :: $*\" >> {}\nif [ -f {} ]; then echo 'Cannot connect to the Docker daemon' >&2; exit 1; fi\ncat {}\n",
+        "#!/bin/sh\necho \"$PWD :: $*\" >> {}\nif [ -f {} ]; then echo 'Cannot connect to the Docker daemon' >&2; exit 1; fi\ncase \"$*\" in\n  *\" -q\"*) cat {} ;;\n  inspect*) cat {} ;;\n  *) cat {} ;;\nesac\n",
         docker_args.display(),
         daemon_down.display(),
+        ids_file.display(),
+        inspect_file.display(),
         ps_file.display()
     );
     for (name, content) in [("ssh", ssh), ("docker", docker)] {
@@ -72,7 +76,13 @@ fn compose_status_reports_containers_restarts_drift_empty_and_unreachable_daemon
         &ps_file,
         "{\"Service\":\"api\",\"Name\":\"demo-api-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"running\",\"Status\":\"Up 2 hours (healthy)\",\"Health\":\"healthy\"}\n\
          {\"Service\":\"worker\",\"Name\":\"demo-worker-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
-         {\"Service\":\"db\",\"Name\":\"demo-db-1\",\"Image\":\"postgres:16-alpine\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n",
+         {\"Service\":\"cache\",\"Name\":\"demo-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n",
+    )
+    .unwrap();
+    std::fs::write(&ids_file, "aaa\nbbb\nccc\n").unwrap();
+    std::fs::write(
+        &inspect_file,
+        "/demo-api-1 0\n/demo-worker-1 0\n/demo-cache-1 0\n",
     )
     .unwrap();
     let out = run(&["status"]);
@@ -83,30 +93,37 @@ fn compose_status_reports_containers_restarts_drift_empty_and_unreachable_daemon
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        text.contains("services      3/3 running (api healthy, worker up 2h, db up 2h)"),
+        text.contains("services      3/3 running (api healthy, worker up 2h, cache up 2h)"),
         "{text}"
     );
     assert!(!text.contains("drift"), "{text}");
     assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
     let logged = std::fs::read_to_string(&docker_args).unwrap();
     assert!(
-        logged.contains("compose -f docker-compose.yml -p demo ps --format json"),
+        logged.contains("compose -f docker-compose.yml -p demo ps --all --format json"),
         "{logged}"
     );
 
-    // 2. Crash-looping worker + drifted api image tag (human + --json).
+    // 2. Crash-looping worker (restart count from docker inspect) + exited container + drifted api image tag (human + --json).
     std::fs::write(
         &ps_file,
         "{\"Service\":\"api\",\"Name\":\"demo-api-1\",\"Image\":\"demo:20261001T120000Z-aaaaaaa\",\"State\":\"running\",\"Status\":\"Up 3 days (healthy)\",\"Health\":\"healthy\"}\n\
-         {\"Service\":\"worker\",\"Name\":\"demo-worker-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"restarting\",\"Status\":\"Restarting (1) 4 seconds ago\",\"RestartCount\":4}\n\
-         {\"Service\":\"db\",\"Name\":\"demo-db-1\",\"Image\":\"postgres:16-alpine\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n",
+         {\"Service\":\"worker\",\"Name\":\"demo-worker-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"restarting\",\"Status\":\"Restarting (1) 4 seconds ago\"}\n\
+         {\"Service\":\"jobs\",\"Name\":\"demo-jobs-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"exited\",\"Status\":\"Exited (1) 2 minutes ago\",\"ExitCode\":1}\n\
+         {\"Service\":\"cache\",\"Name\":\"demo-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n",
+    )
+    .unwrap();
+    std::fs::write(&ids_file, "aaa\nbbb\nccc\nddd\n").unwrap();
+    std::fs::write(
+        &inspect_file,
+        "/demo-api-1 0\n/demo-worker-1 4\n/demo-jobs-1 0\n/demo-cache-1 0\n",
     )
     .unwrap();
     let out = run(&["status"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{text}");
     assert!(
-        text.contains("services      2/3 running (api healthy, worker restarting ×4, db up 2h)"),
+        text.contains("services      2/4 running (api healthy, worker restarting ×4, jobs exited (1), cache up 2h)"),
         "{text}"
     );
     assert!(
@@ -115,13 +132,14 @@ fn compose_status_reports_containers_restarts_drift_empty_and_unreachable_daemon
         ),
         "{text}"
     );
+    assert!(!text.contains("cache runs"), "{text}");
 
     let json_out = run(&["status", "--json"]);
     assert!(json_out.status.success());
     let rows: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
     assert_eq!(rows[0]["docker_reachable"], true);
     let containers = rows[0]["containers"].as_array().unwrap();
-    assert_eq!(containers.len(), 3);
+    assert_eq!(containers.len(), 4);
     assert_eq!(containers[0]["service"], "api");
     assert!(containers[0]["image_drift"]
         .as_str()
@@ -129,9 +147,13 @@ fn compose_status_reports_containers_restarts_drift_empty_and_unreachable_daemon
         .contains("20261001T120000Z-aaaaaaa"));
     assert_eq!(containers[1]["service"], "worker");
     assert_eq!(containers[1]["restart_count"], 4);
+    assert_eq!(containers[2]["service"], "jobs");
+    assert_eq!(containers[2]["exit_code"], 1);
 
-    // 3. Nothing running (empty `ps --format json` output).
+    // 3. Nothing running (empty `ps --all --format json` output).
     std::fs::write(&ps_file, "").unwrap();
+    std::fs::write(&ids_file, "").unwrap();
+    std::fs::write(&inspect_file, "").unwrap();
     let out = run(&["status"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{text}");

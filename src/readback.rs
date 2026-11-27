@@ -33,7 +33,7 @@ pub struct ComposeTarget {
     pub dir: String,
 }
 
-/// One container reported by `docker compose ps --format json`.
+/// One container reported by `docker compose ps --all --format json`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Container {
     pub service: String,
@@ -301,7 +301,7 @@ pub struct Deploy {
 pub struct Status {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<Ingress>,
-    /// Live containers reported by `docker compose ps --format json` when this
+    /// Live containers reported by `docker compose ps --all --format json` when this
     /// service is a Compose stack and the daemon answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub containers: Option<Vec<Container>>,
@@ -534,13 +534,33 @@ fn compose_probe(index: usize, target: &ComposeTarget, sudo: &str) -> Probe {
         key: format!("{index}:compose"),
         // Distinguish a not-yet-created project directory (`absent`), a working
         // daemon with zero or more containers (`ok`), and a failed `compose ps`
-        // such as an unreachable Docker daemon (`err`). Stderr is discarded on
-        // the `ps` call so Compose warnings never corrupt the JSON payload.
+        // such as an unreachable Docker daemon (`err`). `--all` includes
+        // stopped/exited containers so a crashed worker does not disappear from
+        // the `running/total` count. Stderr is discarded on the `ps` call so
+        // Compose warnings never corrupt the JSON payload.
         snippet: format!(
             "if ! {sudo}test -d {dir}; then printf 'absent\\n'; \
-             elif OUT=$(cd {dir} && {sudo}{compose} ps --format json 2>/dev/null); then \
+             elif OUT=$(cd {dir} && {sudo}{compose} ps --all --format json 2>/dev/null); then \
                printf 'ok\\n%s' \"$OUT\"; \
              else printf 'err\\n'; fi"
+        ),
+    }
+}
+
+fn compose_restarts_probe(index: usize, target: &ComposeTarget, sudo: &str) -> Probe {
+    let dir = shell_quote(&target.dir);
+    let compose = &target.compose;
+    Probe {
+        key: format!("{index}:compose:restarts"),
+        // `docker compose ps --format json` does not emit RestartCount, so read
+        // it from `docker inspect` over the same SSH connection.
+        snippet: format!(
+            "if {sudo}test -d {dir}; then \
+               IDS=$(cd {dir} && {sudo}{compose} ps --all -q 2>/dev/null); \
+               if [ -n \"$IDS\" ]; then \
+                 {sudo}docker inspect --format '{{{{.Name}}}} {{{{.RestartCount}}}}' $IDS 2>/dev/null; \
+               fi; \
+             fi"
         ),
     }
 }
@@ -561,8 +581,6 @@ struct RawContainer {
     health: String,
     #[serde(default, alias = "ExitCode")]
     exit_code: Option<i64>,
-    #[serde(default, alias = "RestartCount", alias = "Restarts")]
-    restart_count: Option<u64>,
 }
 
 impl From<RawContainer> for Container {
@@ -589,7 +607,6 @@ impl From<RawContainer> for Container {
             } else {
                 None
             };
-        let restart_count = raw.restart_count.filter(|&n| n > 0);
         Container {
             service,
             name: raw.name,
@@ -598,8 +615,34 @@ impl From<RawContainer> for Container {
             status: raw.status,
             health,
             exit_code,
-            restart_count,
+            restart_count: None,
             image_drift: None,
+        }
+    }
+}
+
+fn parse_compose_restarts(raw: &str) -> BTreeMap<String, u64> {
+    let mut map = BTreeMap::new();
+    for line in raw.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(name), Some(count), None) = (parts.next(), parts.next(), parts.next()) {
+            if let Ok(n) = count.parse::<u64>() {
+                let name = name.trim_start_matches('/').to_string();
+                if !name.is_empty() {
+                    map.insert(name, n);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn apply_restart_counts(containers: &mut [Container], restarts: &BTreeMap<String, u64>) {
+    for container in containers.iter_mut() {
+        if let Some(&n) = restarts.get(&container.name) {
+            if n > 0 {
+                container.restart_count = Some(n);
+            }
         }
     }
 }
@@ -766,6 +809,7 @@ fn detect_image_drift(
     container: &Container,
     recorded: &Deploy,
     history: &[Deploy],
+    app_repos: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     let (repo, tag) = split_image_tag(&container.image)?;
     if tag == "latest" || tag_matches_deploy(tag, recorded) {
@@ -791,9 +835,17 @@ fn detect_image_drift(
         }
     }) {
         Some(kind)
-    } else if is_v_semver(tag) && recorded.release != "untagged" && !recorded.release.is_empty() {
+    } else if app_repos.contains(repo)
+        && is_v_semver(tag)
+        && recorded.release != "untagged"
+        && !recorded.release.is_empty()
+    {
         Some(recorded.release.clone())
-    } else if is_hex_sha(tag) && !recorded.sha.is_empty() && recorded.sha != "unknown" {
+    } else if app_repos.contains(repo)
+        && is_hex_sha(tag)
+        && !recorded.sha.is_empty()
+        && recorded.sha != "unknown"
+    {
         Some(short_sha(&recorded.sha))
     } else {
         None
@@ -802,6 +854,19 @@ fn detect_image_drift(
         "{} runs {repo}:{tag} but the record says {repo}:{expected}",
         container.service
     ))
+}
+
+fn apply_image_drift(containers: &mut [Container], recorded: &Deploy, history: &[Deploy]) {
+    let app_repos: std::collections::BTreeSet<String> = containers
+        .iter()
+        .filter_map(|c| {
+            let (repo, tag) = split_image_tag(&c.image)?;
+            tag_matches_deploy(tag, recorded).then(|| repo.to_string())
+        })
+        .collect();
+    for container in containers.iter_mut() {
+        container.image_drift = detect_image_drift(container, recorded, history, &app_repos);
+    }
 }
 
 fn render_compose(status: &Status) -> String {
@@ -918,6 +983,7 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                     .unwrap_or_default();
                 if let Some(compose) = &request.compose {
                     probes.push(compose_probe(*i, compose, sudo));
+                    probes.push(compose_restarts_probe(*i, compose, sudo));
                 }
                 probes.extend(ingress_probes(
                     *i,
@@ -1026,11 +1092,12 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                     .filter(|text| !text.is_empty()),
             };
             if let Some(list) = containers.as_mut() {
+                if let Some(raw_restarts) = answer.get(&format!("{i}:compose:restarts")) {
+                    let restarts = parse_compose_restarts(raw_restarts);
+                    apply_restart_counts(list, &restarts);
+                }
                 if let Some(recorded) = status.live_deploy() {
-                    for container in list.iter_mut() {
-                        container.image_drift =
-                            detect_image_drift(container, recorded, &status.history);
-                    }
+                    apply_image_drift(list, recorded, &status.history);
                 }
             }
             status.containers = containers;
@@ -1545,6 +1612,15 @@ mod tests {
         containers: Option<Vec<Container>>,
         docker_reachable: Option<bool>,
     ) -> Status {
+        compose_status_with_restarts(history_tsv, containers, docker_reachable, "")
+    }
+
+    fn compose_status_with_restarts(
+        history_tsv: &str,
+        containers: Option<Vec<Container>>,
+        docker_reachable: Option<bool>,
+        restarts_raw: &str,
+    ) -> Status {
         let history = parse_history(history_tsv);
         let mut status = Status {
             ingress: Vec::new(),
@@ -1567,10 +1643,10 @@ mod tests {
         };
         let mut containers = containers;
         if let Some(list) = containers.as_mut() {
+            let restarts = parse_compose_restarts(restarts_raw);
+            apply_restart_counts(list, &restarts);
             if let Some(recorded) = status.live_deploy() {
-                for c in list.iter_mut() {
-                    c.image_drift = detect_image_drift(c, recorded, &status.history);
-                }
+                apply_image_drift(list, recorded, &status.history);
             }
         }
         status.containers = containers;
@@ -1582,7 +1658,8 @@ mod tests {
         let raw = "ok\n\
             {\"Service\":\"api\",\"Name\":\"app-api-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"running\",\"Status\":\"Up 2 hours (healthy)\",\"Health\":\"healthy\"}\n\
             {\"Service\":\"worker\",\"Name\":\"app-worker-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
-            {\"Service\":\"db\",\"Name\":\"app-db-1\",\"Image\":\"postgres:16-alpine\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n";
+            {\"Service\":\"db\",\"Name\":\"app-db-1\",\"Image\":\"postgres:16-alpine\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
+            {\"Service\":\"cache\",\"Name\":\"app-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n";
         let (containers, reachable) = parse_compose_ps(raw);
         assert_eq!(reachable, Some(true));
         let status = compose_status(
@@ -1592,31 +1669,36 @@ mod tests {
         );
         let text = render_status(&[status]);
         assert!(
-            text.contains("services      3/3 running (api healthy, worker up 2h, db up 2h)"),
+            text.contains(
+                "services      4/4 running (api healthy, worker up 2h, db up 2h, cache up 2h)"
+            ),
             "{text}"
         );
+        // Unchanged sidecar `redis:v7.4` must not be flagged as needing app release `v1.2.0`.
         assert!(!text.contains("drift"), "{text}");
     }
 
     #[test]
-    fn compose_ps_parses_json_array_and_reports_restarting_and_drift() {
+    fn compose_ps_parses_json_array_and_reports_restarting_exited_and_drift() {
         let raw = "ok\n[\
             {\"Service\":\"api\",\"Name\":\"app-api-1\",\"Image\":\"myapp:20261001T120000Z-aaaaaaa\",\"State\":\"running\",\"Status\":\"Up 3 days (healthy)\"},\
-            {\"Service\":\"worker\",\"Name\":\"app-worker-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"restarting\",\"Status\":\"Restarting (1) 5 seconds ago\",\"RestartCount\":4},\
-            {\"Service\":\"db\",\"Name\":\"app-db-1\",\"Image\":\"postgres:16.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\
+            {\"Service\":\"worker\",\"Name\":\"app-worker-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"restarting\",\"Status\":\"Restarting (1) 5 seconds ago\"},\
+            {\"Service\":\"jobs\",\"Name\":\"app-jobs-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"exited\",\"Status\":\"Exited (1) 2 minutes ago\",\"ExitCode\":1},\
+            {\"Service\":\"cache\",\"Name\":\"app-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\
         ]";
         let (containers, reachable) = parse_compose_ps(raw);
         assert_eq!(reachable, Some(true));
-        let status = compose_status(
+        let status = compose_status_with_restarts(
             "1\t20261001T120000Z-aaaaaaa\tv1.1.0\taaaaaaa1234\t2026-10-01T12:00:00Z\n\
              2\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
             containers,
             reachable,
+            "/app-api-1 0\n/app-worker-1 4\n/app-jobs-1 0\n/app-cache-1 0\n",
         );
         let text = render_status(std::slice::from_ref(&status));
         assert!(
             text.contains(
-                "services      2/3 running (api healthy, worker restarting ×4, db up 2h)"
+                "services      2/4 running (api healthy, worker restarting ×4, jobs exited (1), cache up 2h)"
             ),
             "{text}"
         );
@@ -1626,17 +1708,38 @@ mod tests {
             ),
             "{text}"
         );
-        // Sidecar image (`postgres:16.4`) and matching `worker` must not be flagged.
-        assert!(!text.contains("db runs"), "{text}");
+        // Sidecar image (`redis:v7.4`) and matching `worker`/`jobs` must not be flagged.
+        assert!(!text.contains("cache runs"), "{text}");
         assert!(!text.contains("worker runs"), "{text}");
+        assert!(!text.contains("jobs runs"), "{text}");
         let json: serde_json::Value = serde_json::to_value(&status).unwrap();
         assert_eq!(json["docker_reachable"], true);
-        assert_eq!(json["containers"].as_array().unwrap().len(), 3);
+        assert_eq!(json["containers"].as_array().unwrap().len(), 4);
         assert_eq!(json["containers"][1]["restart_count"], 4);
+        assert_eq!(json["containers"][2]["exit_code"], 1);
         assert!(json["containers"][0]["image_drift"]
             .as_str()
             .unwrap()
             .contains("20261001T120000Z-aaaaaaa"));
+    }
+
+    #[test]
+    fn compose_restarting_without_inspect_count_renders_cleanly() {
+        let raw = "ok\n\
+            {\"Service\":\"worker\",\"Name\":\"app-worker-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"restarting\",\"Status\":\"Restarting (1) 5 seconds ago\"}\n";
+        let (containers, reachable) = parse_compose_ps(raw);
+        let status = compose_status(
+            "1\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+            containers,
+            reachable,
+        );
+        let text = render_status(std::slice::from_ref(&status));
+        assert!(
+            text.contains("services      0/1 running (worker restarting)"),
+            "{text}"
+        );
+        let json: serde_json::Value = serde_json::to_value(&status).unwrap();
+        assert!(json["containers"][0].get("restart_count").is_none());
     }
 
     #[test]
