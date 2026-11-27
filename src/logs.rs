@@ -233,6 +233,7 @@ mod tests {
         LogSource::Compose {
             compose: "docker compose -f docker-compose.yml -p amp".to_string(),
             dir: "/var/universal/amp".to_string(),
+            images: Vec::new(),
         }
     }
 

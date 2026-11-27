@@ -1124,16 +1124,38 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     let release = ctx.version.release_display();
     let sha = &ctx.version.git.sha;
     let stamp = &ctx.version.id;
-    steps.push(PlannedStep::ssh(
-        format!("record deploy {stamp} (release {release})"),
-        format!(
-            "set -e; {sudo}mkdir -p {root}/.deliver; \
-             N=1; if {sudo}test -f {root}/.deliver/history.tsv; then \
-               N=$(( $({sudo}wc -l {root}/.deliver/history.tsv | awk '{{print $1}}') + 1 )); fi; \
-             printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$N\" \"{stamp}\" \"{release}\" \"{sha}\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \
-               | {sudo}tee -a {root}/.deliver/history.tsv >/dev/null; \
-             echo \"deploy #$N · {stamp} · release {release}\""
-        ),
+    let owned_images: Vec<String> = {
+        let mut repos: Vec<String> = Vec::new();
+        for full in shipped_images
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .chain(extra_tags.iter().map(String::as_str))
+        {
+            let without_digest = full.split('@').next().unwrap_or(full);
+            let last_slash = without_digest.rfind('/');
+            let repo = match without_digest.rfind(':') {
+                Some(colon) if last_slash.is_none_or(|slash| colon >= slash) => {
+                    &without_digest[..colon]
+                }
+                _ => without_digest,
+            };
+            if !repo.is_empty() && !repos.iter().any(|r| r == repo) {
+                repos.push(repo.to_string());
+            }
+        }
+        repos
+    };
+    steps.push(
+        PlannedStep::ssh(
+            format!("record deploy {stamp} (release {release})"),
+            format!(
+                "set -e; {sudo}mkdir -p {root}/.deliver; \
+                 N=1; if {sudo}test -f {root}/.deliver/history.tsv; then \
+                   N=$(( $({sudo}wc -l {root}/.deliver/history.tsv | awk '{{print $1}}') + 1 )); fi; \
+                 printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$N\" \"{stamp}\" \"{release}\" \"{sha}\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \
+                   | {sudo}tee -a {root}/.deliver/history.tsv >/dev/null; \
+                 echo \"deploy #$N · {stamp} · release {release}\""
+            ),
         )
         // Compose replaces containers in place, so there is no live symlink and
         // no retained release directory — the history is the whole record.
@@ -1151,6 +1173,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         .with_log_source(LogSource::Compose {
             compose: compose.clone(),
             dir: root.clone(),
+            images: owned_images,
         }),
     );
 

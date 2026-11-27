@@ -190,8 +190,13 @@ pub struct IngressState {
 /// services say so themselves, with a `logs:` block on the service.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogSource {
-    /// A Compose project: its own `docker compose … logs`, run from `dir`.
-    Compose { compose: String, dir: String },
+    /// A Compose project: its own `docker compose … logs`, run from `dir`,
+    /// together with the image repositories owned by this deployer.
+    Compose {
+        compose: String,
+        dir: String,
+        images: Vec<String>,
+    },
     /// A systemd unit, read with `journalctl -u`.
     Unit { name: String },
     /// Log files on the target, read with `tail`.
@@ -208,7 +213,7 @@ impl LogSource {
     /// these logs under sudo, so reading them usually needs the same.
     pub fn command(&self, sudo: &str, follow: bool, tail: usize) -> String {
         match self {
-            LogSource::Compose { compose, dir } => {
+            LogSource::Compose { compose, dir, .. } => {
                 let follow = if follow { " --follow" } else { "" };
                 format!(
                     "cd {} && {sudo}{compose} logs --no-color --tail {tail}{follow}",

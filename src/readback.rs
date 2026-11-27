@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 pub struct ComposeTarget {
     pub compose: String,
     pub dir: String,
+    pub images: Vec<String>,
 }
 
 /// One container reported by `docker compose ps --all --format json`.
@@ -390,9 +391,14 @@ pub fn collect(plan: &[ServicePlan]) -> Vec<Request> {
                 .filter_map(|step| step.ingress_state.clone())
                 .collect();
             let compose = sp.steps.iter().find_map(|step| match &step.log_source {
-                Some(LogSource::Compose { compose, dir }) => Some(ComposeTarget {
+                Some(LogSource::Compose {
+                    compose,
+                    dir,
+                    images,
+                }) => Some(ComposeTarget {
                     compose: compose.clone(),
                     dir: dir.clone(),
+                    images: images.clone(),
                 }),
                 _ => None,
             });
@@ -812,11 +818,11 @@ fn detect_image_drift(
     app_repos: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     let (repo, tag) = split_image_tag(&container.image)?;
-    if tag == "latest" || tag_matches_deploy(tag, recorded) {
+    if !app_repos.contains(repo) || tag == "latest" || tag_matches_deploy(tag, recorded) {
         return None;
     }
     let expected = if is_deploy_id_tag(tag) {
-        Some(recorded.deploy_id.clone())
+        recorded.deploy_id.clone()
     } else if let Some(kind) = history.iter().find_map(|old| {
         if tag == old.deploy_id {
             Some(recorded.deploy_id.clone())
@@ -834,36 +840,36 @@ fn detect_image_drift(
             None
         }
     }) {
-        Some(kind)
-    } else if app_repos.contains(repo)
-        && is_v_semver(tag)
-        && recorded.release != "untagged"
-        && !recorded.release.is_empty()
-    {
-        Some(recorded.release.clone())
-    } else if app_repos.contains(repo)
-        && is_hex_sha(tag)
-        && !recorded.sha.is_empty()
-        && recorded.sha != "unknown"
-    {
-        Some(short_sha(&recorded.sha))
+        kind
+    } else if is_v_semver(tag) && recorded.release != "untagged" && !recorded.release.is_empty() {
+        recorded.release.clone()
+    } else if is_hex_sha(tag) && !recorded.sha.is_empty() && recorded.sha != "unknown" {
+        short_sha(&recorded.sha)
+    } else if recorded.release != "untagged" && !recorded.release.is_empty() {
+        recorded.release.clone()
     } else {
-        None
-    }?;
+        recorded.deploy_id.clone()
+    };
     Some(format!(
         "{} runs {repo}:{tag} but the record says {repo}:{expected}",
         container.service
     ))
 }
 
-fn apply_image_drift(containers: &mut [Container], recorded: &Deploy, history: &[Deploy]) {
-    let app_repos: std::collections::BTreeSet<String> = containers
-        .iter()
-        .filter_map(|c| {
-            let (repo, tag) = split_image_tag(&c.image)?;
-            tag_matches_deploy(tag, recorded).then(|| repo.to_string())
-        })
-        .collect();
+fn apply_image_drift(
+    containers: &mut [Container],
+    recorded: &Deploy,
+    history: &[Deploy],
+    owned_images: &[String],
+) {
+    let mut app_repos: std::collections::BTreeSet<String> = owned_images.iter().cloned().collect();
+    for c in containers.iter() {
+        if let Some((repo, tag)) = split_image_tag(&c.image) {
+            if tag_matches_deploy(tag, recorded) {
+                app_repos.insert(repo.to_string());
+            }
+        }
+    }
     for container in containers.iter_mut() {
         container.image_drift = detect_image_drift(container, recorded, history, &app_repos);
     }
@@ -1091,13 +1097,18 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                     .map(|text| text.trim().to_string())
                     .filter(|text| !text.is_empty()),
             };
+            let owned_images = request
+                .compose
+                .as_ref()
+                .map(|c| c.images.as_slice())
+                .unwrap_or(&[]);
             if let Some(list) = containers.as_mut() {
                 if let Some(raw_restarts) = answer.get(&format!("{i}:compose:restarts")) {
                     let restarts = parse_compose_restarts(raw_restarts);
                     apply_restart_counts(list, &restarts);
                 }
                 if let Some(recorded) = status.live_deploy() {
-                    apply_image_drift(list, recorded, &status.history);
+                    apply_image_drift(list, recorded, &status.history, owned_images);
                 }
             }
             status.containers = containers;
@@ -1646,7 +1657,8 @@ mod tests {
             let restarts = parse_compose_restarts(restarts_raw);
             apply_restart_counts(list, &restarts);
             if let Some(recorded) = status.live_deploy() {
-                apply_image_drift(list, recorded, &status.history);
+                let owned = vec!["myapp".to_string()];
+                apply_image_drift(list, recorded, &status.history, &owned);
             }
         }
         status.containers = containers;
@@ -1740,6 +1752,30 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::to_value(&status).unwrap();
         assert!(json["containers"][0].get("restart_count").is_none());
+    }
+
+    #[test]
+    fn compose_drift_ignores_sidecars_with_semver_sha_or_deploy_id_tags() {
+        let raw = "ok\n\
+            {\"Service\":\"api\",\"Name\":\"app-api-1\",\"Image\":\"myapp:v1.1.0\",\"State\":\"running\",\"Status\":\"Up 1 hour (healthy)\",\"Health\":\"healthy\"}\n\
+            {\"Service\":\"cache\",\"Name\":\"app-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
+            {\"Service\":\"exporter\",\"Name\":\"app-exporter-1\",\"Image\":\"vendor/exporter:deadbeef\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
+            {\"Service\":\"cron\",\"Name\":\"app-cron-1\",\"Image\":\"vendor/cron:20261001T120000Z-aaaaaaa\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n";
+        let (containers, reachable) = parse_compose_ps(raw);
+        let status = compose_status(
+            "1\t20261001T120000Z-aaaaaaa\tv1.1.0\taaaaaaa1234\t2026-10-01T12:00:00Z\n\
+             2\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+            containers,
+            reachable,
+        );
+        let text = render_status(&[status]);
+        assert!(
+            text.contains("drift         api runs myapp:v1.1.0 but the record says myapp:v1.2.0"),
+            "{text}"
+        );
+        assert!(!text.contains("cache runs"), "{text}");
+        assert!(!text.contains("exporter runs"), "{text}");
+        assert!(!text.contains("cron runs"), "{text}");
     }
 
     #[test]
