@@ -570,7 +570,14 @@ fn nginx_log_choices(name: &str, conf: &str, override_logs: &str) -> String {
         "      conf: nginx/site.conf\n      ssl: false\n",
     );
     let path = dir.join(".deliver.yml");
-    let mut config = std::fs::read_to_string(&path).unwrap();
+    // Keep the fixture local even if discovery regresses to a single source.
+    let mut config = std::fs::read_to_string(&path).unwrap().replace(
+        "host: example.md, user: root, dir: /var/universal/example",
+        &format!(
+            "host: localhost, method: local, sudo: false, dir: {}",
+            dir.display()
+        ),
+    );
     config.push_str(override_logs);
     config.push_str("  other:\n    deployer: commands\n    config: {steps: [{command: \"true\"}]}\n    logs: {command: \"true\"}\n");
     std::fs::write(path, config).unwrap();
