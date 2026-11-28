@@ -3,6 +3,8 @@ set -eu
 
 version=${1:?usage: build-local.sh VERSION WORK_DIR}
 work=${2:?usage: build-local.sh VERSION WORK_DIR}
+mkdir -p "$work"
+work=$(cd "$work" && pwd)
 dist="$work/release"
 
 case "$version" in
@@ -21,6 +23,8 @@ fi
 command -v cargo >/dev/null
 command -v docker >/dev/null
 command -v rustup >/dev/null
+command -v zip >/dev/null
+command -v unzip >/dev/null
 docker info >/dev/null
 
 release_toolchain=1.94.0
@@ -58,6 +62,14 @@ do
     /deliver --version
 done
 
+echo "building x86_64-pc-windows-gnu in local Docker"
+docker buildx build \
+  --file scripts/release/Dockerfile.windows \
+  --progress plain \
+  --output "type=local,dest=$work/docker-x86_64-pc-windows-gnu" \
+  .
+test -s "$work/docker-x86_64-pc-windows-gnu/deliver.exe"
+
 package_archive() {
   target=$1
   binary=$2
@@ -74,7 +86,12 @@ package_archive x86_64-apple-darwin target/x86_64-apple-darwin/release/deliver
 package_archive aarch64-unknown-linux-gnu "$work/docker-aarch64-unknown-linux-gnu/deliver"
 package_archive x86_64-unknown-linux-gnu "$work/docker-x86_64-unknown-linux-gnu/deliver"
 
-(cd "$dist" && shasum -a 256 deliveryboy-*.tar.gz > SHA256SUMS)
-(cd "$dist" && shasum -a 256 -c SHA256SUMS)
+stage="$work/package-x86_64-pc-windows-gnu"
+mkdir -p "$stage"
+cp "$work/docker-x86_64-pc-windows-gnu/deliver.exe" README.md LICENSE "$stage/"
+(cd "$stage" && zip -X "$dist/deliveryboy-$version-x86_64-pc-windows-gnu.zip" deliver.exe README.md LICENSE)
+
+(cd "$dist" && shasum -a 256 deliveryboy-*.tar.gz deliveryboy-*.zip > SHA256SUMS)
+scripts/release/check-artifacts.sh "$version" "$dist"
 
 echo "local release files are ready in $dist"
