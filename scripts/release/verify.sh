@@ -21,7 +21,7 @@ if [ "$is_draft" != false ]; then
 fi
 
 asset_count=$(gh release view "$tag" --repo SerenitySoftware/deliveryboy --json assets --jq '.assets | length')
-if [ "$asset_count" -lt 5 ]; then
+if [ "$asset_count" -lt 6 ]; then
   echo "GitHub release $tag has only $asset_count assets" >&2
   exit 1
 fi
@@ -31,10 +31,7 @@ trap 'rm -rf "$install_root"' EXIT HUP INT TERM
 release_root="$install_root/release"
 mkdir "$release_root"
 gh release download "$tag" --repo SerenitySoftware/deliveryboy --dir "$release_root"
-(cd "$release_root" && shasum -a 256 -c SHA256SUMS)
-for asset in "$release_root"/deliveryboy-*; do
-  test -s "$asset"
-done
+scripts/release/check-artifacts.sh "$version" "$release_root"
 
 cargo install deliveryboy --version "$version" --locked --root "$install_root"
 "$install_root/bin/deliver" --version

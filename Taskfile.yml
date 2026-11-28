@@ -2,21 +2,35 @@ version: '3'
 
 tasks:
   fmt:
-    cmds:
-      - PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all -- --check
-  lint:
-    cmds:
-      - PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets --locked -- -D warnings
+    desc: Check Rust formatting
+    cmds: ['PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all -- --check']
+  clippy:
+    desc: Lint all Rust targets
+    cmds: ['PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets --locked -- -D warnings']
   test:
-    cmds:
-      - PATH="$HOME/.cargo/bin:$PATH" cargo test --locked
+    desc: Run the locked Rust test suite
+    cmds: ['PATH="$HOME/.cargo/bin:$PATH" cargo test --locked']
   site:
-    cmds:
-      - hugo --source site --minify --destination "{{.OUTPUT | default "/tmp/deliveryboy-site"}}"
+    desc: Build install documentation into OUTPUT
+    cmds: ['hugo --source site --minify --destination {{.OUTPUT}}']
+    requires:
+      vars: [OUTPUT]
   site:preview:
-    desc: Preview the install docs locally
-    cmds:
-      - hugo server --source site --bind 127.0.0.1 --port 13837 --disableLiveReload
+    desc: Preview documentation locally without writing build output
+    cmds: ['hugo server --source site --renderToMemory --bind 127.0.0.1 --port 14387 --disableLiveReload']
+  release:build:
+    desc: Build local release archives without publishing
+    cmds: ['scripts/release/build-local.sh {{.VERSION}} {{.WORK_DIR}}']
+    requires:
+      vars: [VERSION, WORK_DIR]
+  release:check:
+    desc: Verify all five release archives and their checksums
+    cmds: ['scripts/release/check-artifacts.sh {{.VERSION}} {{.WORK_DIR}}/release']
+    requires:
+      vars: [VERSION, WORK_DIR]
+  lint:
+    desc: Alias for the Rust lint check
+    cmds: ["task clippy"]
   homebrew:update:
     desc: Generate the formula from a published release (VERSION=0.4.0)
     requires:

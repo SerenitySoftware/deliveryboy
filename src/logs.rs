@@ -9,9 +9,8 @@
 //! point: a `logs:` block on the service is the operator's own answer and wins,
 //! and otherwise the deployer that started the thing declares it
 //! ([`LogSource`], attached to a step exactly as [`crate::deployers::ReleaseState`]
-//! is). Only `docker-compose` can honestly declare one — it knows the `-f`
-//! files and the `-p` project because it wrote them — so every other service
-//! either carries a `logs:` block or is reported as having nowhere to look.
+//! is). `docker-compose` knows its invocation, and `nginx-vhost` knows the
+//! log files in the conf it installs. Other services need a `logs:` block.
 //!
 //! Read-only: nothing here mutates the target. Each output line passes through
 //! the secret scrubber and flushes immediately so `--follow` streams.
@@ -103,6 +102,7 @@ pub struct Request {
     /// True when the source came from the service's `logs:` block rather than
     /// from the deployer, so the command can say which answer it is using.
     pub declared: bool,
+    pub nginx_log_default: bool,
 }
 
 /// A service in the plan that has no log source at all.
@@ -143,9 +143,31 @@ pub fn collect(config: &Config, plan: &[ServicePlan]) -> (Vec<Request>, Vec<Unkn
         // The operator's own answer beats the deployer's, so a Compose project
         // fronted by nginx can be pointed at the access log instead.
         let declared = service.and_then(|s| s.logs.as_ref()).map(LogSource::from);
+        let mut inferred = None;
+        let mut nginx_log_default = false;
+        for step in &sp.steps {
+            let Some(source) = &step.log_source else {
+                continue;
+            };
+            match (&mut inferred, source) {
+                (Some(LogSource::Files { paths }), LogSource::Files { paths: more }) => {
+                    nginx_log_default |= step.nginx_log_default;
+                    for path in more {
+                        if !paths.contains(path) {
+                            paths.push(path.clone());
+                        }
+                    }
+                }
+                (None, _) => {
+                    nginx_log_default = step.nginx_log_default;
+                    inferred = Some(source.clone());
+                }
+                _ => {}
+            }
+        }
         let source = match declared.clone() {
             Some(source) => Some(source),
-            None => sp.steps.iter().find_map(|s| s.log_source.clone()),
+            None => inferred,
         };
         match source {
             Some(source) => {
@@ -161,6 +183,7 @@ pub fn collect(config: &Config, plan: &[ServicePlan]) -> (Vec<Request>, Vec<Unkn
                         host: sp.host.clone(),
                         source,
                         declared: declared.is_some(),
+                        nginx_log_default: declared.is_none() && nginx_log_default,
                     });
                 }
             }
@@ -213,6 +236,8 @@ pub fn run(request: &Request, config: &Config, follow: bool, tail: usize) -> boo
 pub fn describe(request: &Request) -> String {
     let where_from = if request.declared {
         "logs:"
+    } else if request.nginx_log_default {
+        "deployer, nginx default"
     } else {
         "deployer"
     };

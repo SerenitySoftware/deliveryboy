@@ -35,6 +35,30 @@ release archive for now. WinGet packages will follow.
 Do not copy a binary from an untrusted source. Check its release checksum before
 running it.
 
+### Windows x86-64
+
+The next release adds `deliveryboy-<version>-x86_64-pc-windows-gnu.zip`, built
+locally in Docker with MinGW. Download the zip and `SHA256SUMS` from the
+[GitHub release](https://github.com/SerenitySoftware/deliveryboy/releases), then
+run this in PowerShell with that release's version:
+
+```powershell
+$archive = 'deliveryboy-<version>-x86_64-pc-windows-gnu.zip'
+$entry = Get-Content SHA256SUMS |
+  Where-Object { $_.EndsWith("  $archive") }
+$expected = ($entry -split '\s+')[0]
+$actual = (Get-FileHash $archive -Algorithm SHA256).Hash
+if (!$expected -or $actual -ne $expected) { throw 'Checksum mismatch' }
+Expand-Archive $archive -DestinationPath "$env:LOCALAPPDATA\DeliveryBoy"
+& "$env:LOCALAPPDATA\DeliveryBoy\deliver.exe" --version
+```
+
+Add `%LOCALAPPDATA%\DeliveryBoy` to your user `PATH`. Deployment commands still
+need a POSIX `sh` on `PATH` (such as Git for Windows) and the tools your release
+calls. Native Windows deployment support and a local Windows smoke test remain
+incomplete; building the zip does not prove those work. Downloads are unsigned:
+checksums detect damage, but do not prove who built a file.
+
 ## Detect your project
 
 From the repository you want to deploy:

@@ -283,6 +283,9 @@ pub struct PlannedStep {
     /// compile-time metadata for a local read, not part of the step.
     #[serde(skip_serializing)]
     pub log_source: Option<LogSource>,
+    /// Whether the file source includes assumed nginx http-level defaults.
+    #[serde(skip_serializing)]
+    pub nginx_log_default: bool,
     /// Binaries this step invokes on the target, so preflight can check they
     /// exist there before anything is built or shipped. Declared by the
     /// deployer that wrote the command rather than parsed out of it: a step
@@ -317,6 +320,7 @@ impl PlannedStep {
             release_state: None,
             ingress_state: None,
             log_source: None,
+            nginx_log_default: false,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
             compose_project: None,
@@ -340,6 +344,7 @@ impl PlannedStep {
             release_state: None,
             ingress_state: None,
             log_source: None,
+            nginx_log_default: false,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
             compose_project: None,
@@ -358,6 +363,7 @@ impl PlannedStep {
             release_state: None,
             ingress_state: None,
             log_source: None,
+            nginx_log_default: false,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
             compose_project: None,
@@ -385,6 +391,7 @@ impl PlannedStep {
             release_state: None,
             ingress_state: None,
             log_source: None,
+            nginx_log_default: false,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
             compose_project: None,
@@ -421,6 +428,7 @@ impl PlannedStep {
             release_state: None,
             ingress_state: None,
             log_source: None,
+            nginx_log_default: false,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
             compose_project: None,
