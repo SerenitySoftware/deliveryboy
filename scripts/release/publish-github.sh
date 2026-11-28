@@ -19,9 +19,7 @@ command -v gh >/dev/null
 gh auth status >/dev/null
 git rev-parse -q --verify "refs/tags/$tag" >/dev/null
 test "$(git rev-list -n 1 "$tag")" = "$(git rev-parse HEAD)"
-test -f "$dist/SHA256SUMS"
-test "$(find "$dist" -name 'deliveryboy-*.tar.gz' | wc -l | tr -d ' ')" = 4
-(cd "$dist" && shasum -a 256 -c SHA256SUMS)
+scripts/release/check-artifacts.sh "$version" "$dist"
 
 awk -v version="$version" '
   $0 ~ "^## " version " — " { found=1; next }
