@@ -56,7 +56,7 @@
 //!       content: 'proxy_set_header X-Admin-Access "{secret:ADMIN_TOKEN}";'
 //! ```
 
-use super::{cfg_bool, cfg_str, IngressState, PlanContext, PlannedStep};
+use super::{cfg_bool, cfg_str, IngressState, LogSource, PlanContext, PlannedStep};
 use crate::remote::shell_quote;
 use anyhow::{bail, Context, Result};
 use serde_yaml::Value;
@@ -165,6 +165,9 @@ pub struct VhostFacts {
     pub domains: Vec<String>,
     /// One entry per distinct certificate referenced.
     pub certs: Vec<CertNeed>,
+    /// File destinations in this conf, including defaults for omitted log directives.
+    pub log_paths: Vec<String>,
+    pub nginx_log_default: bool,
 }
 
 /// One vhost to install, after config is resolved.
@@ -191,6 +194,8 @@ pub fn parse_vhost(text: &str) -> VhostFacts {
     let mut in_server = false;
     let mut block_domains: Vec<String> = Vec::new();
     let mut block_cert: Option<String> = None;
+    let mut access_log = false;
+    let mut error_log = false;
 
     for raw in text.lines() {
         let line = raw.split('#').next().unwrap_or("").trim().to_string();
@@ -202,9 +207,54 @@ pub fn parse_vhost(text: &str) -> VhostFacts {
             in_server = true;
             block_domains.clear();
             block_cert = None;
+            access_log = false;
+            error_log = false;
         }
 
         if in_server {
+            // A destination is the first argument; later tokens name a format,
+            // level or buffer settings. An explicit non-file destination also
+            // suppresses the corresponding default.
+            let mut directive_depth = depth;
+            for part in line.split_inclusive([';', '{', '}']) {
+                let directive = part.trim_end_matches([';', '{', '}']).trim();
+                let mut tokens = directive.splitn(2, char::is_whitespace);
+                let seen = match tokens.next() {
+                    Some("access_log") => Some(&mut access_log),
+                    Some("error_log") => Some(&mut error_log),
+                    _ => None,
+                };
+                if let Some(seen) = seen {
+                    // A location-level override does not suppress the server’s
+                    // inherited destination for requests outside that location.
+                    if directive_depth == 1 {
+                        *seen = true;
+                    }
+                    if let Some(rest) = tokens.next() {
+                        let rest = rest.trim_start();
+                        let path = if let Some(quote) =
+                            rest.chars().next().filter(|c| *c == '"' || *c == '\'')
+                        {
+                            rest[1..].split(quote).next().unwrap_or("")
+                        } else {
+                            rest.split_whitespace().next().unwrap_or("")
+                        };
+                        if path != "off"
+                            && path != "stderr"
+                            && !path.starts_with("syslog:")
+                            && !path.starts_with("memory:")
+                        {
+                            push_unique(&mut facts.log_paths, path);
+                        }
+                    }
+                }
+                if part.ends_with('{') {
+                    directive_depth += 1;
+                }
+                if part.ends_with('}') {
+                    directive_depth -= 1;
+                }
+            }
             if let Some(rest) = line.strip_prefix("server_name") {
                 for token in rest.trim_end_matches(';').split_whitespace() {
                     let d = token.trim().trim_end_matches(';');
@@ -229,6 +279,15 @@ pub fn parse_vhost(text: &str) -> VhostFacts {
         depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
 
         if in_server && depth <= 0 {
+            for (seen, path) in [
+                (access_log, "/var/log/nginx/access.log"),
+                (error_log, "/var/log/nginx/error.log"),
+            ] {
+                if !seen {
+                    push_unique(&mut facts.log_paths, path);
+                    facts.nginx_log_default = true;
+                }
+            }
             if let Some(cert) = block_cert.take() {
                 match facts.certs.iter_mut().find(|c| c.cert_name == cert) {
                     Some(existing) => {
@@ -672,7 +731,16 @@ fn install_step(
         cert_names,
     });
     match content {
-        Some(text) => step.with_live_config(&available, text),
+        Some(text) => {
+            let facts = parse_vhost(text);
+            step.nginx_log_default = facts.nginx_log_default;
+            if !facts.log_paths.is_empty() {
+                step = step.with_log_source(LogSource::Files {
+                    paths: facts.log_paths,
+                });
+            }
+            step.with_live_config(&available, text)
+        }
         None => step,
     }
 }
@@ -890,4 +958,96 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     }
 
     Ok(steps)
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn install_step_carries_file_sources_and_default_provenance() {
+        let support = super::super::http_test_support::Context::new();
+        let spec = VhostSpec {
+            conf: "nginx/site.conf".into(),
+            site_name: "site.conf".into(),
+            ssl: false,
+            domains: None,
+            cert_name: None,
+        };
+        for (text, expected, default) in [
+            ("server {\n access_log /var/log/nginx/x.access.log combined;\n error_log /var/log/nginx/x.error.log warn;\n}", vec!["/var/log/nginx/x.access.log", "/var/log/nginx/x.error.log"], false),
+            ("server {}", vec!["/var/log/nginx/access.log", "/var/log/nginx/error.log"], true),
+            ("server { access_log off; }", vec!["/var/log/nginx/error.log"], true),
+        ] {
+            let step = install_step(&spec, &support.ctx, Some(text), vec![]);
+            assert_eq!(step.log_source, Some(LogSource::Files { paths: expected.into_iter().map(str::to_string).collect() }));
+            assert_eq!(step.nginx_log_default, default);
+        }
+        assert!(install_step(&spec, &support.ctx, None, vec![])
+            .log_source
+            .is_none());
+    }
+
+    #[test]
+    fn explicit_non_file_destinations_do_not_turn_into_defaults() {
+        for access in ["off", "syslog:server=unix:/dev/log", "memory:32m"] {
+            let facts = parse_vhost(&format!(
+                "server {{\n access_log {access};\n error_log stderr warn;\n}}"
+            ));
+            assert!(facts.log_paths.is_empty());
+            assert!(!facts.nginx_log_default);
+        }
+    }
+
+    #[test]
+    fn location_logs_keep_server_defaults_and_quoted_paths() {
+        let facts = parse_vhost("server {\n location /api {\n access_log \"/var/log/nginx/api access.log\" combined;\n }\n error_log stderr;\n}\n");
+        assert_eq!(
+            facts.log_paths,
+            vec!["/var/log/nginx/api access.log", "/var/log/nginx/access.log"]
+        );
+        assert!(facts.nginx_log_default);
+    }
+
+    #[test]
+    fn rendered_vhosts_combine_paths_without_duplicates() {
+        let support = super::super::http_test_support::Context::new();
+        let root = &support.ctx.repo_root;
+        std::fs::create_dir(root.join("nginx")).unwrap();
+        std::fs::write(
+            root.join("nginx/site.conf"),
+            "server {\n access_log __LOG__/site.log;\n error_log stderr;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("nginx/api.conf"),
+            "server {\n access_log __LOG__/api.log;\n error_log stderr;\n}\n",
+        )
+        .unwrap();
+        let cfg = serde_yaml::from_str("ssl: false\nrender: {__LOG__: /var/log/nginx}\nvhosts: [{conf: nginx/site.conf}, {conf: nginx/api.conf}]\n").unwrap();
+        let steps = compile(&cfg, &support.ctx).unwrap();
+        let config = serde_yaml::from_str("version: 1\napp: fixture\ntargets: {box: {host: example.com, dir: /fixture}}\nservices: {}\n").unwrap();
+        let plan = vec![crate::plan::ServicePlan {
+            service: "nginx".into(),
+            target: "box".into(),
+            host: "example.com".into(),
+            steps,
+            after_tag: false,
+            soak: None,
+        }];
+        let (requests, unknown) = crate::logs::collect(&config, &plan);
+        assert!(unknown.is_empty());
+        assert_eq!(
+            requests[0].source,
+            LogSource::Files {
+                paths: vec![
+                    "/var/log/nginx/site.log".into(),
+                    "/var/log/nginx/api.log".into()
+                ]
+            }
+        );
+        assert!(!requests[0].nginx_log_default);
+        let facts = parse_vhost("server { access_log /shared.log; error_log /shared.log; }\nserver { access_log off; error_log /shared.log; }");
+        assert_eq!(facts.log_paths, vec!["/shared.log"]);
+    }
 }

@@ -34,6 +34,7 @@ pub fn compile(check: &Value, ctx: &PlanContext) -> Result<PlannedStep> {
             release_state: None,
             ingress_state: None,
             log_source: None,
+            nginx_log_default: false,
             remote_tools: Vec::new(),
             cert_domains: Vec::new(),
             compose_project: None,
