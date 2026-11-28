@@ -18,11 +18,39 @@
 //! way out goes through [`crate::secrets::redact`].
 
 use crate::config::Target;
-use crate::deployers::{IngressState, ReleaseState};
+use crate::deployers::{IngressState, LogSource, ReleaseState};
 use crate::plan::ServicePlan;
 use crate::remote::{capture, nonce, shell_quote};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Where a Compose stack runs on the target, taken from the deployer's
+/// [`LogSource::Compose`] so `deliver status` queries the exact same project
+/// and files the deploy brought up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComposeTarget {
+    pub compose: String,
+    pub dir: String,
+    pub images: Vec<String>,
+}
+
+/// One container reported by `docker compose ps --all --format json`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Container {
+    pub service: String,
+    pub name: String,
+    pub image: String,
+    pub state: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_drift: Option<String>,
+}
 
 /// One service on one host whose deploy state can be read back.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +60,7 @@ pub struct Request {
     pub host: String,
     pub state: Option<ReleaseState>,
     pub ingress: Vec<IngressState>,
+    pub compose: Option<ComposeTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -273,6 +302,14 @@ pub struct Deploy {
 pub struct Status {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<Ingress>,
+    /// Live containers reported by `docker compose ps --all --format json` when this
+    /// service is a Compose stack and the daemon answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containers: Option<Vec<Container>>,
+    /// False when `docker compose ps` failed (e.g. Docker daemon unreachable),
+    /// kept distinct from `containers: Some([])` ("nothing running").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_reachable: Option<bool>,
     pub service: String,
     pub target: String,
     pub host: String,
@@ -353,12 +390,25 @@ pub fn collect(plan: &[ServicePlan]) -> Vec<Request> {
                 .iter()
                 .filter_map(|step| step.ingress_state.clone())
                 .collect();
+            let compose = sp.steps.iter().find_map(|step| match &step.log_source {
+                Some(LogSource::Compose {
+                    compose,
+                    dir,
+                    images,
+                }) => Some(ComposeTarget {
+                    compose: compose.clone(),
+                    dir: dir.clone(),
+                    images: images.clone(),
+                }),
+                _ => None,
+            });
             (state.is_some() || !ingress.is_empty()).then(|| Request {
                 service: sp.service.clone(),
                 target: sp.target.clone(),
                 host: sp.host.clone(),
                 state,
                 ingress,
+                compose,
             })
         })
         .collect()
@@ -369,6 +419,10 @@ pub fn collect_releases(plan: &[ServicePlan]) -> Vec<Request> {
     collect(plan)
         .into_iter()
         .filter(|r| r.state.is_some())
+        .map(|mut r| {
+            r.compose = None;
+            r
+        })
         .collect()
 }
 
@@ -479,6 +533,386 @@ fn probes_for(index: usize, state: &ReleaseState, sudo: &str) -> Vec<Probe> {
     probes
 }
 
+fn compose_probe(index: usize, target: &ComposeTarget, sudo: &str) -> Probe {
+    let dir = shell_quote(&target.dir);
+    let compose = &target.compose;
+    Probe {
+        key: format!("{index}:compose"),
+        // Distinguish a not-yet-created project directory (`absent`), a working
+        // daemon with zero or more containers (`ok`), and a failed `compose ps`
+        // such as an unreachable Docker daemon (`err`). `--all` includes
+        // stopped/exited containers so a crashed worker does not disappear from
+        // the `running/total` count. Stderr is discarded on the `ps` call so
+        // Compose warnings never corrupt the JSON payload.
+        snippet: format!(
+            "if ! {sudo}test -d {dir}; then printf 'absent\\n'; \
+             elif OUT=$(cd {dir} && {sudo}{compose} ps --all --format json 2>/dev/null); then \
+               printf 'ok\\n%s' \"$OUT\"; \
+             else printf 'err\\n'; fi"
+        ),
+    }
+}
+
+fn compose_restarts_probe(index: usize, target: &ComposeTarget, sudo: &str) -> Probe {
+    let dir = shell_quote(&target.dir);
+    let compose = &target.compose;
+    Probe {
+        key: format!("{index}:compose:restarts"),
+        // `docker compose ps --format json` does not emit RestartCount, so read
+        // it from `docker inspect` over the same SSH connection.
+        snippet: format!(
+            "if {sudo}test -d {dir}; then \
+               IDS=$(cd {dir} && {sudo}{compose} ps --all -q 2>/dev/null); \
+               if [ -n \"$IDS\" ]; then \
+                 {sudo}docker inspect --format '{{{{.Name}}}} {{{{.RestartCount}}}}' $IDS 2>/dev/null; \
+               fi; \
+             fi"
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct RawContainer {
+    #[serde(default, alias = "Service")]
+    service: String,
+    #[serde(default, alias = "Name")]
+    name: String,
+    #[serde(default, alias = "Image")]
+    image: String,
+    #[serde(default, alias = "State")]
+    state: String,
+    #[serde(default, alias = "Status")]
+    status: String,
+    #[serde(default, alias = "Health")]
+    health: String,
+    #[serde(default, alias = "ExitCode")]
+    exit_code: Option<i64>,
+}
+
+impl From<RawContainer> for Container {
+    fn from(raw: RawContainer) -> Self {
+        let service = if raw.service.is_empty() {
+            raw.name.clone()
+        } else {
+            raw.service
+        };
+        let health = if !raw.health.is_empty() {
+            Some(raw.health.to_lowercase())
+        } else if raw.status.contains("(unhealthy)") {
+            Some("unhealthy".into())
+        } else if raw.status.contains("(healthy)") {
+            Some("healthy".into())
+        } else if raw.status.contains("(health: starting)") {
+            Some("starting".into())
+        } else {
+            None
+        };
+        let exit_code =
+            if raw.state.eq_ignore_ascii_case("exited") || raw.exit_code.is_some_and(|c| c != 0) {
+                raw.exit_code
+            } else {
+                None
+            };
+        Container {
+            service,
+            name: raw.name,
+            image: raw.image,
+            state: raw.state,
+            status: raw.status,
+            health,
+            exit_code,
+            restart_count: None,
+            image_drift: None,
+        }
+    }
+}
+
+fn parse_compose_restarts(raw: &str) -> BTreeMap<String, u64> {
+    let mut map = BTreeMap::new();
+    for line in raw.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(name), Some(count), None) = (parts.next(), parts.next(), parts.next()) {
+            if let Ok(n) = count.parse::<u64>() {
+                let name = name.trim_start_matches('/').to_string();
+                if !name.is_empty() {
+                    map.insert(name, n);
+                }
+            }
+        }
+    }
+    map
+}
+
+fn apply_restart_counts(containers: &mut [Container], restarts: &BTreeMap<String, u64>) {
+    for container in containers.iter_mut() {
+        if let Some(&n) = restarts.get(&container.name) {
+            if n > 0 {
+                container.restart_count = Some(n);
+            }
+        }
+    }
+}
+
+/// Parse the framed `{index}:compose` probe output into `(containers, docker_reachable)`.
+///
+/// Accepts both Compose v2.21+ NDJSON (one object per line) and older JSON
+/// array output. Any `err` response or unparseable non-empty payload is
+/// reported as `docker_reachable = Some(false)` with `containers = None` so an
+/// unreachable daemon is never mistaken for "nothing running".
+fn parse_compose_ps(raw: &str) -> (Option<Vec<Container>>, Option<bool>) {
+    let trimmed = raw.trim();
+    if trimmed == "absent" {
+        return (None, None);
+    }
+    if trimmed == "err" || trimmed.starts_with("err\n") {
+        return (None, Some(false));
+    }
+    let Some(rest) = raw
+        .strip_prefix("ok\n")
+        .or_else(|| (trimmed == "ok").then_some(""))
+    else {
+        return (None, Some(false));
+    };
+    let payload = rest.trim();
+    if payload.is_empty() {
+        return (Some(Vec::new()), Some(true));
+    }
+    if payload.starts_with('[') {
+        return match serde_json::from_str::<Vec<RawContainer>>(payload) {
+            Ok(items) => (
+                Some(items.into_iter().map(Container::from).collect()),
+                Some(true),
+            ),
+            Err(_) => (None, Some(false)),
+        };
+    }
+    let mut containers = Vec::new();
+    for line in payload.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match serde_json::from_str::<RawContainer>(line) {
+            Ok(item) => containers.push(Container::from(item)),
+            Err(_) => return (None, Some(false)),
+        }
+    }
+    (Some(containers), Some(true))
+}
+
+fn short_uptime(status: &str) -> Option<String> {
+    let rest = status
+        .strip_prefix("Up ")
+        .or_else(|| status.strip_prefix("up "))?;
+    let rest = rest.split(" (").next().unwrap_or(rest).trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let lower = rest.to_lowercase();
+    if lower == "less than a second" {
+        return Some("up <1s".into());
+    }
+    if lower == "about a minute" {
+        return Some("up 1m".into());
+    }
+    if lower == "about an hour" {
+        return Some("up 1h".into());
+    }
+    let mut parts = lower.split_whitespace();
+    if let (Some(n), Some(unit), None) = (parts.next(), parts.next(), parts.next()) {
+        if n.chars().all(|c| c.is_ascii_digit()) {
+            let suffix = match unit {
+                "second" | "seconds" => Some("s"),
+                "minute" | "minutes" => Some("m"),
+                "hour" | "hours" => Some("h"),
+                "day" | "days" => Some("d"),
+                "week" | "weeks" => Some("w"),
+                "month" | "months" => Some("mo"),
+                "year" | "years" => Some("y"),
+                _ => None,
+            };
+            if let Some(suffix) = suffix {
+                return Some(format!("up {n}{suffix}"));
+            }
+        }
+    }
+    Some(format!("up {lower}"))
+}
+
+impl Container {
+    fn short_state(&self) -> String {
+        let state = self.state.to_lowercase();
+        match state.as_str() {
+            "running" => match self.health.as_deref() {
+                Some("healthy") => "healthy".into(),
+                Some("unhealthy") => "unhealthy".into(),
+                Some("starting") => "starting".into(),
+                _ => short_uptime(&self.status).unwrap_or_else(|| "running".into()),
+            },
+            "restarting" => match self.restart_count {
+                Some(n) if n > 0 => format!("restarting ×{n}"),
+                _ => "restarting".into(),
+            },
+            "exited" => match self.exit_code {
+                Some(code) => format!("exited ({code})"),
+                None => "exited".into(),
+            },
+            "" => "unknown".into(),
+            other => other.into(),
+        }
+    }
+}
+
+fn split_image_tag(image: &str) -> Option<(&str, &str)> {
+    let without_digest = image.split('@').next().unwrap_or(image);
+    let last_slash = without_digest.rfind('/');
+    let colon = without_digest.rfind(':')?;
+    if last_slash.is_some_and(|slash| colon < slash) {
+        return None;
+    }
+    let repo = &without_digest[..colon];
+    let tag = &without_digest[colon + 1..];
+    if repo.is_empty() || tag.is_empty() {
+        return None;
+    }
+    Some((repo, tag))
+}
+
+fn is_deploy_id_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    bytes.len() >= 9 && bytes[..8].iter().all(u8::is_ascii_digit) && bytes[8] == b'T'
+}
+
+fn is_hex_sha(tag: &str) -> bool {
+    (7..=40).contains(&tag.len())
+        && tag.chars().all(|c| c.is_ascii_hexdigit())
+        && tag.chars().any(|c| matches!(c, 'a'..='f' | 'A'..='F'))
+}
+
+fn is_v_semver(tag: &str) -> bool {
+    let mut chars = tag.chars();
+    matches!(chars.next(), Some('v'))
+        && chars.next().is_some_and(|c| c.is_ascii_digit())
+        && tag.contains('.')
+}
+
+fn tag_matches_release(tag: &str, release: &str) -> bool {
+    !release.is_empty()
+        && release != "untagged"
+        && (tag == release || tag.trim_start_matches('v') == release.trim_start_matches('v'))
+}
+
+fn tag_matches_sha(tag: &str, sha: &str) -> bool {
+    !sha.is_empty()
+        && sha != "unknown"
+        && is_hex_sha(tag)
+        && (sha.starts_with(tag) || tag.starts_with(sha))
+}
+
+fn tag_matches_deploy(tag: &str, deploy: &Deploy) -> bool {
+    tag == deploy.deploy_id
+        || tag_matches_release(tag, &deploy.release)
+        || tag_matches_sha(tag, &deploy.sha)
+}
+
+fn detect_image_drift(
+    container: &Container,
+    recorded: &Deploy,
+    history: &[Deploy],
+    app_repos: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let (repo, tag) = split_image_tag(&container.image)?;
+    if !app_repos.contains(repo) || tag == "latest" || tag_matches_deploy(tag, recorded) {
+        return None;
+    }
+    let expected = if is_deploy_id_tag(tag) {
+        recorded.deploy_id.clone()
+    } else if let Some(kind) = history.iter().find_map(|old| {
+        if tag == old.deploy_id {
+            Some(recorded.deploy_id.clone())
+        } else if tag_matches_release(tag, &old.release) {
+            Some(
+                if recorded.release != "untagged" && !recorded.release.is_empty() {
+                    recorded.release.clone()
+                } else {
+                    recorded.deploy_id.clone()
+                },
+            )
+        } else if tag_matches_sha(tag, &old.sha) {
+            Some(if !recorded.sha.is_empty() && recorded.sha != "unknown" {
+                short_sha(&recorded.sha)
+            } else {
+                recorded.deploy_id.clone()
+            })
+        } else {
+            None
+        }
+    }) {
+        kind
+    } else if is_v_semver(tag) && recorded.release != "untagged" && !recorded.release.is_empty() {
+        recorded.release.clone()
+    } else if is_hex_sha(tag) && !recorded.sha.is_empty() && recorded.sha != "unknown" {
+        short_sha(&recorded.sha)
+    } else if recorded.release != "untagged" && !recorded.release.is_empty() {
+        recorded.release.clone()
+    } else {
+        recorded.deploy_id.clone()
+    };
+    Some(format!(
+        "{} runs {repo}:{tag} but the record says {repo}:{expected}",
+        container.service
+    ))
+}
+
+fn apply_image_drift(
+    containers: &mut [Container],
+    recorded: &Deploy,
+    history: &[Deploy],
+    owned_images: &[String],
+) {
+    let mut app_repos: std::collections::BTreeSet<String> = owned_images.iter().cloned().collect();
+    for c in containers.iter() {
+        if let Some((repo, tag)) = split_image_tag(&c.image) {
+            if tag_matches_deploy(tag, recorded) {
+                app_repos.insert(repo.to_string());
+            }
+        }
+    }
+    for container in containers.iter_mut() {
+        container.image_drift = detect_image_drift(container, recorded, history, &app_repos);
+    }
+}
+
+fn render_compose(status: &Status) -> String {
+    let mut out = String::new();
+    if status.docker_reachable == Some(false) {
+        out.push_str("    docker        daemon unreachable — could not query containers\n");
+        return out;
+    }
+    let Some(containers) = &status.containers else {
+        return out;
+    };
+    if containers.is_empty() {
+        out.push_str("    services      nothing running\n");
+        return out;
+    }
+    let running = containers
+        .iter()
+        .filter(|c| c.state.eq_ignore_ascii_case("running"))
+        .count();
+    let details: Vec<String> = containers
+        .iter()
+        .map(|c| format!("{} {}", c.service, c.short_state()))
+        .collect();
+    out.push_str(&format!(
+        "    services      {running}/{} running ({})\n",
+        containers.len(),
+        details.join(", ")
+    ));
+    for container in containers {
+        if let Some(drift) = &container.image_drift {
+            out.push_str(&format!("    drift         {drift}\n"));
+        }
+    }
+    out
+}
+
 /// Backup file names, newest first by the UTC stamp every backup carries
 /// (`predeploy-20260918T220521Z.dump`, `media-20260918T220521Z.tar.gz`) —
 /// not by name, since the kinds would otherwise sort by their prefix.
@@ -557,6 +991,10 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                     .as_ref()
                     .map(|state| probes_for(*i, state, sudo))
                     .unwrap_or_default();
+                if let Some(compose) = &request.compose {
+                    probes.push(compose_probe(*i, compose, sudo));
+                    probes.push(compose_restarts_probe(*i, compose, sudo));
+                }
                 probes.extend(ingress_probes(
                     *i,
                     &request.ingress,
@@ -628,8 +1066,18 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                 .get(&format!("{i}:history"))
                 .map(|text| parse_history(text))
                 .unwrap_or_default();
-            Status {
+            let (mut containers, docker_reachable) = if reachable {
+                answer
+                    .get(&format!("{i}:compose"))
+                    .map(|raw| parse_compose_ps(raw))
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+            let mut status = Status {
                 ingress,
+                containers: None,
+                docker_reachable,
                 service: request.service,
                 target: request.target,
                 host: request.host,
@@ -652,7 +1100,23 @@ pub fn read(requests: Vec<Request>, targets: &BTreeMap<String, Target>) -> Vec<S
                     .get(&format!("{i}:previous"))
                     .map(|text| text.trim().to_string())
                     .filter(|text| !text.is_empty()),
+            };
+            let owned_images = request
+                .compose
+                .as_ref()
+                .map(|c| c.images.as_slice())
+                .unwrap_or(&[]);
+            if let Some(list) = containers.as_mut() {
+                if let Some(raw_restarts) = answer.get(&format!("{i}:compose:restarts")) {
+                    let restarts = parse_compose_restarts(raw_restarts);
+                    apply_restart_counts(list, &restarts);
+                }
+                if let Some(recorded) = status.live_deploy() {
+                    apply_image_drift(list, recorded, &status.history, owned_images);
+                }
             }
+            status.containers = containers;
+            status
         })
         .collect()
 }
@@ -720,6 +1184,7 @@ pub fn render_status(statuses: &[Status]) -> String {
         if let (Some(live_path), Live::Release { path }) = (&status.live_path, &status.live) {
             out.push_str(&format!("    path          {live_path} → {path}\n"));
         }
+        out.push_str(&render_compose(status));
         if status.releases_dir.is_some() {
             out.push_str(&format!(
                 "    retained      {} release(s)\n",
@@ -851,6 +1316,8 @@ mod tests {
         assert!(text.contains("EXPIRED"), "{text}");
         let mut status = Status {
             ingress,
+            containers: None,
+            docker_reachable: None,
             service: "nginx".into(),
             target: "box".into(),
             host: "example.com".into(),
@@ -1027,6 +1494,8 @@ mod tests {
     fn the_live_symlink_names_the_deploy_that_is_live() {
         let status = Status {
             ingress: Vec::new(),
+            containers: None,
+            docker_reachable: None,
             service: "web".into(),
             target: "production".into(),
             host: "example.com".into(),
@@ -1062,6 +1531,8 @@ mod tests {
     fn a_live_release_missing_from_history_says_so_rather_than_inventing_one() {
         let status = Status {
             ingress: Vec::new(),
+            containers: None,
+            docker_reachable: None,
             service: "web".into(),
             target: "production".into(),
             host: "example.com".into(),
@@ -1088,6 +1559,8 @@ mod tests {
     fn an_unreachable_target_is_reported_not_read_as_empty() {
         let status = Status {
             ingress: Vec::new(),
+            containers: None,
+            docker_reachable: None,
             service: "web".into(),
             target: "production".into(),
             host: "example.com".into(),
@@ -1112,6 +1585,8 @@ mod tests {
     fn a_deployer_with_no_symlink_falls_back_to_the_newest_recorded_deploy() {
         let status = Status {
             ingress: Vec::new(),
+            containers: None,
+            docker_reachable: None,
             service: "stack".into(),
             target: "production".into(),
             host: "example.com".into(),
@@ -1145,5 +1620,225 @@ mod tests {
         assert!(rows[0].rollback);
         assert!(!rows[1].rollback);
         assert!(!rows[2].rollback);
+    }
+
+    fn compose_status(
+        history_tsv: &str,
+        containers: Option<Vec<Container>>,
+        docker_reachable: Option<bool>,
+    ) -> Status {
+        compose_status_with_restarts(history_tsv, containers, docker_reachable, "")
+    }
+
+    fn compose_status_with_restarts(
+        history_tsv: &str,
+        containers: Option<Vec<Container>>,
+        docker_reachable: Option<bool>,
+        restarts_raw: &str,
+    ) -> Status {
+        let history = parse_history(history_tsv);
+        let mut status = Status {
+            ingress: Vec::new(),
+            containers: None,
+            docker_reachable,
+            service: "stack".into(),
+            target: "production".into(),
+            host: "example.com".into(),
+            reachable: true,
+            live: Live::NotApplicable,
+            releases: Vec::new(),
+            history,
+            history_path: "/var/app/.deliver/history.tsv".into(),
+            live_path: None,
+            releases_dir: None,
+            previous_marker: None,
+            backups: None,
+            backups_dir: None,
+            previous: None,
+        };
+        let mut containers = containers;
+        if let Some(list) = containers.as_mut() {
+            let restarts = parse_compose_restarts(restarts_raw);
+            apply_restart_counts(list, &restarts);
+            if let Some(recorded) = status.live_deploy() {
+                let owned = vec!["myapp".to_string()];
+                apply_image_drift(list, recorded, &status.history, &owned);
+            }
+        }
+        status.containers = containers;
+        status
+    }
+
+    #[test]
+    fn compose_ps_parses_ndjson_and_renders_running_services() {
+        let raw = "ok\n\
+            {\"Service\":\"api\",\"Name\":\"app-api-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"running\",\"Status\":\"Up 2 hours (healthy)\",\"Health\":\"healthy\"}\n\
+            {\"Service\":\"worker\",\"Name\":\"app-worker-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
+            {\"Service\":\"db\",\"Name\":\"app-db-1\",\"Image\":\"postgres:16-alpine\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
+            {\"Service\":\"cache\",\"Name\":\"app-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n";
+        let (containers, reachable) = parse_compose_ps(raw);
+        assert_eq!(reachable, Some(true));
+        let status = compose_status(
+            "1\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+            containers,
+            reachable,
+        );
+        let text = render_status(&[status]);
+        assert!(
+            text.contains(
+                "services      4/4 running (api healthy, worker up 2h, db up 2h, cache up 2h)"
+            ),
+            "{text}"
+        );
+        // Unchanged sidecar `redis:v7.4` must not be flagged as needing app release `v1.2.0`.
+        assert!(!text.contains("drift"), "{text}");
+    }
+
+    #[test]
+    fn compose_ps_parses_json_array_and_reports_restarting_exited_and_drift() {
+        let raw = "ok\n[\
+            {\"Service\":\"api\",\"Name\":\"app-api-1\",\"Image\":\"myapp:20261001T120000Z-aaaaaaa\",\"State\":\"running\",\"Status\":\"Up 3 days (healthy)\"},\
+            {\"Service\":\"worker\",\"Name\":\"app-worker-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"restarting\",\"Status\":\"Restarting (1) 5 seconds ago\"},\
+            {\"Service\":\"jobs\",\"Name\":\"app-jobs-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"exited\",\"Status\":\"Exited (1) 2 minutes ago\",\"ExitCode\":1},\
+            {\"Service\":\"cache\",\"Name\":\"app-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\
+        ]";
+        let (containers, reachable) = parse_compose_ps(raw);
+        assert_eq!(reachable, Some(true));
+        let status = compose_status_with_restarts(
+            "1\t20261001T120000Z-aaaaaaa\tv1.1.0\taaaaaaa1234\t2026-10-01T12:00:00Z\n\
+             2\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+            containers,
+            reachable,
+            "/app-api-1 0\n/app-worker-1 4\n/app-jobs-1 0\n/app-cache-1 0\n",
+        );
+        let text = render_status(std::slice::from_ref(&status));
+        assert!(
+            text.contains(
+                "services      2/4 running (api healthy, worker restarting ×4, jobs exited (1), cache up 2h)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "drift         api runs myapp:20261001T120000Z-aaaaaaa but the record says myapp:20261015T120000Z-bbbbbbb"
+            ),
+            "{text}"
+        );
+        // Sidecar image (`redis:v7.4`) and matching `worker`/`jobs` must not be flagged.
+        assert!(!text.contains("cache runs"), "{text}");
+        assert!(!text.contains("worker runs"), "{text}");
+        assert!(!text.contains("jobs runs"), "{text}");
+        let json: serde_json::Value = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["docker_reachable"], true);
+        assert_eq!(json["containers"].as_array().unwrap().len(), 4);
+        assert_eq!(json["containers"][1]["restart_count"], 4);
+        assert_eq!(json["containers"][2]["exit_code"], 1);
+        assert!(json["containers"][0]["image_drift"]
+            .as_str()
+            .unwrap()
+            .contains("20261001T120000Z-aaaaaaa"));
+    }
+
+    #[test]
+    fn compose_restarting_without_inspect_count_renders_cleanly() {
+        let raw = "ok\n\
+            {\"Service\":\"worker\",\"Name\":\"app-worker-1\",\"Image\":\"myapp:20261015T120000Z-bbbbbbb\",\"State\":\"restarting\",\"Status\":\"Restarting (1) 5 seconds ago\"}\n";
+        let (containers, reachable) = parse_compose_ps(raw);
+        let status = compose_status(
+            "1\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+            containers,
+            reachable,
+        );
+        let text = render_status(std::slice::from_ref(&status));
+        assert!(
+            text.contains("services      0/1 running (worker restarting)"),
+            "{text}"
+        );
+        let json: serde_json::Value = serde_json::to_value(&status).unwrap();
+        assert!(json["containers"][0].get("restart_count").is_none());
+    }
+
+    #[test]
+    fn compose_drift_ignores_sidecars_with_semver_sha_or_deploy_id_tags() {
+        let raw = "ok\n\
+            {\"Service\":\"api\",\"Name\":\"app-api-1\",\"Image\":\"myapp:v1.1.0\",\"State\":\"running\",\"Status\":\"Up 1 hour (healthy)\",\"Health\":\"healthy\"}\n\
+            {\"Service\":\"cache\",\"Name\":\"app-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
+            {\"Service\":\"exporter\",\"Name\":\"app-exporter-1\",\"Image\":\"vendor/exporter:deadbeef\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
+            {\"Service\":\"cron\",\"Name\":\"app-cron-1\",\"Image\":\"vendor/cron:20261001T120000Z-aaaaaaa\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n";
+        let (containers, reachable) = parse_compose_ps(raw);
+        let status = compose_status(
+            "1\t20261001T120000Z-aaaaaaa\tv1.1.0\taaaaaaa1234\t2026-10-01T12:00:00Z\n\
+             2\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+            containers,
+            reachable,
+        );
+        let text = render_status(&[status]);
+        assert!(
+            text.contains("drift         api runs myapp:v1.1.0 but the record says myapp:v1.2.0"),
+            "{text}"
+        );
+        assert!(!text.contains("cache runs"), "{text}");
+        assert!(!text.contains("exporter runs"), "{text}");
+        assert!(!text.contains("cron runs"), "{text}");
+    }
+
+    #[test]
+    fn compose_drift_falls_back_to_deploy_id_when_recorded_sha_is_unknown() {
+        let raw = "ok\n\
+            {\"Service\":\"api\",\"Name\":\"app-api-1\",\"Image\":\"myapp:aaaaaaa\",\"State\":\"running\",\"Status\":\"Up 1 hour\"}\n";
+        let (containers, reachable) = parse_compose_ps(raw);
+        let status = compose_status(
+            "1\t20261001T120000Z-aaaaaaa\tv1.1.0\taaaaaaa1234\t2026-10-01T12:00:00Z\n\
+             2\t20261015T120000Z-bbbbbbb\tv1.2.0\tunknown\t2026-10-15T12:00:00Z\n",
+            containers,
+            reachable,
+        );
+        let text = render_status(&[status]);
+        assert!(
+            text.contains(
+                "drift         api runs myapp:aaaaaaa but the record says myapp:20261015T120000Z-bbbbbbb"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn compose_ps_distinguishes_nothing_running_from_unreachable_docker_daemon() {
+        let (empty_containers, empty_reachable) = parse_compose_ps("ok\n");
+        assert_eq!(empty_reachable, Some(true));
+        assert_eq!(empty_containers, Some(Vec::new()));
+        let empty = compose_status(
+            "1\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+            empty_containers,
+            empty_reachable,
+        );
+        let empty_text = render_status(std::slice::from_ref(&empty));
+        assert!(
+            empty_text.contains("services      nothing running"),
+            "{empty_text}"
+        );
+        assert!(!empty_text.contains("daemon unreachable"), "{empty_text}");
+
+        let (arr_empty, arr_reachable) = parse_compose_ps("ok\n[]\n");
+        assert_eq!(arr_reachable, Some(true));
+        assert_eq!(arr_empty, Some(Vec::new()));
+
+        let (err_containers, err_reachable) = parse_compose_ps("err\n");
+        assert_eq!(err_reachable, Some(false));
+        assert_eq!(err_containers, None);
+        let down = compose_status(
+            "1\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+            err_containers,
+            err_reachable,
+        );
+        let down_text = render_status(std::slice::from_ref(&down));
+        assert!(
+            down_text.contains("docker        daemon unreachable"),
+            "{down_text}"
+        );
+        assert!(!down_text.contains("nothing running"), "{down_text}");
+        let json: serde_json::Value = serde_json::to_value(&down).unwrap();
+        assert_eq!(json["docker_reachable"], false);
+        assert!(json.get("containers").is_none());
     }
 }

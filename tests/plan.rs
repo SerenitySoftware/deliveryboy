@@ -9,6 +9,175 @@ fn deliver() -> Command {
 
 #[cfg(unix)]
 #[test]
+fn compose_status_reports_containers_restarts_drift_empty_and_unreachable_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmpdir("compose-status-readback");
+    let bin = dir.join("bin");
+    let remote_root = dir.join("remote/demo");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(remote_root.join(".deliver")).unwrap();
+    std::fs::write(
+        dir.join("docker-compose.yml"),
+        "services:\n  api:\n    image: demo:latest\n  worker:\n    image: demo:latest\n  db:\n    image: postgres:16-alpine\n",
+    )
+    .unwrap();
+    std::fs::write(
+        remote_root.join(".deliver/history.tsv"),
+        "1\t20261001T120000Z-aaaaaaa\tv1.1.0\taaaaaaa1234\t2026-10-01T12:00:00Z\n\
+         2\t20261015T120000Z-bbbbbbb\tv1.2.0\tbbbbbbb1234\t2026-10-15T12:00:00Z\n",
+    )
+    .unwrap();
+
+    let calls = dir.join("connections");
+    let docker_args = dir.join("docker-args");
+    let ps_file = dir.join("ps-output");
+    let ids_file = dir.join("ids-output");
+    let inspect_file = dir.join("inspect-output");
+    let daemon_down = dir.join("daemon-down");
+
+    let ssh = format!(
+        "#!/bin/sh\necho connection >> {}\nfor arg do script=$arg; done\nprintf %s \"$script\" | sh\n",
+        calls.display()
+    );
+    let docker = format!(
+        "#!/bin/sh\necho \"$PWD :: $*\" >> {}\nif [ -f {} ]; then echo 'Cannot connect to the Docker daemon' >&2; exit 1; fi\ncase \"$*\" in\n  *\" -q\"*) cat {} ;;\n  inspect*) cat {} ;;\n  *) cat {} ;;\nesac\n",
+        docker_args.display(),
+        daemon_down.display(),
+        ids_file.display(),
+        inspect_file.display(),
+        ps_file.display()
+    );
+    for (name, content) in [("ssh", ssh), ("docker", docker)] {
+        let path = bin.join(name);
+        std::fs::write(&path, content).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let config = format!(
+        "version: 1\napp: demo\ndefaults: {{target: box}}\ntargets:\n  box: {{host: example.com, user: deploy, sudo: false, dir: {}}}\nservices:\n  stack:\n    deployer: docker-compose\n    config:\n      project: demo\n      files: [docker-compose.yml]\n",
+        remote_root.display()
+    );
+    std::fs::write(dir.join(".deliver.yml"), config).unwrap();
+
+    let run = |args: &[&str]| {
+        deliver()
+            .current_dir(&dir)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // 1. All 3 containers running, matching recorded release, over a single SSH connection.
+    std::fs::write(
+        &ps_file,
+        "{\"Service\":\"api\",\"Name\":\"demo-api-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"running\",\"Status\":\"Up 2 hours (healthy)\",\"Health\":\"healthy\"}\n\
+         {\"Service\":\"worker\",\"Name\":\"demo-worker-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n\
+         {\"Service\":\"cache\",\"Name\":\"demo-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n",
+    )
+    .unwrap();
+    std::fs::write(&ids_file, "aaa\nbbb\nccc\n").unwrap();
+    std::fs::write(
+        &inspect_file,
+        "/demo-api-1 0\n/demo-worker-1 0\n/demo-cache-1 0\n",
+    )
+    .unwrap();
+    let out = run(&["status"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("services      3/3 running (api healthy, worker up 2h, cache up 2h)"),
+        "{text}"
+    );
+    assert!(!text.contains("drift"), "{text}");
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    let logged = std::fs::read_to_string(&docker_args).unwrap();
+    assert!(
+        logged.contains("compose -f docker-compose.yml -p demo ps --all --format json"),
+        "{logged}"
+    );
+
+    // 2. Crash-looping worker (restart count from docker inspect) + exited container + drifted api image tag (human + --json).
+    std::fs::write(
+        &ps_file,
+        "{\"Service\":\"api\",\"Name\":\"demo-api-1\",\"Image\":\"demo:20261001T120000Z-aaaaaaa\",\"State\":\"running\",\"Status\":\"Up 3 days (healthy)\",\"Health\":\"healthy\"}\n\
+         {\"Service\":\"worker\",\"Name\":\"demo-worker-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"restarting\",\"Status\":\"Restarting (1) 4 seconds ago\"}\n\
+         {\"Service\":\"jobs\",\"Name\":\"demo-jobs-1\",\"Image\":\"demo:20261015T120000Z-bbbbbbb\",\"State\":\"exited\",\"Status\":\"Exited (1) 2 minutes ago\",\"ExitCode\":1}\n\
+         {\"Service\":\"cache\",\"Name\":\"demo-cache-1\",\"Image\":\"redis:v7.4\",\"State\":\"running\",\"Status\":\"Up 2 hours\"}\n",
+    )
+    .unwrap();
+    std::fs::write(&ids_file, "aaa\nbbb\nccc\nddd\n").unwrap();
+    std::fs::write(
+        &inspect_file,
+        "/demo-api-1 0\n/demo-worker-1 4\n/demo-jobs-1 0\n/demo-cache-1 0\n",
+    )
+    .unwrap();
+    let out = run(&["status"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("services      2/4 running (api healthy, worker restarting ×4, jobs exited (1), cache up 2h)"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "drift         api runs demo:20261001T120000Z-aaaaaaa but the record says demo:20261015T120000Z-bbbbbbb"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("cache runs"), "{text}");
+
+    let json_out = run(&["status", "--json"]);
+    assert!(json_out.status.success());
+    let rows: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(rows[0]["docker_reachable"], true);
+    let containers = rows[0]["containers"].as_array().unwrap();
+    assert_eq!(containers.len(), 4);
+    assert_eq!(containers[0]["service"], "api");
+    assert!(containers[0]["image_drift"]
+        .as_str()
+        .unwrap()
+        .contains("20261001T120000Z-aaaaaaa"));
+    assert_eq!(containers[1]["service"], "worker");
+    assert_eq!(containers[1]["restart_count"], 4);
+    assert_eq!(containers[2]["service"], "jobs");
+    assert_eq!(containers[2]["exit_code"], 1);
+
+    // 3. Nothing running (empty `ps --all --format json` output).
+    std::fs::write(&ps_file, "").unwrap();
+    std::fs::write(&ids_file, "").unwrap();
+    std::fs::write(&inspect_file, "").unwrap();
+    let out = run(&["status"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("services      nothing running"), "{text}");
+    let json_out = run(&["status", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(rows[0]["docker_reachable"], true);
+    assert!(rows[0]["containers"].as_array().unwrap().is_empty());
+
+    // 4. Unreachable Docker daemon — its own line, never "nothing running".
+    std::fs::write(&daemon_down, "").unwrap();
+    let out = run(&["status"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("docker        daemon unreachable"), "{text}");
+    assert!(!text.contains("nothing running"), "{text}");
+    let json_out = run(&["status", "--json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(rows[0]["docker_reachable"], false);
+    assert!(rows[0].get("containers").is_none());
+}
+
+#[cfg(unix)]
+#[test]
 fn ingress_status_history_and_fleet_read_all_vhosts_in_one_connection() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let dir = tmpdir("ingress-readback");

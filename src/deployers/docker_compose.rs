@@ -1124,16 +1124,64 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
     let release = ctx.version.release_display();
     let sha = &ctx.version.git.sha;
     let stamp = &ctx.version.id;
-    steps.push(PlannedStep::ssh(
-        format!("record deploy {stamp} (release {release})"),
-        format!(
-            "set -e; {sudo}mkdir -p {root}/.deliver; \
-             N=1; if {sudo}test -f {root}/.deliver/history.tsv; then \
-               N=$(( $({sudo}wc -l {root}/.deliver/history.tsv | awk '{{print $1}}') + 1 )); fi; \
-             printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$N\" \"{stamp}\" \"{release}\" \"{sha}\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \
-               | {sudo}tee -a {root}/.deliver/history.tsv >/dev/null; \
-             echo \"deploy #$N · {stamp} · release {release}\""
-        ),
+    let owned_images: Vec<String> = if builds || !image_specs.is_empty() {
+        let mut repos: Vec<String> = Vec::new();
+        let mut push_repo = |full: &str| {
+            let without_digest = full.split('@').next().unwrap_or(full);
+            let last_slash = without_digest.rfind('/');
+            let repo = match without_digest.rfind(':') {
+                Some(colon) if last_slash.is_none_or(|slash| colon >= slash) => {
+                    &without_digest[..colon]
+                }
+                _ => without_digest,
+            };
+            if !repo.is_empty() && !repos.iter().any(|r| r == repo) {
+                repos.push(repo.to_string());
+            }
+        };
+        for (_, full) in &shipped_images {
+            push_repo(full);
+        }
+        // Bare `extra_tags` (e.g. `"{version}"`, `"{sha}"`) are tags on the
+        // primary image's repo, which is already recorded above. Only
+        // repo-qualified entries (containing `:` or `/`) introduce another repo.
+        for extra in &extra_tags {
+            if extra.contains(':') || extra.contains('/') {
+                push_repo(extra);
+            }
+        }
+        if transport == "registry" {
+            if let Some(registry) = image
+                .and_then(|i| i.get("registry"))
+                .and_then(|v| v.as_str())
+                .map(|r| r.trim_end_matches('/'))
+                .filter(|r| !r.is_empty())
+            {
+                let base_repos = repos.clone();
+                for repo in base_repos {
+                    let leaf = repo.rsplit('/').next().unwrap_or(&repo);
+                    let remote = format!("{registry}/{leaf}");
+                    if !repos.iter().any(|r| r == &remote) {
+                        repos.push(remote);
+                    }
+                }
+            }
+        }
+        repos
+    } else {
+        Vec::new()
+    };
+    steps.push(
+        PlannedStep::ssh(
+            format!("record deploy {stamp} (release {release})"),
+            format!(
+                "set -e; {sudo}mkdir -p {root}/.deliver; \
+                 N=1; if {sudo}test -f {root}/.deliver/history.tsv; then \
+                   N=$(( $({sudo}wc -l {root}/.deliver/history.tsv | awk '{{print $1}}') + 1 )); fi; \
+                 printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$N\" \"{stamp}\" \"{release}\" \"{sha}\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \
+                   | {sudo}tee -a {root}/.deliver/history.tsv >/dev/null; \
+                 echo \"deploy #$N · {stamp} · release {release}\""
+            ),
         )
         // Compose replaces containers in place, so there is no live symlink and
         // no retained release directory — the history is the whole record.
@@ -1151,6 +1199,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
         .with_log_source(LogSource::Compose {
             compose: compose.clone(),
             dir: root.clone(),
+            images: owned_images,
         }),
     );
 
@@ -1207,7 +1256,7 @@ pub fn compile(cfg: &Value, ctx: &PlanContext) -> Result<Vec<PlannedStep>> {
 
 #[cfg(test)]
 mod tests {
-    use super::env_line;
+    use super::{compile, env_line, LogSource, Value};
 
     #[test]
     fn values_are_single_quoted_so_compose_reads_them_literally() {
@@ -1231,6 +1280,47 @@ mod tests {
             err.contains("env_file value CERT contains a newline"),
             "{err}"
         );
+    }
+    #[test]
+    fn owned_images_exclude_bare_extra_tags_and_pull_only_defaults() {
+        let fixture = crate::deployers::http_test_support::Context::new();
+        std::fs::write(
+            fixture.ctx.repo_root.join("docker-compose.yml"),
+            "services:\n  cache:\n    image: redis:v7.4\n",
+        )
+        .unwrap();
+
+        let extract = |cfg_yaml: &str| -> Vec<String> {
+            let cfg: Value = serde_yaml::from_str(cfg_yaml).unwrap();
+            let steps = compile(&cfg, &fixture.ctx).unwrap();
+            steps
+                .iter()
+                .find_map(|s| match &s.log_source {
+                    Some(LogSource::Compose { images, .. }) => Some(images.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+
+        // Bare extra_tags (`{version}`, `{sha}`) belong to the primary repo;
+        // only repo-qualified entries add a new repo.
+        assert_eq!(
+            extract(
+                "image:\n  tag: myapp:latest\n  extra_tags: ['{version}', '{sha}', 'ghcr.io/acme/myapp:{version}']\n"
+            ),
+            vec!["myapp", "ghcr.io/acme/myapp"]
+        );
+
+        // Registry transport also owns the registry-prefixed repository.
+        assert_eq!(
+            extract(
+                "image:\n  tag: myapp:latest\n  transport: registry\n  registry: ghcr.io/acme\n"
+            ),
+            vec!["myapp", "ghcr.io/acme/myapp"]
+        );
+
+        // Pull-only stacks without `image`/`images` do not claim `ctx.app`.
+        assert!(extract("build: false\n").is_empty());
     }
 }
 
