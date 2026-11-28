@@ -1,0 +1,30 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build the deliver CLI
+    cmds:
+      - cargo build --locked
+  run:
+    desc: Run deliver (pass arguments after --)
+    cmds:
+      - cargo run --locked -- {{.CLI_ARGS}}
+  deps:
+    desc: Resolve dependencies after editing Cargo.toml
+    cmds:
+      - cargo update --workspace
+  fmt:
+    desc: Format Rust source
+    cmds:
+      - cargo fmt --all
+  check:
+    desc: Run the CLI and site checks used in CI
+    cmds:
+      - cargo fmt --all -- --check
+      - cargo clippy --all-targets --locked -- -D warnings
+      - cargo test --locked
+      - hugo --source site --minify
+  test:completions:
+    desc: Test completion scripts and config names
+    cmds:
+      - cargo test --locked --test completions

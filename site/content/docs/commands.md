@@ -23,6 +23,48 @@ It replaces `defaults.target` for this run, so every service without its own `ta
 
 `deliver --version` prints the CLI version. `deliver --help` and `deliver COMMAND --help` show the installed command surface.
 
+## `deliver completions`
+
+Print a completion script to stdout for `bash`, `zsh`, or `fish`. The command
+works without a config. Keep `deliver` on your `PATH` so the script can call it
+when you press Tab.
+
+For bash, add this line to `~/.bashrc`:
+
+```bash
+source <(deliver completions bash)
+```
+
+For zsh, add these lines to `~/.zshrc` (skip `compinit` if your shell setup
+already runs it):
+
+```zsh
+autoload -Uz compinit
+compinit
+source <(deliver completions zsh)
+```
+
+For fish, create `~/.config/fish/completions/deliver.fish` containing:
+
+```fish
+deliver completions fish | source
+```
+
+Open a new shell, or run the lines above in your current shell. Generate the
+script on shell startup as shown, so it stays in step with the installed CLI
+after an upgrade. You can also save the output with
+`deliver completions bash > deliver.bash`; regenerate saved scripts after
+upgrading.
+
+Tab completes commands, options, `--service` names and `--target` names. Names
+come from the current project's `.deliver.yml` each time, so config edits and
+changing directories take effect without reinstalling completions. The usual
+config search applies (including parent directories and other supported config
+filenames), and an already typed `--config PATH` or `-c PATH` selects that file.
+A missing, unreadable or invalid config quietly gives no service or target
+suggestions; command and option completion still works. Completion reads config
+only; it runs no build, secret provider or deployment command.
+
 ## `deliver init`
 
 Inspect a repository, report supported project shapes, and prepare `.deliver.yml`.
