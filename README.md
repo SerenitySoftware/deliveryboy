@@ -31,8 +31,16 @@ deliver --version
 ```
 
 Versioned macOS and Linux archives with SHA-256 checksums are attached to GitHub
-releases. Homebrew and WinGet packages will follow. Every install method
-provides the `deliver` command.
+releases. Every install method provides the `deliver` command.
+
+The planned Homebrew command for macOS and Linux is **not yet available**:
+
+```bash
+brew install serenitysoftware/tap/deliveryboy
+```
+
+The tap repository still needs to be created and published. Use Cargo or a
+release archive for now. WinGet packages will follow.
 
 ## Start a release
 
