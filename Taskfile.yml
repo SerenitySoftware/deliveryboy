@@ -28,3 +28,33 @@ tasks:
     cmds: ['scripts/release/check-artifacts.sh {{.VERSION}} {{.WORK_DIR}}/release']
     requires:
       vars: [VERSION, WORK_DIR]
+  lint:
+    desc: Alias for the Rust lint check
+    cmds: ["task clippy"]
+  homebrew:update:
+    desc: Generate the formula from a published release (VERSION=0.4.0)
+    requires:
+      vars: [VERSION]
+    cmds:
+      - python3 scripts/release/update-homebrew.py '{{.VERSION}}'
+  homebrew:test:generator:
+    cmds:
+      - PYTHONDONTWRITEBYTECODE=1 python3 scripts/release/test-update-homebrew.py
+  homebrew:test:macos:
+    desc: Install, test, audit and remove the formula in a temporary local tap
+    platforms: [darwin]
+    cmds:
+      - bash scripts/release/test-homebrew.sh
+  homebrew:test:linux:
+    desc: Check the formula in a disposable Homebrew on Linux container
+    cmds:
+      - >-
+        docker run --rm --name deliveryboy-homebrew-test
+        --platform linux/amd64
+        -v '{{.ROOT_DIR}}:/src:ro'
+        -e HOMEBREW_NO_AUTO_UPDATE=1
+        -e HOMEBREW_NO_INSTALL_CLEANUP=1
+        -e HOMEBREW_NO_ANALYTICS=1
+        -e HOMEBREW_DEVELOPER=1
+        homebrew/brew:latest
+        bash /src/scripts/release/test-homebrew.sh

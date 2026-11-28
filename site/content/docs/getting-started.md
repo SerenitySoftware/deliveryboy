@@ -21,7 +21,16 @@ Cargo installs the command into its binary directory, normally `~/.cargo/bin`. M
 Versioned macOS and Linux archives are also available from the GitHub release.
 Delivery Boy builds and tests them on the release operator's machine, then
 uploads them after pushing the release tag. Each release includes SHA-256
-checksums. Homebrew and WinGet packages will follow.
+checksums.
+
+The planned Homebrew command for macOS and Linux is **not yet available**:
+
+```bash
+brew install serenitysoftware/tap/deliveryboy
+```
+
+The tap repository still needs to be created and published. Use Cargo or a
+release archive for now. WinGet packages will follow.
 
 Do not copy a binary from an untrusted source. Check its release checksum before
 running it.
