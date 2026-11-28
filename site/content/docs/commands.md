@@ -145,14 +145,18 @@ several services in range it lists them and asks you to narrow the run with
 `--service NAME`, rather than interleaving two streams into something neither
 of them said.
 
-Where the log is comes from one of two places. A `docker-compose` service is
-tailed with the deploy's own `docker compose` invocation — the same `-f` files
-and `-p` project it brought the containers up with. Every other service has to
-say, because the deploy does not know: a `files` or `hugo` release is served by
-a web server Delivery Boy never configured, so guessing a path would be wrong
-on half of the hosts this tool targets. Give those services a
-[`logs:` block](../configuration/#where-the-logs-are); a service with neither
-is reported as such and exits `2`.
+A `docker-compose` service uses the deploy’s own Compose invocation, with the
+same `-f` files and `-p` project. An `nginx-vhost` service tails the `access_log`
+and `error_log` files named in the conf Delivery Boy installs, including rendered
+values. It skips `off`, syslog and stderr destinations. Omitted directives use
+`/var/log/nginx/access.log` and `/var/log/nginx/error.log`; the source is marked
+`[deployer, nginx default]` when it includes these assumed paths. A host may set
+different inherited defaults, so use a [`logs:` block](../configuration/#where-the-logs-are)
+to override them. Delivery Boy does not read nginx includes or the host’s `http` config.
+
+A `files` or `hugo` service needs its own `logs:` block, or select the
+`nginx-vhost` service that serves it with `--service NAME`. A service with
+neither a declared nor a deployer source is reported as such and exits `2`.
 
 The command it runs is printed before it runs, and the read is read-only.
 

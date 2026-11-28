@@ -562,6 +562,104 @@ fn service_filter_limits_the_plan() {
     assert!(!text.contains("▸ web"), "{text}");
 }
 
+// Two sources make --follow list the compiled sources before any remote read.
+fn nginx_log_choices(name: &str, conf: &str, override_logs: &str) -> String {
+    let dir = nginx_repo(
+        name,
+        conf,
+        "      conf: nginx/site.conf\n      ssl: false\n",
+    );
+    let path = dir.join(".deliver.yml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str(override_logs);
+    config.push_str("  other:\n    deployer: commands\n    config: {steps: [{command: \"true\"}]}\n    logs: {command: \"true\"}\n");
+    std::fs::write(path, config).unwrap();
+    let out = run_in(&dir, &["logs", "--follow"]);
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("More than one service"), "{text}");
+    text
+}
+
+#[test]
+fn nginx_logs_use_the_installed_confs_file_paths() {
+    let text = nginx_log_choices("nginx-log-paths", "server {\n access_log /var/log/nginx/x.access.log combined;\n error_log /var/log/nginx/x.error.log warn;\n}\n", "");
+    assert!(
+        text.contains("nginx — /var/log/nginx/x.access.log, /var/log/nginx/x.error.log [deployer]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn nginx_logs_use_and_label_defaults_when_the_conf_names_neither() {
+    let text = nginx_log_choices("nginx-log-defaults", "server {}\n", "");
+    assert!(
+        text.contains(
+            "nginx — /var/log/nginx/access.log, /var/log/nginx/error.log [deployer, nginx default]"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn nginx_logs_access_off_leaves_only_the_error_log() {
+    let text = nginx_log_choices("nginx-log-off", "server {\n access_log off;\n}\n", "");
+    assert!(
+        text.contains("nginx — /var/log/nginx/error.log [deployer, nginx default]"),
+        "{text}"
+    );
+    assert!(!text.contains("/var/log/nginx/access.log"), "{text}");
+}
+
+#[test]
+fn nginx_logs_explicit_logs_block_wins() {
+    let text = nginx_log_choices(
+        "nginx-log-override",
+        "server {}\n",
+        "    logs: {files: [/custom/site.log]}\n",
+    );
+    assert!(text.contains("nginx — /custom/site.log [logs:]"), "{text}");
+    assert!(!text.contains("nginx default"), "{text}");
+}
+
+#[test]
+fn nginx_logs_tail_the_discovered_files_locally() {
+    let dir = nginx_repo(
+        "nginx-log-read",
+        "server {}\n",
+        "      conf: nginx/site.conf\n      ssl: false\n",
+    );
+    let access = dir.join("access.log");
+    let error = dir.join("error.log");
+    std::fs::write(&access, "site request served\n").unwrap();
+    std::fs::write(&error, "site error detail\n").unwrap();
+    std::fs::write(
+        dir.join("nginx/site.conf"),
+        format!(
+            "server {{\n access_log \"{}\" combined;\n error_log \"{}\" warn;\n}}\n",
+            access.display(),
+            error.display()
+        ),
+    )
+    .unwrap();
+    let cfg = dir.join(".deliver.yml");
+    let body = std::fs::read_to_string(&cfg).unwrap().replace(
+        "host: example.md, user: root, dir: /var/universal/example",
+        &format!(
+            "host: localhost, method: local, sudo: false, dir: {}",
+            dir.display()
+        ),
+    );
+    std::fs::write(cfg, body).unwrap();
+    let out = run_in(&dir, &["logs", "--tail", "1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(text.contains("site request served"), "{text}");
+    assert!(text.contains("site error detail"), "{text}");
+    assert!(stderr.contains("[deployer]"), "{stderr}");
+}
+
 #[test]
 fn compose_remote_health_can_set_the_host_header() {
     let dir = tmpdir("compose-health-host");
