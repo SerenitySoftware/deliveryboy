@@ -239,7 +239,11 @@ pub fn parse_vhost(text: &str) -> VhostFacts {
                         } else {
                             rest.split_whitespace().next().unwrap_or("")
                         };
-                        if path != "off" && path != "stderr" && !path.starts_with("syslog:") {
+                        if path != "off"
+                            && path != "stderr"
+                            && !path.starts_with("syslog:")
+                            && !path.starts_with("memory:")
+                        {
                             push_unique(&mut facts.log_paths, path);
                         }
                     }
@@ -986,7 +990,7 @@ mod log_tests {
 
     #[test]
     fn explicit_non_file_destinations_do_not_turn_into_defaults() {
-        for access in ["off", "syslog:server=unix:/dev/log"] {
+        for access in ["off", "syslog:server=unix:/dev/log", "memory:32m"] {
             let facts = parse_vhost(&format!(
                 "server {{\n access_log {access};\n error_log stderr warn;\n}}"
             ));

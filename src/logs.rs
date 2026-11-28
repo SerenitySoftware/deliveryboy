@@ -149,16 +149,19 @@ pub fn collect(config: &Config, plan: &[ServicePlan]) -> (Vec<Request>, Vec<Unkn
             let Some(source) = &step.log_source else {
                 continue;
             };
-            nginx_log_default |= step.nginx_log_default;
             match (&mut inferred, source) {
                 (Some(LogSource::Files { paths }), LogSource::Files { paths: more }) => {
+                    nginx_log_default |= step.nginx_log_default;
                     for path in more {
                         if !paths.contains(path) {
                             paths.push(path.clone());
                         }
                     }
                 }
-                (None, _) => inferred = Some(source.clone()),
+                (None, _) => {
+                    nginx_log_default = step.nginx_log_default;
+                    inferred = Some(source.clone());
+                }
                 _ => {}
             }
         }
