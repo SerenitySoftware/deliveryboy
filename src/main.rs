@@ -2,6 +2,7 @@
 //!
 //! Exit codes: 0 ok · 1 step/verify failure · 2 config or usage error.
 
+mod completions;
 mod config;
 mod configdiff;
 mod deployers;
@@ -28,7 +29,8 @@ mod version;
 mod workflow;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::ArgValueCompleter;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -44,7 +46,7 @@ struct Cli {
 
     /// Deploy to this target instead of `defaults.target` (a service that
     /// names its own `target:` keeps it)
-    #[arg(long, global = true, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "NAME", add = ArgValueCompleter::new(completions::targets))]
     target: Option<String>,
 
     #[command(subcommand)]
@@ -80,12 +82,12 @@ enum SecretsAction {
 enum FleetAction {
     /// Run preflight in every repo
     Preflight {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
     },
     /// Deploy every repo, in fleet-file order
     Deploy {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
         /// Walk every step without running it
         #[arg(long)]
@@ -102,13 +104,18 @@ enum FleetAction {
     },
     /// Show what is live across the fleet
     Status {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Print a shell completion script (source it in your shell startup file)
+    Completions {
+        #[arg(value_enum)]
+        shell: completions::Shell,
+    },
     /// Prepare, check and deploy retained artifacts with the Azure release adapter
     Release {
         #[command(subcommand)]
@@ -137,7 +144,7 @@ enum Commands {
     },
     /// Compile and print the plan — executes nothing
     Plan {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
         /// Preview this release version without prompting (e.g. 0.4.1)
         #[arg(long)]
@@ -148,7 +155,7 @@ enum Commands {
     },
     /// Execute the plan
     Deploy {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
         /// Walk every step without running it
         #[arg(long)]
@@ -168,12 +175,12 @@ enum Commands {
     },
     /// Run only the verify checks
     Verify {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
     },
     /// Show what is live on the target right now
     Status {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
         /// Emit JSON instead of text
         #[arg(long)]
@@ -181,7 +188,7 @@ enum Commands {
     },
     /// List the deploys recorded on the target, newest first
     History {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
         /// How many deploys to show per service (0 for all)
         #[arg(long, default_value_t = 10)]
@@ -192,7 +199,7 @@ enum Commands {
     },
     /// Tail the deployed logs from the target
     Logs {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
         /// Keep the stream open (one service at a time)
         #[arg(long, short = 'f')]
@@ -206,7 +213,7 @@ enum Commands {
     },
     /// Roll back to the previous release (repoints the live symlink)
     Rollback {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
         /// Roll back to this retained deploy id instead of one step back
         /// (`deliver history` lists the ids)
@@ -224,7 +231,7 @@ enum Commands {
     },
     /// Run the preflight checks only (tools, input files, ssh reachability)
     Preflight {
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completions::services))]
         service: Vec<String>,
     },
     /// Show which secrets this config needs and whether they're in place
@@ -252,6 +259,9 @@ enum Commands {
 }
 
 fn main() {
+    clap_complete::CompleteEnv::with_factory(Cli::command)
+        .var(completions::ENV)
+        .complete();
     let cli = Cli::parse();
     let code = match run(&cli) {
         Ok(code) => code,
@@ -271,6 +281,10 @@ fn run(cli: &Cli) -> Result<i32> {
         target: cli.target.as_deref(),
     };
     match &cli.command {
+        Commands::Completions { shell } => {
+            completions::generate(*shell, &mut std::io::stdout().lock())?;
+            Ok(0)
+        }
         Commands::Release { action } => release::run(args.path, args.target, action),
         Commands::Init {
             path,
