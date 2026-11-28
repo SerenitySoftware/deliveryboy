@@ -221,9 +221,12 @@ is a decision rather than an oversight:
 
 ## Where the logs are
 
-`deliver logs` tails a `docker-compose` service with the deploy's own compose
-invocation. Any other service says where to look, with exactly one of `unit:`,
-`files:` or `command:`:
+`deliver logs` uses the deploy’s Compose invocation for `docker-compose`, and
+the installed conf’s file log paths for `nginx-vhost`. Omitted nginx log directives
+use `/var/log/nginx/access.log` and `/var/log/nginx/error.log`, marked
+`[deployer, nginx default]`; override these when the host inherits other paths.
+Other services declare a source with exactly one of `unit:`, `files:` or `command:`.
+A `logs:` block also overrides any deployer source, as in the nginx example below:
 
 ```yaml
 services:
@@ -232,7 +235,8 @@ services:
     logs:
       unit: example-api        # journalctl -u example-api
   site:
-    deployer: hugo
+    deployer: nginx-vhost
+    config: {conf: nginx/site.conf}
     logs:
       files:                   # tail -F
         - /var/log/nginx/example.com.access.log

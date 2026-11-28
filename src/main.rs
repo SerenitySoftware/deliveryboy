@@ -2136,7 +2136,7 @@ fn cmd_logs(
             ));
         }
         ui::note(
-            "only `docker-compose` services can be tailed without being told where to look. \
+            "`docker-compose` and `nginx-vhost` services can declare their own log sources. \
              Give the others a `logs:` block — `unit:` for a systemd unit, `files:` for log \
              files, or `command:` to run something else on the target.",
         );
@@ -2180,6 +2180,7 @@ fn cmd_logs(
                 .map(|t| t.describe(&request.host))
                 .unwrap_or_else(|| request.host.clone())
         ));
+        ui::detail(logs::describe(request));
         let ok = if json {
             let deployed = statuses
                 .iter()

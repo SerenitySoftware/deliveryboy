@@ -10,7 +10,9 @@ machine. No Delivery Boy account, daemon, or hosted runner is required.
 
 The CLI is in public beta. Releases include macOS and Linux binaries built and
 tested on the release operator's machine. Windows support still needs native
-command execution and a local Windows test host.
+command execution and a local Windows test host. The next release also builds a
+Windows x86-64 zip in local Docker with MinGW; a cross-build does not prove that
+Windows deployments work.
 
 ## Install
 
@@ -33,6 +35,28 @@ deliver --version
 Versioned macOS and Linux archives with SHA-256 checksums are attached to GitHub
 releases. Homebrew and WinGet packages will follow. Every install method
 provides the `deliver` command.
+
+For Windows x86-64, starting with the next release, download
+`deliveryboy-<version>-x86_64-pc-windows-gnu.zip` and `SHA256SUMS` from the
+[GitHub release](https://github.com/SerenitySoftware/deliveryboy/releases).
+In PowerShell, replace `<version>` with that release's version:
+
+```powershell
+$archive = 'deliveryboy-<version>-x86_64-pc-windows-gnu.zip'
+$entry = Get-Content SHA256SUMS |
+  Where-Object { $_.EndsWith("  $archive") }
+$expected = ($entry -split '\s+')[0]
+$actual = (Get-FileHash $archive -Algorithm SHA256).Hash
+if (!$expected -or $actual -ne $expected) { throw 'Checksum mismatch' }
+Expand-Archive $archive -DestinationPath "$env:LOCALAPPDATA\DeliveryBoy"
+& "$env:LOCALAPPDATA\DeliveryBoy\deliver.exe" --version
+```
+
+Add `%LOCALAPPDATA%\DeliveryBoy` to your user `PATH` to run `deliver` from any
+directory. Deployment commands currently need a POSIX `sh` on `PATH` (for
+example, from Git for Windows), plus the tools your release calls. Native
+Windows deployment support remains incomplete. These archives are unsigned;
+checksums detect damaged downloads but do not prove who built them.
 
 ## Start a release
 
